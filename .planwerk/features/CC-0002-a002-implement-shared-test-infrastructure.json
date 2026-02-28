@@ -1,0 +1,703 @@
+{
+  "feature_id": "CC-0002",
+  "title": "A002: Implement shared test infrastructure",
+  "slug": "a002-implement-shared-test-infrastructure",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "**Size:** 🏗️ large\n**Category:** infrastructure\n**Priority:** high\n\n## Summary\n\nImplement the shared test infrastructure in `internal/common/testutil/` that all operator integration and E2E tests will depend on. This includes: an envtest bootstrap function starting a local API server + etcd with project and external CRDs; minimal fake CRD YAML schemas for five external operators (MariaDB, ESO, cert-manager, Memcached, RabbitMQ); a `SecretBuilder` establishing the fluent builder pattern; external operator simulators that patch CR status to mimic readiness; custom gomega assertion helpers for condition checking and resource existence; and a Chainsaw E2E directory structure with global configuration targeting Chainsaw v0.3+.\n\n## Scope\n\n**Included:**\n- `internal/common/testutil/envtest/` — `SetupEnvTest()` function: starts `envtest.Environment`, installs CRDs from `config/crd/bases` (own) and `fake_crds/` (external), registers schemes, returns `*rest.Config` + `client.Client` + teardown func. Follows the pattern from `architecture/06-testing.md:90-104`\n- `internal/common/testutil/fake_crds/` — Minimal CRD YAML schemas (only fields operators interact with: `.status.conditions`, `.status.ready`, referenced `.spec` fields) for: MariaDB Operator (`MariaDB`, `Database`, `User`, `Grant`), ESO (`ExternalSecret`, `PushSecret`, `ClusterSecretStore`), cert-manager (`Certificate`, `ClusterIssuer`), Memcached Operator (`Memcached`), RabbitMQ Cluster Operator (`RabbitmqCluster`)\n- `internal/common/testutil/builders/` — `SecretBuilder` with chainable `WithName()`, `WithNamespace()`, `WithData()`, `WithStringData()`, `WithLabels()`, `WithOwnerRef()`, `Build()`, `Create(ctx, client)`. Establishes the fluent builder pattern that operator-specific builders (S011/S019) will follow\n- `internal/common/testutil/simulators/` — `SimulateMariaDBReady(ctx, client, name, namespace)`, `SimulateMemcachedReady(...)`, `SimulateExternalSecretSync(...)`, `SimulateJobComplete(...)` — each creates the CR if absent, then patches its status to indicate readiness\n- `internal/common/testutil/assertions/` — `AssertCondition(g, conditions, condType, status)`, `EventuallyCondition(ctx, client, obj, condType, status, timeout)`, `AssertResourceExists(ctx, client, key, obj)`, `AssertResourceNotExists(ctx, client, key, obj)`\n- `tests/e2e/chainsaw-config.yaml` — Global Chainsaw v0.3+ configuration (`apiVersion: chainsaw.kyverno.io/v1alpha1`, default timeouts, cleanup, parallel, JUnit output)\n- `tests/e2e/{keystone,c5c3,infrastructure}/.gitkeep` — Directory placeholders\n- Unit tests for assertions and builders; integration test verifying `SetupEnvTest()` starts/stops cleanly\n\n**Excluded (with rationale):**\n- `KeystoneBuilder`, `ControlPlaneBuilder` — API types don't exist until S011/S019; builder pattern established via `SecretBuilder` (YAGNI)\n- Actual Chainsaw test scenarios — S012, S016, S022; only directory structure and config here\n- CI pipeline integration — S003\n- Makefile `test-integration` / `install-test-deps` targets — S001 stubs, S003 implements\n- Controller-runtime reconciler test wiring — S014, reconciler-specific\n- OpenBao/ESO test doubles beyond `SimulateExternalSecretSync` — S010\n\n## Visualization\n\n```mermaid\nflowchart TD\n    subgraph testutil[\"internal/common/testutil/\"]\n        envtest_pkg[\"envtest/\\nSetupEnvTest()\"]\n        builders[\"builders/\\nSecretBuilder\"]\n        simulators[\"simulators/\\nSimulateMariaDBReady\\nSimulateMemcachedReady\\nSimulateExternalSecretSync\\nSimulateJobComplete\"]\n        assertions[\"assertions/\\nAssertCondition\\nEventuallyCondition\\nAssertResourceExists\\nAssertResourceNotExists\"]\n        fake_crds[\"fake_crds/\\nmariadb/ eso/ cert-manager/\\nmemcached/ rabbitmq/\"]\n    end\n\n    subgraph consumers[\"Future Consumers\"]\n        s012[\"S012: Keystone CRD Tests\"]\n        s014[\"S014: Keystone Reconciler Tests\"]\n        s022[\"S022: c5c3-operator Tests\"]\n    end\n\n    subgraph e2e[\"tests/e2e/\"]\n        chainsaw_cfg[\"chainsaw-config.yaml\"]\n        ks_dir[\"keystone/\"]\n        c5c3_dir[\"c5c3/\"]\n        infra_dir[\"infrastructure/\"]\n    end\n\n    envtest_pkg -->|\"loads\"| fake_crds\n    s012 -->|\"imports\"| envtest_pkg\n    s012 -->|\"imports\"| assertions\n    s014 -->|\"imports\"| envtest_pkg\n    s014 -->|\"imports\"| builders\n    s014 -->|\"imports\"| simulators\n    s014 -->|\"imports\"| assertions\n    s022 -->|\"imports\"| envtest_pkg\n    s022 -->|\"imports\"| simulators\n```\n\n```mermaid\nsequenceDiagram\n    participant T as Test Suite\n    participant E as SetupEnvTest\n    participant API as envtest API Server\n    participant etcd as etcd\n\n    T->>E: SetupEnvTest(crdPaths...)\n    E->>etcd: Start etcd process\n    E->>API: Start API server\n    E->>API: Install own CRDs from config/crd/bases\n    E->>API: Install fake external CRDs\n    E->>E: Register schemes\n    E-->>T: config, client, teardownFn\n\n    Note over T: Run tests using client...\n\n    T->>T: teardownFn()\n    T->>API: Stop API server\n    T->>etcd: Stop etcd\n```\n\n## Key Components\n\n- **`testutil/envtest/setup.go`** — `SetupEnvTest(crdPaths ...string) (*rest.Config, client.Client, func())`: boots envtest with API server + etcd, installs CRDs from provided paths plus `fake_crds/`, registers all relevant schemes (core, apps, batch + external operator types), returns config + client + teardown closure\n- **`testutil/fake_crds/{mariadb,eso,cert-manager,memcached,rabbitmq}/`** — Minimal CRD YAMLs defining only the spec/status fields operators interact with. Derived from `internal/common/database/`, `secrets/`, `tls/` function signatures in `architecture/02-shared-library.md`\n- **`testutil/builders/secret.go`** — Fluent `SecretBuilder` returning `*corev1.Secret`. Pattern reference for operator-specific builders added in S011/S019\n- **`testutil/simulators/{mariadb,memcached,externalsecret,job}.go`** — Create external CRs with ready status to simulate third-party operator behavior in envtest. Each creates the CR if absent, patches `.status.ready = true` and condition `Ready=True`\n- **`testutil/assertions/conditions.go`** — Typed gomega helpers: `EventuallyCondition` polls via `Eventually()` + `client.Get()` until condition reaches expected status\n- **`testutil/assertions/resources.go`** — `AssertResourceExists` / `AssertResourceNotExists` for existence checks\n- **`tests/e2e/chainsaw-config.yaml`** — Global Chainsaw v0.3+ config: 120s assert timeout, 30s apply timeout, cleanup enabled, parallel execution, JUnit report output\n- **`tests/e2e/{keystone,c5c3,infrastructure}/.gitkeep`** — Empty directory structure for future test scenarios",
+  "stories": [
+    {
+      "title": "Developer bootstraps envtest environment for integration tests",
+      "role": "developer",
+      "want": "to call a single SetupEnvTest() function that starts a local API server + etcd with all project and external CRDs installed",
+      "so_that": "I can write integration tests against a real Kubernetes API without deploying a full cluster",
+      "criteria": [
+        "SetupEnvTest() returns a valid *rest.Config, a working client.Client, and a teardown function",
+        "CRDs from provided paths (e.g., config/crd/bases) are installed and queryable via the client",
+        "External fake CRDs from fake_crds/ are automatically installed alongside own CRDs",
+        "Calling the teardown function cleanly stops etcd and the API server without errors",
+        "Schemes for core, apps, batch, and external operator types are registered on the client"
+      ]
+    },
+    {
+      "title": "Developer uses fake CRDs to test interactions with external operators",
+      "role": "developer",
+      "want": "minimal CRD YAML schemas for MariaDB, ESO, cert-manager, Memcached, and RabbitMQ operators that define only the fields our code interacts with",
+      "so_that": "integration tests can create, read, and patch external operator CRs without installing the full operator CRDs",
+      "criteria": [
+        "MariaDB fake CRDs include MariaDB, Database, User, and Grant kinds with .status.conditions and .status.ready fields",
+        "ESO fake CRDs include ExternalSecret, PushSecret, and ClusterSecretStore with .status.conditions",
+        "cert-manager fake CRDs include Certificate and ClusterIssuer with .status.conditions",
+        "Memcached fake CRD includes Memcached with .status.conditions and .status.ready",
+        "RabbitMQ fake CRD includes RabbitmqCluster with .status.conditions",
+        "All fake CRDs are installable in envtest without validation errors"
+      ]
+    },
+    {
+      "title": "Developer builds test data with fluent SecretBuilder",
+      "role": "developer",
+      "want": "a chainable builder for Kubernetes Secrets with WithName(), WithNamespace(), WithData(), WithStringData(), WithLabels(), WithOwnerRef(), Build(), and Create()",
+      "so_that": "I can construct test Secrets concisely and consistently, establishing the builder pattern for future operator-specific builders",
+      "criteria": [
+        "SecretBuilder().WithName('x').WithNamespace('ns').Build() returns a *corev1.Secret with correct metadata",
+        "WithData() accepts map[string][]byte and sets .Data on the built Secret",
+        "WithStringData() accepts map[string]string and sets .StringData on the built Secret",
+        "WithLabels() merges labels into .Labels without overwriting previous labels",
+        "WithOwnerRef() appends an OwnerReference to .OwnerReferences",
+        "Create(ctx, client) calls client.Create and returns the created Secret or an error",
+        "Builder is reusable — calling Build() multiple times returns independent Secret copies"
+      ]
+    },
+    {
+      "title": "Developer simulates external operator readiness in tests",
+      "role": "developer",
+      "want": "simulator functions that create external CRs if absent and patch their status to indicate readiness",
+      "so_that": "integration tests can test reconciler logic that depends on external operators being ready without running those operators",
+      "criteria": [
+        "SimulateMariaDBReady(ctx, client, name, namespace) creates a MariaDB CR if absent and patches .status.ready=true with Ready=True condition",
+        "SimulateMemcachedReady(ctx, client, name, namespace) creates a Memcached CR if absent and patches .status.ready=true with Ready=True condition",
+        "SimulateExternalSecretSync(ctx, client, name, namespace) creates an ExternalSecret CR if absent and patches .status.conditions with SecretSynced=True",
+        "SimulateJobComplete(ctx, client, name, namespace) creates a Job if absent and patches .status.succeeded=1 and .status.conditions with Complete=True",
+        "All simulators are idempotent — calling them when the CR already exists only patches status"
+      ]
+    },
+    {
+      "title": "Developer uses gomega assertion helpers for condition and resource checks",
+      "role": "developer",
+      "want": "typed gomega helpers for checking metav1.Condition status and Kubernetes resource existence",
+      "so_that": "integration tests can assert condition state and resource lifecycle with readable, reusable assertions",
+      "criteria": [
+        "AssertCondition(g, conditions, condType, status) succeeds when condition exists with expected status, fails with descriptive message otherwise",
+        "EventuallyCondition(ctx, client, obj, condType, status, timeout) polls obj status until condition matches or times out",
+        "AssertResourceExists(ctx, client, key, obj) succeeds when the resource exists in the API server",
+        "AssertResourceNotExists(ctx, client, key, obj) succeeds when the resource returns NotFound",
+        "All helpers produce readable gomega failure messages including condition type and expected/actual status"
+      ]
+    },
+    {
+      "title": "Developer has Chainsaw E2E directory structure ready for future test scenarios",
+      "role": "developer",
+      "want": "a global Chainsaw v0.3+ configuration and placeholder directories for keystone, c5c3, and infrastructure E2E tests",
+      "so_that": "future E2E test tasks (S012, S016, S022) can add test scenarios without setting up the Chainsaw config from scratch",
+      "criteria": [
+        "tests/e2e/chainsaw-config.yaml exists with apiVersion chainsaw.kyverno.io/v1alpha1, 120s assert timeout, 30s apply timeout, cleanup enabled, parallel enabled, JUnit output",
+        "tests/e2e/keystone/.gitkeep exists creating the directory placeholder",
+        "tests/e2e/c5c3/.gitkeep exists creating the directory placeholder",
+        "tests/e2e/infrastructure/.gitkeep exists creating the directory placeholder"
+      ]
+    },
+    {
+      "title": "Developer verifies test infrastructure with passing tests",
+      "role": "developer",
+      "want": "unit tests for builders and assertions, and an integration test proving SetupEnvTest starts and stops cleanly",
+      "so_that": "the shared test infrastructure is validated before downstream features depend on it",
+      "criteria": [
+        "Unit tests for SecretBuilder cover all With* methods, Build(), and Create()",
+        "Unit tests for AssertCondition and AssertResourceExists/NotExists cover success and failure cases",
+        "Integration test calls SetupEnvTest(), creates a Namespace using the returned client, then calls teardown without errors",
+        "All tests pass with `go test ./...` in the testutil module",
+        "golangci-lint reports no errors for testutil packages"
+      ]
+    },
+    {
+      "title": "Developer finds reference documentation for the test infrastructure",
+      "role": "developer",
+      "want": "a reference doc describing all testutil packages, their functions, signatures, and usage examples",
+      "so_that": "I can use the shared test infrastructure without reading all source files",
+      "criteria": [
+        "Reference doc covers envtest/SetupEnvTest with signature, parameters, return values, and example usage",
+        "Reference doc lists all fake CRD groups with their kinds and key fields",
+        "Reference doc covers SecretBuilder with method chain examples",
+        "Reference doc covers all simulator functions with signatures and behavior",
+        "Reference doc covers all assertion helpers with signatures and gomega integration examples"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "SetupEnvTest() SHALL start an envtest.Environment with API server and etcd, install CRDs from provided paths and fake_crds/, register schemes, and return *rest.Config, client.Client, and a teardown function",
+      "priority": "SHALL",
+      "rationale": "All integration tests across all operators depend on a consistent envtest bootstrap. Centralizing it prevents each test suite from reimplementing envtest setup.",
+      "scenarios": [
+        {
+          "name": "Clean start and stop",
+          "when": "SetupEnvTest() is called with valid CRD paths",
+          "then": "envtest starts successfully, returns non-nil config, working client, and callable teardown",
+          "and_then": [
+            "teardown() stops etcd and API server without errors"
+          ]
+        },
+        {
+          "name": "CRDs installable",
+          "when": "SetupEnvTest() is called with paths including own and fake CRDs",
+          "then": "all CRDs are registered and discoverable via the API server",
+          "and_then": [
+            "client can create instances of both own and external CRD types"
+          ]
+        },
+        {
+          "name": "Scheme registration",
+          "when": "SetupEnvTest() completes",
+          "then": "the returned client's scheme includes core/v1, apps/v1, batch/v1, and all external operator types",
+          "and_then": [
+            "client.Get for any registered type does not return 'no kind registered' errors"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "Fake CRD YAMLs SHALL define minimal valid CustomResourceDefinition manifests for MariaDB (MariaDB, Database, User, Grant), ESO (ExternalSecret, PushSecret, ClusterSecretStore), cert-manager (Certificate, ClusterIssuer), Memcached (Memcached), and RabbitMQ (RabbitmqCluster)",
+      "priority": "SHALL",
+      "rationale": "Tests need to create and patch external CRs to simulate operator interactions. Using full upstream CRDs would add unnecessary complexity and version coupling.",
+      "scenarios": [
+        {
+          "name": "Valid CRD YAML",
+          "when": "a fake CRD YAML is applied to envtest",
+          "then": "the CRD is accepted without validation errors",
+          "and_then": [
+            "the API server serves the CR's API group and version"
+          ]
+        },
+        {
+          "name": "Status subresource enabled",
+          "when": "a CR is created from a fake CRD",
+          "then": "the CR's status can be patched independently via the status subresource",
+          "and_then": [
+            "status patches do not require updating the full resource"
+          ]
+        },
+        {
+          "name": "Minimal spec/status fields",
+          "when": "a CR is created with only the fields the operator code interacts with",
+          "then": "the CR passes schema validation",
+          "and_then": [
+            "the CR's .status.conditions and .status.ready fields are writable"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "SecretBuilder SHALL implement a fluent builder pattern with chainable WithName(), WithNamespace(), WithData(), WithStringData(), WithLabels(), WithOwnerRef(), Build(), and Create() methods",
+      "priority": "SHALL",
+      "rationale": "Establishing the builder pattern here allows S011/S019 to follow the same pattern for KeystoneBuilder and ControlPlaneBuilder.",
+      "scenarios": [
+        {
+          "name": "Full builder chain",
+          "when": "all With* methods are chained before Build()",
+          "then": "Build() returns a *corev1.Secret with all specified fields set correctly",
+          "and_then": [
+            "the Secret's metadata, data, stringData, labels, and ownerReferences are all populated"
+          ]
+        },
+        {
+          "name": "Partial builder chain",
+          "when": "only WithName and WithNamespace are called before Build()",
+          "then": "Build() returns a valid Secret with only name and namespace set",
+          "and_then": [
+            "data, labels, and ownerReferences are nil/empty"
+          ]
+        },
+        {
+          "name": "Create persists to API server",
+          "when": "Create(ctx, client) is called on a built Secret",
+          "then": "the Secret is created in the API server and retrievable via client.Get",
+          "and_then": [
+            "the returned error is nil for valid Secrets"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "Simulator functions SHALL create external CRs if absent and patch their status to indicate readiness, supporting idempotent invocation",
+      "priority": "SHALL",
+      "rationale": "Integration tests need to simulate third-party operator behavior. Simulators must be idempotent so tests can call them multiple times safely.",
+      "scenarios": [
+        {
+          "name": "Create and patch new CR",
+          "when": "SimulateMariaDBReady is called and no MariaDB CR exists",
+          "then": "a MariaDB CR is created with .status.ready=true and Ready=True condition",
+          "and_then": [
+            "the CR is retrievable via client.Get with correct status"
+          ]
+        },
+        {
+          "name": "Patch existing CR",
+          "when": "SimulateMariaDBReady is called and a MariaDB CR already exists with .status.ready=false",
+          "then": "the CR's status is patched to .status.ready=true without recreating the resource",
+          "and_then": [
+            "the CR's spec remains unchanged"
+          ]
+        },
+        {
+          "name": "Job simulator sets completion status",
+          "when": "SimulateJobComplete is called",
+          "then": "the Job CR has .status.succeeded=1 and Complete=True condition",
+          "and_then": [
+            "tests polling for Job completion see it as done"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "Assertion helpers SHALL provide AssertCondition, EventuallyCondition, AssertResourceExists, and AssertResourceNotExists with descriptive gomega failure messages",
+      "priority": "SHALL",
+      "rationale": "Custom assertions reduce test boilerplate and produce readable failure output, making test debugging faster.",
+      "scenarios": [
+        {
+          "name": "Condition present with expected status",
+          "when": "AssertCondition is called with a condition type that exists with the expected status",
+          "then": "the assertion passes without error",
+          "and_then": []
+        },
+        {
+          "name": "Condition absent",
+          "when": "AssertCondition is called with a condition type that does not exist in the list",
+          "then": "the assertion fails with a message indicating the condition was not found",
+          "and_then": [
+            "the failure message includes the expected condition type"
+          ]
+        },
+        {
+          "name": "EventuallyCondition waits and succeeds",
+          "when": "EventuallyCondition is called and the condition becomes True within the timeout",
+          "then": "the assertion passes after polling",
+          "and_then": [
+            "the resource is fetched fresh on each poll"
+          ]
+        },
+        {
+          "name": "Resource not found assertion",
+          "when": "AssertResourceNotExists is called for a deleted resource",
+          "then": "the assertion passes because client.Get returns NotFound",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "Chainsaw configuration SHALL define global settings for E2E tests targeting Chainsaw v0.3+ with apiVersion chainsaw.kyverno.io/v1alpha1",
+      "priority": "SHALL",
+      "rationale": "A centralized Chainsaw config ensures consistent timeouts, cleanup, and reporting across all E2E test suites.",
+      "scenarios": [
+        {
+          "name": "Valid Chainsaw config",
+          "when": "chainsaw-config.yaml is loaded by Chainsaw",
+          "then": "Chainsaw accepts the config without errors",
+          "and_then": [
+            "the default assert timeout is 120s and apply timeout is 30s"
+          ]
+        },
+        {
+          "name": "Cleanup enabled",
+          "when": "a Chainsaw test completes",
+          "then": "test resources are automatically cleaned up",
+          "and_then": []
+        },
+        {
+          "name": "JUnit output",
+          "when": "Chainsaw runs with this config",
+          "then": "JUnit XML reports are generated",
+          "and_then": [
+            "CI can consume the reports for test result display"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "All testutil packages SHALL pass go vet and golangci-lint without errors",
+      "priority": "SHALL",
+      "rationale": "Test infrastructure code is foundational — lint failures here would propagate to all consuming test suites.",
+      "scenarios": [
+        {
+          "name": "go vet clean",
+          "when": "go vet ./... is run on testutil packages",
+          "then": "no issues are reported",
+          "and_then": []
+        },
+        {
+          "name": "golangci-lint clean",
+          "when": "golangci-lint run is executed against testutil packages",
+          "then": "no errors or warnings are reported",
+          "and_then": []
+        },
+        {
+          "name": "Exported symbols documented",
+          "when": "golangci-lint with gocritic is run",
+          "then": "all exported functions have Go doc comments",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The testutil module SHALL compile and test within the existing Go Workspace without modifying operator go.mod files",
+      "priority": "SHALL",
+      "rationale": "testutil is part of internal/common; it must not introduce new module boundaries or require changes to operator modules.",
+      "scenarios": [
+        {
+          "name": "Workspace builds",
+          "when": "go build ./... is run from the workspace root",
+          "then": "all modules including testutil compile without errors",
+          "and_then": []
+        },
+        {
+          "name": "No new go.mod",
+          "when": "testutil packages are added under internal/common/",
+          "then": "they are part of the existing internal/common go.mod module",
+          "and_then": [
+            "no new go.mod file is created for testutil"
+          ]
+        },
+        {
+          "name": "Dependencies added to internal/common/go.mod",
+          "when": "testutil requires envtest, gomega, or unstructured packages",
+          "then": "these dependencies are added to internal/common/go.mod via go mod tidy",
+          "and_then": [
+            "go.sum is updated accordingly"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-009",
+      "description": "Reference documentation SHALL be provided for all testutil packages following the project's documentation conventions",
+      "priority": "SHALL",
+      "rationale": "Downstream developers need to understand testutil APIs without reading source code. All new APIs require reference docs.",
+      "scenarios": [
+        {
+          "name": "Package overview",
+          "when": "a developer reads the reference doc",
+          "then": "they find a table listing all packages with their purpose",
+          "and_then": []
+        },
+        {
+          "name": "Function signatures documented",
+          "when": "a developer looks up SetupEnvTest",
+          "then": "they find the full Go signature, parameter descriptions, return values, and usage example",
+          "and_then": []
+        },
+        {
+          "name": "Usage examples",
+          "when": "a developer wants to use SecretBuilder",
+          "then": "the doc includes a code example showing the builder chain pattern",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "1.1",
+      "title": "Create MariaDB fake CRD YAMLs (MariaDB, Database, User, Grant) in internal/common/testutil/fake_crds/mariadb/ (REQ-002)",
+      "description": "Create four minimal CRD YAML files under `internal/common/testutil/fake_crds/mariadb/`: mariadb.yaml (group: k8s.mariadb.com, kind: MariaDB, spec: replicas/image, status: ready/conditions), database.yaml (kind: Database, spec: mariaDbRef/name, status: ready/conditions), user.yaml (kind: User, spec: mariaDbRef/name/passwordSecretKeyRef, status: ready/conditions), grant.yaml (kind: Grant, spec: mariaDbRef/database/table/username/privileges, status: ready/conditions). All CRDs must have status subresource enabled, use v1alpha1 version, and only include fields referenced in architecture/02-shared-library.md database/ package.",
+      "level": 1,
+      "estimate_minutes": 25,
+      "requirements": [
+        "REQ-002"
+      ]
+    },
+    {
+      "id": "1.2",
+      "title": "Create ESO fake CRD YAMLs (ExternalSecret, PushSecret, ClusterSecretStore) in internal/common/testutil/fake_crds/eso/ (REQ-002)",
+      "description": "Create three minimal CRD YAML files under `internal/common/testutil/fake_crds/eso/`: externalsecret.yaml (group: external-secrets.io, kind: ExternalSecret, spec: refreshInterval/secretStoreRef/target/data, status: conditions/syncedResourceVersion), pushsecret.yaml (kind: PushSecret, spec: secretStoreRefs/selector/data, status: conditions), clustersecretstore.yaml (kind: ClusterSecretStore, spec: provider, status: conditions). All with status subresource. Fields derived from architecture/02-shared-library.md secrets/ package.",
+      "level": 1,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-002"
+      ]
+    },
+    {
+      "id": "1.3",
+      "title": "Create cert-manager, Memcached, and RabbitMQ fake CRD YAMLs in internal/common/testutil/fake_crds/ (REQ-002)",
+      "description": "Create five minimal CRD YAML files: `fake_crds/cert-manager/certificate.yaml` (group: cert-manager.io, kind: Certificate, spec: secretName/issuerRef/dnsNames, status: conditions), `fake_crds/cert-manager/clusterissuer.yaml` (kind: ClusterIssuer, spec: selfSigned/ca, status: conditions), `fake_crds/memcached/memcached.yaml` (group: opsv1.memcached.com or similar, kind: Memcached, spec: replicas, status: ready/conditions/serverList), `fake_crds/rabbitmq/rabbitmqcluster.yaml` (group: rabbitmq.com, kind: RabbitmqCluster, spec: replicas, status: conditions/defaultUser). All with status subresource.",
+      "level": 1,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-002"
+      ]
+    },
+    {
+      "id": "1.4",
+      "title": "Implement SecretBuilder with fluent builder pattern and unit tests in internal/common/testutil/builders/ (REQ-003)",
+      "description": "Create `internal/common/testutil/builders/secret.go` with SecretBuilder struct and methods: NewSecretBuilder() *SecretBuilder, WithName(string) *SecretBuilder, WithNamespace(string) *SecretBuilder, WithData(map[string][]byte) *SecretBuilder, WithStringData(map[string]string) *SecretBuilder, WithLabels(map[string]string) *SecretBuilder, WithOwnerRef(metav1.OwnerReference) *SecretBuilder, Build() *corev1.Secret, Create(ctx context.Context, c client.Client) (*corev1.Secret, error). Create `internal/common/testutil/builders/secret_test.go` with table-driven unit tests covering: all With* methods, Build() returns independent copies, Create() error on missing name/namespace.",
+      "level": 1,
+      "estimate_minutes": 25,
+      "requirements": [
+        "REQ-003"
+      ]
+    },
+    {
+      "id": "1.5",
+      "title": "Implement AssertCondition and resource existence assertion helpers with unit tests in internal/common/testutil/assertions/ (REQ-005)",
+      "description": "Create `internal/common/testutil/assertions/conditions.go` with: AssertCondition(g gomega.Gomega, conditions []metav1.Condition, condType string, status metav1.ConditionStatus) — asserts condition found with expected status, fails with descriptive message. Create `internal/common/testutil/assertions/resources.go` with: AssertResourceExists(ctx, client, key types.NamespacedName, obj client.Object) — asserts client.Get succeeds. AssertResourceNotExists(ctx, client, key, obj) — asserts client.Get returns NotFound. Create `internal/common/testutil/assertions/conditions_test.go` and `resources_test.go` with table-driven tests covering found/not-found/wrong-status scenarios.",
+      "level": 1,
+      "estimate_minutes": 25,
+      "requirements": [
+        "REQ-005"
+      ]
+    },
+    {
+      "id": "2.1",
+      "title": "Implement SetupEnvTest() function in internal/common/testutil/envtest/setup.go (REQ-001, REQ-008)",
+      "description": "Create `internal/common/testutil/envtest/setup.go` with: func SetupEnvTest(crdPaths ...string) (*rest.Config, client.Client, func()). Implementation: create envtest.Environment with CRDDirectoryPaths combining user-provided paths + embedded fake_crds/ path (resolved via runtime.Caller or filepath). Call testEnv.Start(). Register schemes: corev1, appsv1, batchv1. Create client via client.New(cfg, client.Options{Scheme: scheme}). Return cfg, client, and teardown closure that calls testEnv.Stop(). Add helper FakeCRDsPath() string returning the absolute path to fake_crds/. Add necessary dependencies to internal/common/go.mod (sigs.k8s.io/controller-runtime envtest, gomega). Run go mod tidy.",
+      "level": 2,
+      "estimate_minutes": 30,
+      "requirements": [
+        "REQ-001",
+        "REQ-008"
+      ]
+    },
+    {
+      "id": "2.2",
+      "title": "Implement EventuallyCondition assertion helper in internal/common/testutil/assertions/ (REQ-005)",
+      "description": "Add to `internal/common/testutil/assertions/conditions.go`: func EventuallyCondition(ctx context.Context, c client.Client, obj client.Object, condType string, status metav1.ConditionStatus, timeout time.Duration). Implementation: use gomega.Eventually with polling that calls c.Get() to refresh obj, then extracts .Status.Conditions and checks for matching condition. Uses gomega.NewWithT or accepts gomega.Gomega parameter. Requires obj to have a Status.Conditions field — use unstructured or interface assertion. Add tests in conditions_test.go — requires envtest client from SetupEnvTest, so test is in a _test.go file that imports envtest.",
+      "level": 2,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-005"
+      ]
+    },
+    {
+      "id": "2.3",
+      "title": "Implement SimulateMariaDBReady and SimulateMemcachedReady simulators in internal/common/testutil/simulators/ (REQ-004)",
+      "description": "Create `internal/common/testutil/simulators/mariadb.go` with: func SimulateMariaDBReady(ctx context.Context, c client.Client, name, namespace string) error. Implementation: use unstructured.Unstructured to create MariaDB CR (GVK k8s.mariadb.com/v1alpha1/MariaDB) if not exists (ignore AlreadyExists), then patch status subresource with .status.ready=true and .status.conditions=[{type:Ready,status:True,reason:Ready}]. Create `internal/common/testutil/simulators/memcached.go` with SimulateMemcachedReady following the same pattern for Memcached GVK.",
+      "level": 2,
+      "estimate_minutes": 25,
+      "requirements": [
+        "REQ-004"
+      ]
+    },
+    {
+      "id": "2.4",
+      "title": "Implement SimulateExternalSecretSync and SimulateJobComplete simulators in internal/common/testutil/simulators/ (REQ-004)",
+      "description": "Create `internal/common/testutil/simulators/externalsecret.go` with: func SimulateExternalSecretSync(ctx context.Context, c client.Client, name, namespace string, targetSecretData map[string][]byte) error. Implementation: create ExternalSecret CR (GVK external-secrets.io/v1beta1/ExternalSecret) if not exists, patch status with SecretSynced=True condition, and create the target K8s Secret with provided data. Create `internal/common/testutil/simulators/job.go` with: func SimulateJobComplete(ctx context.Context, c client.Client, name, namespace string) error. Uses batchv1.Job (native type, not unstructured), creates if absent, patches status with .succeeded=1 and Complete=True condition.",
+      "level": 2,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-004"
+      ]
+    },
+    {
+      "id": "3.1",
+      "title": "Create Chainsaw v0.3+ configuration and E2E directory structure (REQ-006)",
+      "description": "Create `tests/e2e/chainsaw-config.yaml` with: apiVersion: chainsaw.kyverno.io/v1alpha1, kind: Configuration, spec with timeouts (assert: 120s, apply: 30s, delete: 60s, cleanup: 60s), cleanup: {enabled: true}, parallel: {enabled: true}, report: {format: JUnit, name: chainsaw-report}. Create `tests/e2e/keystone/.gitkeep`, `tests/e2e/c5c3/.gitkeep`, `tests/e2e/infrastructure/.gitkeep` as directory placeholders.",
+      "level": 3,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-006"
+      ]
+    },
+    {
+      "id": "3.2",
+      "title": "Write integration test verifying SetupEnvTest starts/stops cleanly and CRDs are installable (REQ-001, REQ-002)",
+      "description": "Create `internal/common/testutil/envtest/setup_test.go` with: TestSetupEnvTest_StartStop — calls SetupEnvTest() with no extra CRD paths, asserts config is non-nil, client can create a Namespace, then calls teardown and asserts no error. TestSetupEnvTest_FakeCRDsInstalled — calls SetupEnvTest(), uses client to list resources for each fake CRD group (k8s.mariadb.com, external-secrets.io, cert-manager.io, etc.), asserts discovery API returns the expected kinds. TestSetupEnvTest_SchemeRegistered — verifies client's scheme recognizes corev1.Secret, appsv1.Deployment, batchv1.Job.",
+      "level": 3,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-001",
+        "REQ-002"
+      ]
+    },
+    {
+      "id": "3.3",
+      "title": "Write integration tests for simulators using envtest (REQ-004)",
+      "description": "Create `internal/common/testutil/simulators/simulators_test.go` with: TestSimulateMariaDBReady — calls SetupEnvTest(), then SimulateMariaDBReady, then verifies CR exists with .status.ready=true via unstructured Get. TestSimulateMariaDBReady_Idempotent — calls SimulateMariaDBReady twice, second call should not error. TestSimulateMemcachedReady — same pattern. TestSimulateExternalSecretSync — verifies CR exists and target Secret is created. TestSimulateJobComplete — verifies Job exists with .status.succeeded=1. All tests use a shared TestMain that calls SetupEnvTest once.",
+      "level": 3,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-004"
+      ]
+    },
+    {
+      "id": "4.1",
+      "title": "Run go vet, golangci-lint, and full test suite across all testutil packages (REQ-007, REQ-008)",
+      "description": "Run `go vet ./internal/common/testutil/...` and verify zero issues. Run `golangci-lint run ./internal/common/testutil/...` and fix any errors. Run `go test ./internal/common/testutil/...` and verify all tests pass. Run `go build ./...` from workspace root to verify no compilation errors. Add Go doc comments to all exported functions if missing.",
+      "level": 4,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-007",
+        "REQ-008"
+      ]
+    },
+    {
+      "id": "5.1",
+      "title": "Write reference documentation for testutil packages in architecture/ (REQ-009)",
+      "description": "Add a new section to architecture/06-testing.md or create a dedicated page at architecture/06-testing-infrastructure.md (prefer extending existing). Content: Package overview table (envtest, builders, assertions, simulators, fake_crds), SetupEnvTest() full signature + usage example, fake CRD inventory (group, version, kinds for each operator), SecretBuilder method chain example, simulator function signatures + behavior, assertion helper signatures + gomega integration example. Follow the existing doc style from 02-shared-library.md (function tables, code blocks).",
+      "level": 5,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-009"
+      ]
+    }
+  ],
+  "test_specifications": [
+    {
+      "test_file": "internal/common/testutil/builders/secret_test.go",
+      "test_function": "TestSecretBuilder_FullChain",
+      "story": "Developer builds test data with fluent SecretBuilder",
+      "expected": "Build() returns a Secret with all fields set when all With* methods are chained",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/common/testutil/builders/secret_test.go",
+      "test_function": "TestSecretBuilder_PartialChain",
+      "story": "Developer builds test data with fluent SecretBuilder",
+      "expected": "Build() returns a valid Secret with only name/namespace when only those With* methods are called",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/common/testutil/builders/secret_test.go",
+      "test_function": "TestSecretBuilder_IndependentCopies",
+      "story": "Developer builds test data with fluent SecretBuilder",
+      "expected": "Calling Build() multiple times returns distinct Secret objects that can be modified independently",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": "internal/common/testutil/assertions/conditions_test.go",
+      "test_function": "TestAssertCondition_Found",
+      "story": "Developer uses gomega assertion helpers for condition and resource checks",
+      "expected": "Assertion passes when condition exists with expected status",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/common/testutil/assertions/conditions_test.go",
+      "test_function": "TestAssertCondition_NotFound",
+      "story": "Developer uses gomega assertion helpers for condition and resource checks",
+      "expected": "Assertion fails with descriptive message when condition type is not present",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/common/testutil/assertions/conditions_test.go",
+      "test_function": "TestAssertCondition_WrongStatus",
+      "story": "Developer uses gomega assertion helpers for condition and resource checks",
+      "expected": "Assertion fails when condition exists but has wrong status",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/common/testutil/assertions/resources_test.go",
+      "test_function": "TestAssertResourceExists_Success",
+      "story": "Developer uses gomega assertion helpers for condition and resource checks",
+      "expected": "Assertion passes when resource exists in the API server",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/common/testutil/assertions/resources_test.go",
+      "test_function": "TestAssertResourceNotExists_Success",
+      "story": "Developer uses gomega assertion helpers for condition and resource checks",
+      "expected": "Assertion passes when resource returns NotFound from the API server",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": "internal/common/testutil/envtest/setup_test.go",
+      "test_function": "TestSetupEnvTest_StartStop",
+      "story": "Developer bootstraps envtest environment for integration tests",
+      "expected": "SetupEnvTest returns non-nil config/client, teardown succeeds without errors",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/common/testutil/envtest/setup_test.go",
+      "test_function": "TestSetupEnvTest_FakeCRDsInstalled",
+      "story": "Developer bootstraps envtest environment for integration tests",
+      "expected": "All fake CRD kinds are discoverable via the API server's discovery API",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": "internal/common/testutil/simulators/simulators_test.go",
+      "test_function": "TestSimulateMariaDBReady",
+      "story": "Developer simulates external operator readiness in tests",
+      "expected": "After calling SimulateMariaDBReady, a MariaDB CR exists with .status.ready=true",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/common/testutil/simulators/simulators_test.go",
+      "test_function": "TestSimulateMariaDBReady_Idempotent",
+      "story": "Developer simulates external operator readiness in tests",
+      "expected": "Calling SimulateMariaDBReady twice does not error and CR remains in ready state",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/common/testutil/simulators/simulators_test.go",
+      "test_function": "TestSimulateExternalSecretSync",
+      "story": "Developer simulates external operator readiness in tests",
+      "expected": "After calling SimulateExternalSecretSync, the ExternalSecret CR exists with SecretSynced=True and the target K8s Secret is created",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/common/testutil/simulators/simulators_test.go",
+      "test_function": "TestSimulateJobComplete",
+      "story": "Developer simulates external operator readiness in tests",
+      "expected": "After calling SimulateJobComplete, the Job has .status.succeeded=1",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/common/testutil/simulators/simulators_test.go",
+      "test_function": "TestSimulateMemcachedReady",
+      "story": "Developer simulates external operator readiness in tests",
+      "expected": "After calling SimulateMemcachedReady, a Memcached CR exists with .status.ready=true",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": "internal/common/testutil/envtest/setup_test.go",
+      "test_function": "TestSetupEnvTest_SchemeRegistered",
+      "story": "Developer bootstraps envtest environment for integration tests",
+      "expected": "Client's scheme recognizes corev1.Secret, appsv1.Deployment, batchv1.Job",
+      "requirement_id": "REQ-001"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "All SHALL requirements (REQ-001 through REQ-009) have corresponding passing tests",
+    "SetupEnvTest() starts and stops cleanly in integration test — no leaked processes",
+    "All 13 fake CRD YAMLs are valid CustomResourceDefinition v1 manifests installable in envtest",
+    "SecretBuilder unit tests achieve 100% method coverage with table-driven tests",
+    "All simulator functions are idempotent — integration tests call each twice without error",
+    "Assertion helpers produce readable gomega failure messages including expected/actual values",
+    "All testutil packages pass go vet and golangci-lint without errors or warnings",
+    "No new go.mod file created — testutil packages live within existing internal/common module",
+    "Reference documentation covers all exported functions with signatures and usage examples",
+    "Code follows existing project conventions: table-driven tests, Go doc comments on exports, error wrapping with fmt.Errorf"
+  ],
+  "implementation_notes": "Architectural decisions:\n- testutil packages are part of the internal/common Go module (no new go.mod) — this keeps them accessible to all operator modules via the existing Go Workspace.\n- Fake CRDs use unstructured.Unstructured in simulators to avoid importing external operator Go types, which would add heavy transitive dependencies.\n- SecretBuilder uses pointer receiver for chainability (*SecretBuilder) and returns deep copies from Build() to prevent mutation bugs.\n- SimulateExternalSecretSync creates both the ExternalSecret CR status patch AND the target K8s Secret because in real ESO, the controller creates the Secret — in envtest without ESO running, the simulator must do both.\n- EventuallyCondition uses gomega.Eventually internally but requires the caller to pass a gomega.Gomega (from NewWithT) so it integrates with both testing.T and Ginkgo contexts.\n- Chainsaw config targets v0.3+ (apiVersion: chainsaw.kyverno.io/v1alpha1) per the feature spec and architecture/01-project-setup.md:162.\n\nKey files to reference:\n- architecture/06-testing.md:90-104 — envtest setup pattern to follow\n- architecture/02-shared-library.md — function signatures that define what fake CRD fields are needed\n- .planwerk/features/CC-0001-a001-scaffold-go-workspace-and-module-structure.json — S001 structure this builds upon\n\nPotential pitfalls:\n- envtest binary assets (kube-apiserver, etcd) must be available in the test environment — SetupEnvTest should use envtest.BinaryAssetsDirectory or KUBEBUILDER_ASSETS env var.\n- Fake CRDs must have status subresource enabled (subresources: {status: {}}) or status patches will fail silently.\n- Unstructured status patches require MergeFrom patch type to avoid overwriting existing status fields.\n- go mod tidy in internal/common will pull in envtest dependencies — this is expected and acceptable since testutil is in the same module.",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.261902"
+    },
+    "elaborated": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:58:38.083613"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T21:55:18.138156"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T21:59:24.703951"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "e45a1b78-e8a3-4fc2-9ac7-f08de390122d",
+      "timestamp": "2026-02-22T21:59:24.703976",
+      "total_duration": 243.69066262245178,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 243.69066262245178,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}

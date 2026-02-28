@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0008",
+  "title": "D001: FluxCD & Infrastructure Manifests",
+  "slug": "d001-fluxcd-infrastructure-manifests",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Create deploy/flux-system/sources/ with HelmRepository CRs for cert-manager, mariadb-operator, ESO, OpenBao, memcached-operator. Create deploy/flux-system/releases/ with HelmRelease CRs for cert-manager (with default ClusterIssuer), MariaDB Operator, Memcached Operator, ESO — with production-ready values and dependsOn ordering. Create deploy/infrastructure/mariadb.yaml (MariaDB Galera cluster, 3 replicas) and deploy/infrastructure/memcached.yaml (Memcached CR, 3 replicas). Add deploy/flux-system/kustomization.yaml for FluxCD integration.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.264577"
+    }
+  },
+  "origin": "plan"
+}

@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0023",
+  "title": "J001: Full-Stack E2E Validation",
+  "slug": "j001-full-stack-e2e-validation",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Create an end-to-end integration test on kind: deploy full infrastructure stack (Phase 4), deploy both operators, apply ControlPlane CR, verify the c5c3-operator creates infrastructure CRs, waits for readiness, creates Keystone CR with correct projection. Verify the Keystone Operator deploys a fully functional Keystone service with Ready=True and the API responds on /v3. Validate the complete secret chain: OpenBao bootstrap writes secrets, ESO ExternalSecrets sync to K8s Secrets, operators consume Secrets for DB connection strings and admin password.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.271607"
+    }
+  },
+  "origin": "plan"
+}

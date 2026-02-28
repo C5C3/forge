@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0014",
+  "title": "F002: Keystone Reconciler Integration Tests",
+  "slug": "f002-keystone-reconciler-integration-tests",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Write envtest integration tests exercising the full reconciliation loop: create prerequisite Secrets (simulating ESO), create Keystone CR, verify condition progression (SecretsReady, DatabaseReady, FernetKeysReady, DeploymentReady, BootstrapReady, Ready), verify Deployment/Service/ConfigMap/Job creation, verify status fields. Use simulators for MariaDB readiness and Job completion. Target 70%+ coverage for reconciler code.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.267419"
+    }
+  },
+  "origin": "plan"
+}

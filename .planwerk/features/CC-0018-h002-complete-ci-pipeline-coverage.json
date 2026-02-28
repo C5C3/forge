@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0018",
+  "title": "H002: Complete CI Pipeline & Coverage",
+  "slug": "h002-complete-ci-pipeline-coverage",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Extend .github/workflows/ci.yaml with full job matrix: lint, test (unit + integration per operator), E2E (kind + Chainsaw), build-and-push (docker + GHCR on main/tags), helm-push (OCI registry on main/tags). Tag-triggered builds produce versioned images, charts, and GitHub Release. Configure .codecov.yml with thresholds: 80%+ for internal/common/, 70%+ for operator controllers, 90%+ for webhooks.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.269256"
+    }
+  },
+  "origin": "plan"
+}

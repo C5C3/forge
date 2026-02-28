@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0007",
+  "title": "C002: Container Image CI Workflow",
+  "slug": "c002-container-image-ci-workflow",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Create .github/workflows/build-images.yaml with matrix build for service images, GHCR push, multi-arch support (linux/amd64, linux/arm64), tag schema (<service>:<upstream-version>-<c5c3-patch>-<branch>-<sha>). Include smoke test step running keystone-manage --version.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.264142"
+    }
+  },
+  "origin": "plan"
+}

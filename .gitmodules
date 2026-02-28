@@ -1,0 +1,3 @@
+[submodule "architecture"]
+	path = architecture
+	url = https://github.com/C5C3/C5C3

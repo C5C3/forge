@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0005",
+  "title": "B002: Kubernetes-Interacting Packages",
+  "slug": "b002-kubernetes-interacting-packages",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Implement all packages that interact with the Kubernetes API: config/ ConfigMap helpers (CreateImmutableConfigMap with content-hash naming and owner references). secrets/ package (WaitForExternalSecret, IsSecretReady, GetSecretValue, EnsurePushSecret). database/ package (EnsureDatabase, EnsureDatabaseUser, RunDBSyncJob). deployment/ package (EnsureDeployment, EnsureService, IsDeploymentReady). job/ package (RunJob, EnsureCronJob, IsJobComplete). tls/ package (EnsureCertificate, GetTLSSecret). policy/ loader (LoadPolicyFromConfigMap). Write envtest integration tests for all packages verifying actual Kubernetes object creation and status handling.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.263267"
+    }
+  },
+  "origin": "plan"
+}

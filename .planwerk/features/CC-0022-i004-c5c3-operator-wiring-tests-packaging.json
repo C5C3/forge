@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0022",
+  "title": "I004: c5c3-operator Wiring, Tests & Packaging",
+  "slug": "i004-c5c3-operator-wiring-tests-packaging",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Wire all reconcilers and webhooks into operators/c5c3/main.go. Write envtest integration tests for the full orchestration: create ControlPlane CR, verify infrastructure CR creation, simulate Ready, verify Keystone CR projection (image tag, clusterRefs, merged policies), simulate Keystone Ready, verify ControlPlane Ready=True. Create Chainsaw E2E tests: full-controlplane/, single-service/, update-phase-tracking/, policy-projection/. Create Helm chart in operators/c5c3/helm/c5c3-operator/ (same pattern as keystone-operator chart). Extend CI pipeline matrix for the c5c3-operator.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.271130"
+    }
+  },
+  "origin": "plan"
+}

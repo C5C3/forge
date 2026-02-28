@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0020",
+  "title": "I002: ControlPlane Orchestration Reconciler",
+  "slug": "i002-controlplane-orchestration-reconciler",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Implement ControlPlaneReconciler with SetupWithManager watching ControlPlane and owned resources (MariaDB, Memcached, Keystone CRs). Phase 1 (reconcileInfrastructure): create/update MariaDB Galera and Memcached CRs from infrastructure spec, set owner references, wait for Ready, set InfrastructureReady condition. Phase 2 (reconcileKeystone): create/update Keystone CR with image tag from openStackRelease, clusterRefs to infrastructure CRs, fernet cron from rotationInterval conversion, merged policyOverrides, bootstrap region. Implement projectPolicyOverrides (global rules as base, per-service overrides). Implement intervalToCron conversion (e.g. \"168h\" to \"0 0 * * 0\"). Implement UpdatePhase state machine (Idle, Validating, UpdatingInfra, UpdatingKeystone, Verifying, Complete, RollingBack). Write table-driven unit tests for policy projection and cron conversion.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.270199"
+    }
+  },
+  "origin": "plan"
+}

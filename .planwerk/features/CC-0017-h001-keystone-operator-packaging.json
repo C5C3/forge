@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0017",
+  "title": "H001: Keystone Operator Packaging",
+  "slug": "h001-keystone-operator-packaging",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Create operators/keystone/Dockerfile (golang:1.25 builder, distroless/static:nonroot runtime, CGO_ENABLED=0). Create Helm chart in operators/keystone/helm/keystone-operator/: Chart.yaml, values.yaml (image, replicas, resources, leaderElection, webhook, metrics, serviceAccount), CRD manifests, templates (deployment, service, serviceaccount, clusterrole, clusterrolebinding, webhook-configuration, _helpers.tpl). Create FluxCD HelmRelease deploy/flux-system/releases/keystone-operator.yaml.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.268806"
+    }
+  },
+  "origin": "plan"
+}

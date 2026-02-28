@@ -1,0 +1,102 @@
+# Planwerk Configuration
+# ==================================
+# This file configures the planwerk tool. Values can be overridden via
+# environment variables with PLANWERK_ prefix.
+#
+# For sensitive values like API keys, use .secrets.toml (add to .gitignore).
+
+[claude]
+# Claude API configuration
+base_url = ""
+
+# Task-specific configuration - set enabled = true to use API
+[claude.tasks.analyze]
+enabled = true
+
+[claude.tasks.improve]
+enabled = true
+
+[claude.tasks.review]
+enabled = true
+
+[claude.tasks.implement]
+enabled = true
+
+[claude.tasks.simplify]
+enabled = true
+
+[claude.tasks.prepare]
+enabled = true
+
+[claude.tasks.propose]
+enabled = true
+
+[claude.tasks.elaborate]
+enabled = true
+
+[claude.tasks.chat]
+enabled = true
+
+[claude.tasks.quick]
+enabled = true
+
+[claude.tasks.chore]
+enabled = true
+
+[claude.tasks.commit]
+enabled = true
+
+[reanalyze]
+enabled = true
+all = true
+
+[planwerk]
+# Prefix for feature IDs (e.g., "PW" -> "PW-0001")
+id_prefix = "CC"
+
+[project]
+# Project type: fullstack-webapp, go-project, python-library, api-only, custom
+type = "go-project"
+
+# Display name for the project (shown in Dashboard)
+name = "c5c3"
+
+# Directories (relative to project root)
+backend_dir = "src"
+frontend_dir = "frontend"
+
+[agents]
+enabled = true
+
+[external_review]
+enabled = true
+auto_request = true
+
+[git]
+author = "Christian Berendt <berendt@23technologies.cloud>"
+co_author = ""
+trailers = [
+    "AI-assisted: Claude Code",
+]
+
+[github]
+# GitHub App ID from your app's settings page
+app_id = ""
+
+# Path to the .pem private key file downloaded when creating the app
+private_key_path = ""
+
+# Installation ID for the target organization/user
+installation_id = ""
+
+# GitHub API base URL (change for GitHub Enterprise)
+api_base_url = "https://api.github.com"
+
+[[git.users]]
+github_account = "berendt"
+name = "Christian Berendt"
+email = "berendt@23technologies.cloud"
+trailers = [
+    "On-behalf-of: @SAP christian.berendt@sap.com",
+    "Signed-off-by: Christian Berendt <berendt@23technologies.cloud>"
+]

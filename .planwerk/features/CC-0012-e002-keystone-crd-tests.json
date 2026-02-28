@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0012",
+  "title": "E002: Keystone CRD Tests",
+  "slug": "e002-keystone-crd-tests",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Write envtest integration test verifying CRD registration, valid CR acceptance, invalid CR schema rejection, and webhook defaulting. Create Chainsaw E2E test tests/e2e/keystone/invalid-cr/ asserting webhook rejection (HTTP 422) for invalid cron expressions and duplicate plugin sections.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.266515"
+    }
+  },
+  "origin": "plan"
+}

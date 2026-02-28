@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0006",
+  "title": "C001: Keystone Container Image & Release Config",
+  "slug": "c001-keystone-container-image-release-config",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Create base images: images/python-base/Dockerfile (Ubuntu Noble, Python 3.12, runtime libraries, service user UID 42424, non-root) and images/venv-builder/Dockerfile (build dependencies, uv package manager, virtualenv at /var/lib/openstack/). Create the Keystone service Dockerfile images/keystone/Dockerfile as a multi-stage build: Stage 1 (venv-builder) installs Keystone + extras via uv pip install with --constraint upper-constraints.txt; Stage 2 (python-base) copies compiled virtualenv, adds Keystone runtime packages. Create release configuration: releases/2025.2/source-refs.yaml, releases/2025.2/upper-constraints.txt, releases/2025.2/extra-packages.yaml, and scripts/apply-constraint-overrides.sh. Verify image builds and keystone-manage --version succeeds.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.263712"
+    }
+  },
+  "origin": "plan"
+}

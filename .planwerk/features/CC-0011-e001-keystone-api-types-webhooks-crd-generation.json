@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0011",
+  "title": "E001: Keystone API Types, Webhooks & CRD Generation",
+  "slug": "e001-keystone-api-types-webhooks-crd-generation",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Define operators/keystone/api/v1alpha1/keystone_types.go: Keystone root type with Kubebuilder markers (object:root, subresource:status, printcolumn for Ready/Endpoint/Age). KeystoneSpec with Replicas (min 1, default 3), Image, Database (XValidation for clusterRef/host mutual exclusivity), Cache, Fernet (RotationSchedule default \"0 0 * * 0\", MaxActiveKeys min 3 default 3), Federation, Bootstrap (AdminUser default \"admin\", AdminPasswordSecretRef, Region default \"RegionOne\"), Middleware, Plugins, PolicyOverrides (XValidation requiring at least one source), ExtraConfig. KeystoneStatus with Conditions and Endpoint. Implement defaulting webhook (Default()) and validation webhook (ValidateCreate/ValidateUpdate with cron validation, duplicate plugin detection, policy source requirement). Generate CRD YAML via controller-gen. Write unit tests for every webhook rule.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.266068"
+    }
+  },
+  "origin": "plan"
+}

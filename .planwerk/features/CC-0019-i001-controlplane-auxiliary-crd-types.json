@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0019",
+  "title": "I001: ControlPlane & Auxiliary CRD Types",
+  "slug": "i001-controlplane-auxiliary-crd-types",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Define ControlPlane CRD in operators/c5c3/api/v1alpha1/: ControlPlane root type (printcolumn for Ready/Phase/Age), ControlPlaneSpec with OpenStackRelease (pattern ^\\d{4}\\.\\d$), Region, Infrastructure (database, messaging, cache sub-specs), Services.Keystone (enabled/replicas/fernet/policyOverrides), Global (TLS, PolicyOverrides). ControlPlaneStatus with Conditions (Ready, InfrastructureReady, KeystoneReady), UpdatePhase enum, Services map. Define SecretAggregate CRD (multi-source secret merging: Sources with SecretRef and optional key filtering, Target name). Define CredentialRotation CRD (TargetServiceUser, RotationType, Schedule with IntervalDays/PreRotationDays, GracePeriodDays). Implement defaulting and validation webhooks for ControlPlane. Generate CRD manifests. Write unit tests for all webhook rules.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.269732"
+    }
+  },
+  "origin": "plan"
+}

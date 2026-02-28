@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0013",
+  "title": "F001: Keystone Reconciler & Sub-reconcilers",
+  "slug": "f001-keystone-reconciler-sub-reconcilers",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Implement KeystoneReconciler with Client, Scheme, Recorder fields. SetupWithManager with watches for owned Deployments, Services, ConfigMaps, Jobs, CronJobs, Secrets. RBAC markers for all permissions. Main Reconcile function calling sub-reconcilers sequentially: reconcileSecrets (check ESO Secrets, set SecretsReady), reconcileDatabase (managed/brownfield MariaDB CRs + db_sync Job, set DatabaseReady), reconcileFernetKeys (initial generation + rotation CronJob + PushSecret, set FernetKeysReady), reconcileConfig (build keystone.conf + api-paste.ini + policy.yaml, create immutable ConfigMap), reconcileDeployment (Deployment + Service with probes and volume mounts, set DeploymentReady), reconcileBootstrap (bootstrap Job, set BootstrapReady). Aggregate Ready condition when all sub-conditions True. Wire into operators/keystone/main.go with scheme registration, webhooks, and health probes.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.266977"
+    }
+  },
+  "origin": "plan"
+}

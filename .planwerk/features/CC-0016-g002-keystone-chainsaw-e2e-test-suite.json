@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0016",
+  "title": "G002: Keystone Chainsaw E2E Test Suite",
+  "slug": "g002-keystone-chainsaw-e2e-test-suite",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Create the full Chainsaw E2E test suite in tests/e2e/keystone/: basic-deployment/ (happy path, all conditions Ready=True), missing-secret/ (SecretsReady=False, recovery on Secret creation), fernet-rotation/ (CronJob schedule, manual trigger, key update, rolling restart), scale/ (replicas 3 to 5 to 2), deletion-cleanup/ (owner reference garbage collection), policy-overrides/ (policy.yaml in ConfigMap, oslo_policy config), middleware-config/ (api-paste.ini pipeline modification), brownfield-database/ (explicit host/port, no MariaDB CRs), image-upgrade/ (rolling update, Ready maintained).",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.268320"
+    }
+  },
+  "origin": "plan"
+}

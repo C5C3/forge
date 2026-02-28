@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0026",
+  "title": "K002: Documentation",
+  "slug": "k002-documentation",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Write deployment guide: prerequisites, deploy infrastructure stack, deploy c5c3-operator, apply ControlPlane CR, verify Keystone running, troubleshooting. Document all CRD API surfaces (ControlPlane, Keystone, SecretAggregate, CredentialRotation) with example CRs for common use cases. Document Helm chart values for both operators with resource recommendations and example overrides.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.273109"
+    }
+  },
+  "origin": "plan"
+}

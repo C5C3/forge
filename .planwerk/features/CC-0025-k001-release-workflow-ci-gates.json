@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0025",
+  "title": "K001: Release Workflow & CI Gates",
+  "slug": "k001-release-workflow-ci-gates",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Validate the full release process: SemVer version bump, git tag v0.1.0, CI builds all artifacts (Keystone service image, Keystone Operator image, c5c3-operator image, Helm charts), pushes to GHCR, FluxCD HelmRelease picks up the new version. Add generated code verification gate (make manifests && make generate && git diff --exit-code). Verify all CI gates pass: lint green, tests with coverage thresholds, E2E scenarios pass reliably (zero flakiness across 3 consecutive runs).",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.272624"
+    }
+  },
+  "origin": "plan"
+}

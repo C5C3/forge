@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0004",
+  "title": "B001: Common Types & Pure Function Packages",
+  "slug": "b001-common-types-pure-function-packages",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Implement all shared type definitions in internal/common/types/: ImageSpec, DatabaseSpec (ClusterRef/Host mutual exclusivity), MessagingSpec, CacheSpec, SecretRefSpec, PolicySpec, PluginSpec, MiddlewareSpec, PipelinePosition. Implement conditions/ package (SetCondition, IsReady, GetCondition, AllTrue). Implement config/ package (RenderINI, MergeDefaults, InjectSecrets, InjectOsloPolicyConfig). Implement plugins/ package (RenderPastePipeline, RenderPluginConfig). Implement policy/ package (RenderPolicyYAML, MergePolicies, ValidatePolicyRules). Write table-driven unit tests for all functions.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.262827"
+    }
+  },
+  "origin": "plan"
+}

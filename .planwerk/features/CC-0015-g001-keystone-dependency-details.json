@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0015",
+  "title": "G001: Keystone Dependency Details",
+  "slug": "g001-keystone-dependency-details",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Implement detailed dependency interactions: DB connection string assembly for managed mode (resolve from MariaDB CR status) and brownfield mode (explicit host/port). Memcached server list discovery (pod DNS from Memcached CR in managed mode, explicit list in brownfield mode). Complete Fernet rotation CronJob (fernet_rotate command, writable Secret mount, maxActiveKeys enforcement, Deployment annotation for rolling restart). Complete bootstrap Job (admin-credentials mount, bootstrap arguments, backoffLimit, ttlSecondsAfterFinished). Write unit tests for connection string assembly, memcached discovery, and envtest tests for CronJob and Job details.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.267876"
+    }
+  },
+  "origin": "plan"
+}

@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0021",
+  "title": "I003: Auxiliary Reconcilers",
+  "slug": "i003-auxiliary-reconcilers",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Implement SecretAggregateReconciler: watch SecretAggregate CR and source Secrets, merge data into target Secret with owner reference. Implement CredentialRotationReconciler: track rotation schedule, create new credentials in pre-rotation window, delete old after grace period. Write envtest integration tests for both.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.270668"
+    }
+  },
+  "origin": "plan"
+}

@@ -1,0 +1,611 @@
+{
+  "feature_id": "CC-0003",
+  "title": "A003: Add minimal GitHub Actions CI workflow",
+  "slug": "a003-add-minimal-github-actions-ci-workflow",
+  "status": "prepared",
+  "phase": null,
+  "summary": "",
+  "description": "**Size:** 🔧 small\n**Category:** infrastructure\n**Priority:** medium\n\n## Summary\n\nCreate a GitHub Actions CI workflow (`.github/workflows/ci.yaml`) that runs three parallel jobs — `lint`, `test`, and `test-integration` — on every PR and push to `main`. The workflow uses Go workspace mode via `go.work`, includes concurrency control to cancel superseded runs, and depends on the Makefile and Go workspace scaffolded by CC-0001.\n\n## Scope\n\n**Included:**\n- `.github/workflows/ci.yaml` with triggers on `push` to `main` and `pull_request`\n- `lint` job using `golangci/golangci-lint-action` against the Go workspace root\n- `test` job running `make test` (unit tests)\n- `test-integration` job running `make test-integration` (envtest-based integration tests)\n- `actions/setup-go` with Go version read from `go.mod` and module caching\n- SPDX license header (matching existing `reuse.yaml` / `deploy-docs.yaml` conventions)\n- `permissions: contents: read` (least privilege, matching `reuse.yaml`)\n- Concurrency group `${{ github.ref }}-${{ github.workflow }}` with `cancel-in-progress: true` (matching `mega-linter.yml` pattern)\n\n**Excluded (with rationale):**\n- Container image builds — CC-0007, separate workflow\n- Helm chart packaging/push — S017/S018, YAGNI until charts exist\n- E2E/Chainsaw tests — S018, requires kind cluster setup, not part of minimal CI\n- Code coverage reporting/thresholds — S018, YAGNI for the minimal CI gate\n- Branch protection rule configuration — repo setting, not a workflow file\n- Matrix builds per operator module — Makefile abstracts this via `OPERATORS` variable; Go workspace mode with `go.work` provides single cache/download\n\n## Visualization\n\n```mermaid\nflowchart TD\n    trigger[\"Push to main / PR\"]\n\n    trigger --> lint\n    trigger --> test\n    trigger --> integ\n\n    subgraph lint[\"lint\"]\n        L1[\"actions/checkout@v4\"] --> L2[\"actions/setup-go\"]\n        L2 --> L3[\"golangci-lint-action\"]\n    end\n\n    subgraph test[\"test\"]\n        T1[\"actions/checkout@v4\"] --> T2[\"actions/setup-go\"]\n        T2 --> T3[\"make test\"]\n    end\n\n    subgraph integ[\"test-integration\"]\n        I1[\"actions/checkout@v4\"] --> I2[\"actions/setup-go\"]\n        I2 --> I3[\"make test-integration\"]\n    end\n\n    lint --> merge[\"PR Merge Gate\"]\n    test --> merge\n    integ --> merge\n```\n\n```mermaid\nsequenceDiagram\n    participant Dev as Developer\n    participant GH as GitHub\n    participant CI as CI Workflow\n    participant Lint as lint job\n    participant Test as test job\n    participant Integ as test-integration job\n\n    Dev->>GH: Push / Open PR\n    GH->>CI: Trigger ci.yaml\n    par All jobs run in parallel\n        CI->>Lint: golangci-lint-action\n        CI->>Test: make test\n        CI->>Integ: make test-integration\n    end\n    Lint-->>CI: pass/fail\n    Test-->>CI: pass/fail\n    Integ-->>CI: pass/fail\n    CI-->>GH: All checks status\n    GH-->>Dev: PR status update\n```\n\n## Key Components\n\n- **`.github/workflows/ci.yaml`** — Single workflow file with 3 parallel jobs. Follows existing conventions: SPDX header (`Copyright 2026 SAP SE or an SAP affiliate company`), `\"on\"` quoting, `ubuntu-latest`, `permissions: contents: read`. Uses `.yaml` extension matching `reuse.yaml` and `deploy-docs.yaml`\n- **`lint` job** — Uses `golangci/golangci-lint-action` (handles installation, caching, version pinning); targets the Go workspace root. No separate `actions/setup-go` needed — the action handles Go setup internally\n- **`test` job** — `actions/setup-go` with `go-version-file: go.mod` + module caching, then `make test`. Relies on CC-0001 Makefile iterating over `OPERATORS`\n- **`test-integration` job** — Same Go setup as `test`, then `make test-integration`. May require envtest binaries — depends on whether CC-0001's Makefile handles `setup-envtest` download within the target or needs a separate `make install-test-deps` step first\n- **Concurrency group** — `${{ github.ref }}-${{ github.workflow }}` with `cancel-in-progress: true`, mirroring `mega-linter.yml:32-34`\n- **Dependency** — Hard dependency on CC-0001 (Go workspace, Makefile targets, `.golangci.yml`) and CC-0002 (test infrastructure for `test-integration` to be meaningful)",
+  "stories": [
+    {
+      "title": "Developer receives automated lint feedback on every PR",
+      "role": "developer",
+      "want": "golangci-lint to run automatically on every pull request and push to main",
+      "so_that": "code quality issues are caught before merge without manual lint runs",
+      "criteria": [
+        "The lint job runs on every pull_request event",
+        "The lint job runs on every push to the main branch",
+        "golangci-lint-action uses the project's .golangci.yml configuration from the workspace root",
+        "Lint failures block PR merge by reporting a failed check status"
+      ]
+    },
+    {
+      "title": "Developer receives automated unit test results on every PR",
+      "role": "developer",
+      "want": "unit tests to run automatically via `make test` on every PR and push to main",
+      "so_that": "test regressions are detected before merge",
+      "criteria": [
+        "The test job runs `make test` which executes unit tests across all operator modules via the OPERATORS variable",
+        "Go is set up with the correct version read from go.work (not hardcoded)",
+        "Go module dependencies are cached between runs for faster execution",
+        "Test failures block PR merge by reporting a failed check status"
+      ]
+    },
+    {
+      "title": "Developer receives automated integration test results on every PR",
+      "role": "developer",
+      "want": "envtest-based integration tests to run automatically via `make test-integration` on every PR and push to main",
+      "so_that": "integration regressions against the Kubernetes API are caught before merge",
+      "criteria": [
+        "The test-integration job runs `make test-integration` which executes envtest-based integration tests",
+        "Go setup matches the test job configuration (same go-version-file, same caching)",
+        "Integration test failures block PR merge by reporting a failed check status",
+        "The job runs in parallel with lint and test jobs (not sequentially after them)"
+      ]
+    },
+    {
+      "title": "Developer benefits from automatic cancellation of superseded CI runs",
+      "role": "developer",
+      "want": "pushing new commits to a PR to automatically cancel any in-progress CI run for the same branch",
+      "so_that": "CI resources are not wasted on outdated code and results arrive faster",
+      "criteria": [
+        "Concurrency group is scoped per-branch per-workflow so different branches do not cancel each other",
+        "cancel-in-progress is true so new pushes cancel running workflows for the same branch",
+        "Concurrency group pattern matches the existing mega-linter.yml convention (${{ github.ref }}-${{ github.workflow }})",
+        "Pushing to a different branch does not affect in-progress runs on other branches"
+      ]
+    },
+    {
+      "title": "Reviewer verifies CI workflow follows project security and convention standards",
+      "role": "reviewer",
+      "want": "the CI workflow to follow the project's established conventions and least-privilege security practices",
+      "so_that": "the workflow is consistent with existing workflows and does not grant unnecessary permissions",
+      "criteria": [
+        "SPDX license header matches deploy-docs.yaml convention (Copyright 2026 SAP SE or an SAP affiliate company, Apache-2.0)",
+        "Workflow permissions are restricted to contents: read (least privilege, matching reuse.yaml)",
+        "File uses .yaml extension matching reuse.yaml and deploy-docs.yaml",
+        "The 'on' key is quoted as '\"on\"' to avoid YAML boolean interpretation, matching all existing workflows"
+      ]
+    }
+  ],
+  "requirements": [
+    {
+      "id": "REQ-001",
+      "description": "The workflow SHALL trigger on push to the main branch and on all pull_request events",
+      "priority": "SHALL",
+      "rationale": "CI must run on both PR creation/updates and direct pushes to main to catch issues at all merge paths",
+      "scenarios": [
+        {
+          "name": "Triggers on push to main",
+          "when": "a commit is pushed directly to the main branch",
+          "then": "the CI workflow is triggered and all three jobs (lint, test, test-integration) run",
+          "and_then": [
+            "the workflow appears in the Actions tab with the push event"
+          ]
+        },
+        {
+          "name": "Triggers on pull request",
+          "when": "a pull request is opened, synchronized, or reopened",
+          "then": "the CI workflow is triggered and all three jobs run against the PR head commit",
+          "and_then": [
+            "check statuses appear on the PR conversation page"
+          ]
+        },
+        {
+          "name": "Does not trigger on pushes to non-main branches outside PRs",
+          "when": "a commit is pushed to a feature branch with no open PR",
+          "then": "the CI workflow is NOT triggered because only push-to-main and pull_request events are configured",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-002",
+      "description": "The lint job SHALL use golangci/golangci-lint-action@v9 to run golangci-lint against the Go workspace root with version v2.10 pinned",
+      "priority": "SHALL",
+      "rationale": "golangci-lint-action handles Go installation, binary caching, and version management internally; version pinning ensures reproducible lint results across runs",
+      "scenarios": [
+        {
+          "name": "Lint runs via golangci-lint-action",
+          "when": "the lint job executes",
+          "then": "golangci-lint-action@v9 runs golangci-lint with version: v2.10 against the repository root",
+          "and_then": [
+            "the action uses the project's .golangci.yml for linter configuration"
+          ]
+        },
+        {
+          "name": "No separate setup-go step in lint job",
+          "when": "the lint job step list is inspected",
+          "then": "there is no separate actions/setup-go step because golangci-lint-action handles Go setup internally",
+          "and_then": [
+            "the action reads Go version from go.work or go.mod automatically"
+          ]
+        },
+        {
+          "name": "Lint failure reports check failure",
+          "when": "golangci-lint finds lint violations in any workspace module",
+          "then": "the lint job exits with a non-zero status code",
+          "and_then": [
+            "the PR shows a failed lint check"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-003",
+      "description": "The test job SHALL run `make test` with Go version sourced from go-version-file: go.work and module caching enabled via actions/setup-go@v5",
+      "priority": "SHALL",
+      "rationale": "Using go-version-file avoids hardcoding Go versions across workflow and go.work; module caching speeds up repeated runs by reusing downloaded dependencies",
+      "scenarios": [
+        {
+          "name": "Go version read from go.work",
+          "when": "the test job sets up Go via actions/setup-go@v5",
+          "then": "Go version is read from go-version-file: go.work (not a hardcoded go-version string)",
+          "and_then": [
+            "the installed Go version matches the workspace go directive (1.25)"
+          ]
+        },
+        {
+          "name": "Module caching enabled",
+          "when": "the test job sets up Go",
+          "then": "Go module cache is enabled (setup-go default) and ~/go/pkg/mod is cached between runs",
+          "and_then": [
+            "subsequent runs with unchanged go.sum files restore cache and skip module downloads"
+          ]
+        },
+        {
+          "name": "make test executes unit tests",
+          "when": "the test job reaches the make test step",
+          "then": "`make test` runs all unit tests across all operator modules via the Makefile's OPERATORS iteration",
+          "and_then": [
+            "test failures cause the job to exit non-zero"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-004",
+      "description": "The test-integration job SHALL run `make test-integration` with the same Go setup configuration as the test job (go-version-file: go.work, module caching)",
+      "priority": "SHALL",
+      "rationale": "Integration tests (envtest-based) require the same Go toolchain as unit tests; consistent setup prevents version drift between test types",
+      "scenarios": [
+        {
+          "name": "Same Go setup as test job",
+          "when": "the test-integration job sets up Go",
+          "then": "actions/setup-go@v5 is used with go-version-file: go.work and module caching, matching the test job exactly",
+          "and_then": [
+            "Go version and cache configuration are identical to the test job"
+          ]
+        },
+        {
+          "name": "make test-integration executes envtest tests",
+          "when": "the test-integration job reaches the make test-integration step",
+          "then": "`make test-integration` runs all envtest-based integration tests via the Makefile",
+          "and_then": [
+            "integration test failures cause the job to exit non-zero"
+          ]
+        },
+        {
+          "name": "test-integration runs independently of test job",
+          "when": "the CI workflow is triggered",
+          "then": "the test-integration job starts without waiting for the test job to complete",
+          "and_then": [
+            "both jobs run on separate runners in parallel"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-005",
+      "description": "All three jobs (lint, test, test-integration) SHALL run in parallel with no inter-job dependencies",
+      "priority": "SHALL",
+      "rationale": "Parallel execution minimizes total CI wall-clock time; these jobs are independent and do not consume each other's outputs",
+      "scenarios": [
+        {
+          "name": "All jobs start simultaneously",
+          "when": "the CI workflow is triggered",
+          "then": "lint, test, and test-integration jobs all start on their own runners without waiting for each other",
+          "and_then": [
+            "no job has a `needs:` key referencing another job in this workflow"
+          ]
+        },
+        {
+          "name": "One job failure does not cancel others",
+          "when": "the lint job fails while test and test-integration are still running",
+          "then": "the test and test-integration jobs continue running to completion",
+          "and_then": [
+            "all three job results are independently visible on the PR"
+          ]
+        },
+        {
+          "name": "All three jobs must pass for complete CI success",
+          "when": "one or more jobs fail",
+          "then": "the overall CI workflow status is reported as failure",
+          "and_then": [
+            "PR merge is blocked when branch protection requires all checks to pass"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "REQ-006",
+      "description": "The workflow SHALL define a concurrency group scoped per-branch per-workflow with cancel-in-progress: true",
+      "priority": "SHALL",
+      "rationale": "Cancelling superseded runs saves CI resources and delivers results faster; per-branch scoping prevents cross-branch cancellation",
+      "scenarios": [
+        {
+          "name": "Concurrency group matches mega-linter pattern",
+          "when": "the workflow concurrency block is inspected",
+          "then": "group is `${{ github.ref }}-${{ github.workflow }}` matching mega-linter.yml lines 32-34",
+          "and_then": [
+            "cancel-in-progress is set to true"
+          ]
+        },
+        {
+          "name": "New push cancels old run on same branch",
+          "when": "a second commit is pushed to a branch while a CI run is in progress for the first commit",
+          "then": "the in-progress run is cancelled and a new run starts for the second commit",
+          "and_then": [
+            "only the latest commit's CI results are reported on the PR"
+          ]
+        },
+        {
+          "name": "Different branches do not cancel each other",
+          "when": "CI runs are in progress on branch-A and a push is made to branch-B",
+          "then": "the branch-A run continues unaffected because the concurrency group keys differ",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-007",
+      "description": "The workflow SHALL declare top-level `permissions: contents: read` following the least-privilege principle",
+      "priority": "SHALL",
+      "rationale": "Least-privilege permissions restrict the GITHUB_TOKEN scope and prevent accidental writes or token misuse; matches reuse.yaml convention",
+      "scenarios": [
+        {
+          "name": "Top-level permissions restrict to contents read",
+          "when": "the workflow YAML top-level permissions block is parsed",
+          "then": "the permissions block contains exactly `contents: read` and no other scopes",
+          "and_then": [
+            "no job-level permissions block overrides this to grant write access"
+          ]
+        },
+        {
+          "name": "GITHUB_TOKEN is restricted to read",
+          "when": "any step in any job implicitly uses the GITHUB_TOKEN",
+          "then": "the token only has read access to repository contents",
+          "and_then": [
+            "write operations (push, comment, release creation) would fail if attempted"
+          ]
+        },
+        {
+          "name": "No unnecessary permission scopes declared",
+          "when": "the permissions block is inspected",
+          "then": "only `contents: read` is declared — no packages, issues, pull-requests, or other scopes",
+          "and_then": []
+        }
+      ]
+    },
+    {
+      "id": "REQ-008",
+      "description": "The workflow file SHALL include an SPDX license header matching the deploy-docs.yaml convention and use the .yaml file extension",
+      "priority": "SHALL",
+      "rationale": "SPDX headers are required for REUSE compliance (verified by the reuse.yaml workflow); .yaml extension and formatting must be consistent with existing project workflows",
+      "scenarios": [
+        {
+          "name": "SPDX header matches deploy-docs.yaml format",
+          "when": "the first lines of ci.yaml are inspected",
+          "then": "the file starts with `# SPDX-FileCopyrightText: Copyright 2026 SAP SE or an SAP affiliate company` followed by `#` blank comment and `# SPDX-License-Identifier: Apache-2.0`",
+          "and_then": [
+            "a `---` YAML document separator follows the header"
+          ]
+        },
+        {
+          "name": "REUSE compliance check passes",
+          "when": "the reuse.yaml workflow runs and validates ci.yaml",
+          "then": "the file passes REUSE compliance validation without errors",
+          "and_then": []
+        },
+        {
+          "name": "File uses .yaml extension",
+          "when": "the file path is inspected",
+          "then": "the file is at `.github/workflows/ci.yaml` (not ci.yml) matching reuse.yaml and deploy-docs.yaml extension convention",
+          "and_then": []
+        }
+      ]
+    }
+  ],
+  "tasks": [
+    {
+      "id": "1.1",
+      "title": "Create `.github/workflows/ci.yaml` with SPDX header (Copyright 2026 SAP SE or an SAP affiliate company, Apache-2.0), `---` separator, workflow name `CI`, quoted `\"on\"` triggers (push branches: [main] + pull_request), top-level `permissions: contents: read`, concurrency group `${{ github.ref }}-${{ github.workflow }}` with cancel-in-progress: true (REQ-001, REQ-006, REQ-007, REQ-008)",
+      "level": 1,
+      "estimate_minutes": 15,
+      "requirements": [
+        "REQ-001",
+        "REQ-006",
+        "REQ-007",
+        "REQ-008"
+      ]
+    },
+    {
+      "id": "1.2",
+      "title": "Add `lint` job to ci.yaml — runs-on: ubuntu-latest, step 1: actions/checkout@v4, step 2: golangci/golangci-lint-action@v9 with `version: v2.10` pinned. No separate actions/setup-go step (action handles Go setup internally). No `needs:` key. (REQ-002, REQ-005)",
+      "level": 1,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-002",
+        "REQ-005"
+      ]
+    },
+    {
+      "id": "1.3",
+      "title": "Add `test` job to ci.yaml — runs-on: ubuntu-latest, step 1: actions/checkout@v4, step 2: actions/setup-go@v5 with `go-version-file: go.work` (module caching enabled by default), step 3: name 'Run unit tests' with `run: make test`. No `needs:` key. (REQ-003, REQ-005)",
+      "level": 1,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-003",
+        "REQ-005"
+      ]
+    },
+    {
+      "id": "1.4",
+      "title": "Add `test-integration` job to ci.yaml — runs-on: ubuntu-latest, step 1: actions/checkout@v4, step 2: actions/setup-go@v5 with `go-version-file: go.work` (identical to test job), step 3: name 'Run integration tests' with `run: make test-integration`. No `needs:` key. (REQ-004, REQ-005)",
+      "level": 1,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-004",
+        "REQ-005"
+      ]
+    },
+    {
+      "id": "2.1",
+      "title": "Validate complete ci.yaml YAML syntax and GitHub Actions workflow schema correctness — valid `on`/`jobs`/`steps` structure, no YAML parsing errors, all action references use valid `owner/repo@version` format (REQ-001)",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-001"
+      ]
+    },
+    {
+      "id": "2.2",
+      "title": "Verify SPDX header matches deploy-docs.yaml exactly: first line `# SPDX-FileCopyrightText: Copyright 2026 SAP SE or an SAP affiliate company`, second line `#`, third line `# SPDX-License-Identifier: Apache-2.0`, followed by `---` separator (REQ-008)",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-008"
+      ]
+    },
+    {
+      "id": "2.3",
+      "title": "Verify concurrency group key is exactly `${{ github.ref }}-${{ github.workflow }}` with `cancel-in-progress: true`, matching mega-linter.yml lines 32-34 character-for-character (REQ-006)",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-006"
+      ]
+    },
+    {
+      "id": "2.4",
+      "title": "Verify lint job has only 2 steps (checkout + golangci-lint-action), no actions/setup-go step, no working-directory override, and golangci-lint-action targets the workspace root implicitly (REQ-002)",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-002"
+      ]
+    },
+    {
+      "id": "2.5",
+      "title": "Verify test and test-integration jobs both use `go-version-file: go.work` (not hardcoded `go-version:`), and that actions/setup-go module caching is not explicitly disabled (default cache: true) (REQ-003, REQ-004)",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-003",
+        "REQ-004"
+      ]
+    },
+    {
+      "id": "2.6",
+      "title": "Verify all three jobs (lint, test, test-integration) have no `needs:` key — confirming they run in parallel with no inter-job dependencies (REQ-005)",
+      "level": 2,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-005"
+      ]
+    },
+    {
+      "id": "3.1",
+      "title": "Add reference documentation for CI workflow: file location (.github/workflows/ci.yaml), trigger events, job descriptions (lint/test/test-integration), Go setup convention (go-version-file: go.work), concurrency behavior, dependency on CC-0001 Makefile targets and .golangci.yml (REQ-001 to REQ-008)",
+      "level": 3,
+      "estimate_minutes": 20,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003",
+        "REQ-004",
+        "REQ-005",
+        "REQ-006",
+        "REQ-007",
+        "REQ-008"
+      ]
+    },
+    {
+      "id": "3.2",
+      "title": "Cross-reference implementation against feature scope checklist — verify all 'Included' items present (triggers, lint, test, test-integration, setup-go, SPDX, permissions, concurrency) and all 'Excluded' items absent (no image builds, no helm, no E2E/Chainsaw, no coverage, no branch protection, no matrix builds) (all REQs)",
+      "level": 3,
+      "estimate_minutes": 10,
+      "requirements": [
+        "REQ-001",
+        "REQ-002",
+        "REQ-003",
+        "REQ-004",
+        "REQ-005",
+        "REQ-006",
+        "REQ-007",
+        "REQ-008"
+      ]
+    }
+  ],
+  "test_specifications": [
+    {
+      "test_file": ".github/workflows/ci.yaml",
+      "test_function": "verify_push_trigger_main_branch",
+      "story": "Developer receives automated lint feedback on every PR",
+      "expected": "The 'on' block contains `push: branches: [main]` — workflow triggers on pushes to main only",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": ".github/workflows/ci.yaml",
+      "test_function": "verify_pull_request_trigger",
+      "story": "Developer receives automated unit test results on every PR",
+      "expected": "The 'on' block contains `pull_request` — workflow triggers on all PR events",
+      "requirement_id": "REQ-001"
+    },
+    {
+      "test_file": ".github/workflows/ci.yaml",
+      "test_function": "verify_lint_uses_golangci_lint_action_v9",
+      "story": "Developer receives automated lint feedback on every PR",
+      "expected": "The lint job uses `golangci/golangci-lint-action@v9` with `version: v2.10` pinned",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": ".github/workflows/ci.yaml",
+      "test_function": "verify_lint_no_setup_go",
+      "story": "Developer receives automated lint feedback on every PR",
+      "expected": "The lint job has exactly 2 steps (checkout + golangci-lint-action) — no separate actions/setup-go",
+      "requirement_id": "REQ-002"
+    },
+    {
+      "test_file": ".github/workflows/ci.yaml",
+      "test_function": "verify_test_go_version_file",
+      "story": "Developer receives automated unit test results on every PR",
+      "expected": "The test job uses `actions/setup-go@v5` with `go-version-file: go.work` (not hardcoded go-version)",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": ".github/workflows/ci.yaml",
+      "test_function": "verify_test_runs_make_test",
+      "story": "Developer receives automated unit test results on every PR",
+      "expected": "The test job has a step with `run: make test` that executes unit tests",
+      "requirement_id": "REQ-003"
+    },
+    {
+      "test_file": ".github/workflows/ci.yaml",
+      "test_function": "verify_integration_go_setup_matches_test",
+      "story": "Developer receives automated integration test results on every PR",
+      "expected": "The test-integration job uses `actions/setup-go@v5` with `go-version-file: go.work` — identical to test job",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": ".github/workflows/ci.yaml",
+      "test_function": "verify_integration_runs_make_test_integration",
+      "story": "Developer receives automated integration test results on every PR",
+      "expected": "The test-integration job has a step with `run: make test-integration` that executes envtest tests",
+      "requirement_id": "REQ-004"
+    },
+    {
+      "test_file": ".github/workflows/ci.yaml",
+      "test_function": "verify_no_needs_between_jobs",
+      "story": "Developer receives automated integration test results on every PR",
+      "expected": "None of the three jobs (lint, test, test-integration) have a `needs:` key — they run in parallel",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": ".github/workflows/ci.yaml",
+      "test_function": "verify_exactly_three_jobs_defined",
+      "story": "Developer receives automated lint feedback on every PR",
+      "expected": "The jobs block contains exactly three jobs: lint, test, test-integration — no additional jobs",
+      "requirement_id": "REQ-005"
+    },
+    {
+      "test_file": ".github/workflows/ci.yaml",
+      "test_function": "verify_concurrency_group_pattern",
+      "story": "Developer benefits from automatic cancellation of superseded CI runs",
+      "expected": "Concurrency group is `${{ github.ref }}-${{ github.workflow }}` matching mega-linter.yml convention",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": ".github/workflows/ci.yaml",
+      "test_function": "verify_cancel_in_progress_true",
+      "story": "Developer benefits from automatic cancellation of superseded CI runs",
+      "expected": "The concurrency block has `cancel-in-progress: true`",
+      "requirement_id": "REQ-006"
+    },
+    {
+      "test_file": ".github/workflows/ci.yaml",
+      "test_function": "verify_permissions_contents_read_only",
+      "story": "Reviewer verifies CI workflow follows project security and convention standards",
+      "expected": "Top-level permissions block contains exactly `contents: read` — no other scopes, no job-level overrides",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": ".github/workflows/ci.yaml",
+      "test_function": "verify_no_job_level_permissions",
+      "story": "Reviewer verifies CI workflow follows project security and convention standards",
+      "expected": "No individual job defines a `permissions:` block that could override the top-level least-privilege setting",
+      "requirement_id": "REQ-007"
+    },
+    {
+      "test_file": ".github/workflows/ci.yaml",
+      "test_function": "verify_spdx_header_format",
+      "story": "Reviewer verifies CI workflow follows project security and convention standards",
+      "expected": "File starts with `# SPDX-FileCopyrightText: Copyright 2026 SAP SE or an SAP affiliate company` then `#` then `# SPDX-License-Identifier: Apache-2.0` then `---`",
+      "requirement_id": "REQ-008"
+    },
+    {
+      "test_file": ".github/workflows/ci.yaml",
+      "test_function": "verify_yaml_extension_and_on_quoting",
+      "story": "Reviewer verifies CI workflow follows project security and convention standards",
+      "expected": "File path ends with `.yaml` (not `.yml`); the trigger key is quoted as `\"on\"` to prevent YAML boolean interpretation",
+      "requirement_id": "REQ-008"
+    }
+  ],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [
+    "ci.yaml file exists at `.github/workflows/ci.yaml` with valid YAML syntax and correct GitHub Actions schema structure",
+    "SPDX header matches deploy-docs.yaml convention exactly: `Copyright 2026 SAP SE or an SAP affiliate company`, `Apache-2.0`, blank comment line, `---` separator",
+    "Workflow triggers on `push: branches: [main]` and `pull_request` only — no tag triggers, no other branch triggers, no workflow_dispatch",
+    "All three jobs (lint, test, test-integration) run in parallel with no `needs:` dependencies; lint uses golangci-lint-action@v9 with version: v2.10; test and test-integration use actions/setup-go@v5 with go-version-file: go.work",
+    "Permissions are `contents: read` at the top level with no job-level permission overrides — least-privilege principle verified",
+    "Concurrency group is `${{ github.ref }}-${{ github.workflow }}` with `cancel-in-progress: true` — matching mega-linter.yml pattern exactly",
+    "No excluded scope items present: no container image builds, no Helm packaging, no E2E/Chainsaw jobs, no code coverage, no matrix builds per operator, no branch protection configuration",
+    "Reference documentation exists covering CI workflow configuration, jobs, Go setup convention, and CC-0001 dependency"
+  ],
+  "implementation_notes": "Architectural decisions: (1) Single workflow file `.github/workflows/ci.yaml` with 3 parallel jobs — no job dependencies, no matrix builds. The Makefile's OPERATORS variable handles multi-module iteration, so no per-operator matrix is needed. (2) go-version-file: go.work instead of go.mod — the repository root has go.work (from CC-0001) not go.mod. actions/setup-go@v5 supports reading Go version from go.work. This is a minor deviation from the feature description wording ('Go version read from go.mod') but matches the actual workspace layout. (3) Lint job uses golangci-lint-action@v9 without a separate setup-go step — the action handles Go installation internally via its built-in setup-go integration. This reduces the step count and avoids potential version conflicts between setup-go and the action's internal Go setup. (4) golangci-lint version v2.10 is pinned via the action's `version` input, matching architecture/07-ci-cd-and-packaging.md. (5) SPDX header follows deploy-docs.yaml (2026) convention rather than reuse.yaml (2024) — 2026 is the current year and the newer convention. (6) Concurrency group uses the exact pattern from mega-linter.yml (${{ github.ref }}-${{ github.workflow }}) ensuring consistent behavior across all repository workflows. (7) The workflow will not pass until CC-0001 (go.work, Makefile, .golangci.yml) is merged — this is expected and documented in the feature's dependency list.",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.262375"
+    },
+    "elaborated": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T21:08:51.591211"
+    },
+    "preparing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T22:44:55.055972"
+    },
+    "prepared": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T22:51:47.893430"
+    }
+  },
+  "execution_history": [
+    {
+      "run_id": "e5b09a22-e1b5-4eda-9353-41e58bf3f3b2",
+      "timestamp": "2026-02-22T22:51:47.893457",
+      "total_duration": 410.0031588077545,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "prepare",
+          "duration": 410.0031588077545,
+          "type": "prepare",
+          "status": "done"
+        }
+      ]
+    }
+  ]
+}

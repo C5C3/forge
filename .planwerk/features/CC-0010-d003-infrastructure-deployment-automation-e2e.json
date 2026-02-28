@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0010",
+  "title": "D003: Infrastructure Deployment Automation & E2E",
+  "slug": "d003-infrastructure-deployment-automation-e2e",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Create make deploy-infra target deploying the full stack to kind in correct order: cert-manager, OpenBao, ESO, MariaDB Operator, Memcached Operator, infrastructure CRs, ExternalSecrets. Include make teardown-infra for cleanup. Create Chainsaw E2E test tests/e2e/infrastructure/infra-stack-health/chainsaw-test.yaml validating all components come up healthy.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.265607"
+    }
+  },
+  "origin": "plan"
+}

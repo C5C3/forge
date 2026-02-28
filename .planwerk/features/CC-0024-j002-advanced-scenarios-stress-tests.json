@@ -1,0 +1,24 @@
+{
+  "feature_id": "CC-0024",
+  "title": "J002: Advanced Scenarios & Stress Tests",
+  "slug": "j002-advanced-scenarios-stress-tests",
+  "status": "draft",
+  "phase": null,
+  "summary": "",
+  "description": "Test ControlPlane-driven image upgrade (rolling update, Ready maintained). Test database failure recovery (MariaDB failure, condition degradation, restoration). Test complete Fernet rotation cycle (initial generation, CronJob trigger, maxActiveKeys enforcement, PushSecret backup). Test config change propagation (ControlPlane to Keystone CR to ConfigMap to Deployment restart). Validate leader election (2 replicas, failover). Stress test with 10+ rapid ControlPlane spec changes verifying convergence without resource leaks.",
+  "stories": [],
+  "requirements": [],
+  "tasks": [],
+  "test_specifications": [],
+  "affected_files": [],
+  "similar_patterns": [],
+  "review_criteria": [],
+  "implementation_notes": "",
+  "status_history": {
+    "draft": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-22T20:42:36.272133"
+    }
+  },
+  "origin": "plan"
+}
