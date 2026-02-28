@@ -1,0 +1,26 @@
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - govet
+    - errcheck
+    - staticcheck
+    - unused
+    - gosimple
+    - ineffassign
+    - typecheck
+    - gocritic
+
+issues:
+  exclude-rules:
+    - path: "zz_generated.*\\.go$"
+      linters:
+        - govet
+        - errcheck
+        - staticcheck
+        - unused
+        - gosimple
+        - ineffassign
+        - typecheck
+        - gocritic
