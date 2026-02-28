@@ -1,0 +1,96 @@
+{
+  "feature_id": "CC-0001",
+  "title": "A001: Scaffold Go workspace and module structure",
+  "date": "2026-02-28",
+  "verdict": "NEEDS_CHANGES",
+  "summary": "Review #2 follow-up. The review #1 golangci-lint fix overcorrected: config was rewritten to golangci-lint v2 format (version: \"2\", linters.exclusions.paths) but the installed linter is v1.64.8. make lint fails, golangci-lint config verify fails. Additionally, two 41MB compiled Go binaries (operators/keystone/keystone, operators/c5c3/c5c3) are tracked in git — .gitignore lacks rules for extensionless Go binaries. All other aspects remain solid: go build succeeds across all modules, go vet clean, GOWORK=off builds work, Makefile targets correct, go mod tidy idempotent, main.go files follow controller-runtime patterns correctly.",
+  "tests_checklist": [
+    {"item": "go build ./... succeeds via make build (all modules)", "checked": true},
+    {"item": "go vet ./... passes on all modules", "checked": true},
+    {"item": "go mod tidy is idempotent (no go.mod/go.sum changes)", "checked": true},
+    {"item": "GOWORK=off go build ./... succeeds in each operator dir", "checked": true},
+    {"item": "make build OPERATOR=keystone targets single operator", "checked": true},
+    {"item": "make test runs without errors (no test files, expected)", "checked": true},
+    {"item": "make lint passes (0 issues across all modules)", "checked": false},
+    {"item": "golangci-lint config verify passes", "checked": false},
+    {"item": "Stub targets fail explicitly with $(error)", "checked": true}
+  ],
+  "code_quality_checklist": [
+    {"item": "Module paths match github.com/c5c3/forge/<path> convention", "checked": true},
+    {"item": "Both main.go files follow controller-runtime manager pattern", "checked": true},
+    {"item": "Structured zap logging configured", "checked": true},
+    {"item": "metricsserver.Options used (not deprecated MetricsBindAddress)", "checked": true},
+    {"item": "Leader election IDs are unique per operator", "checked": true},
+    {"item": "Health/readiness probes registered (/healthz, /readyz)", "checked": true},
+    {"item": "No dead code or unused imports", "checked": true},
+    {"item": "Makefile has all 11 required targets", "checked": true},
+    {"item": ".golangci.yml config is valid for installed linter version", "checked": false},
+    {"item": "Go version consistent across all go.mod and go.work (1.25.0)", "checked": true},
+    {"item": "No compiled binaries in git", "checked": false}
+  ],
+  "security_checklist": [
+    {"item": "No hardcoded secrets or credentials", "checked": true},
+    {"item": "No sensitive data in logs", "checked": true},
+    {"item": "Dependencies from trusted sources (k8s.io, sigs.k8s.io)", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "go.work links all 3 modules correctly", "checked": true},
+    {"item": "Replace directives enable standalone module builds", "checked": true},
+    {"item": "Directory structure matches architecture spec", "checked": true},
+    {"item": "Placeholder dirs have .gitkeep files", "checked": true},
+    {"item": ".gitignore covers Go build artifacts", "checked": false},
+    {"item": "go.work.sum tracked (not gitignored)", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No unnecessary dependencies in internal/common", "checked": true},
+    {"item": "No premature abstractions", "checked": true},
+    {"item": "Stub targets fail fast instead of silently doing nothing", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Manager creation errors cause os.Exit(1)", "checked": true},
+    {"item": "Health probe setup errors cause os.Exit(1)", "checked": true},
+    {"item": "Stub Makefile targets fail with $(error)", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "ctrl.GetConfigOrDie() used for kubeconfig", "checked": true},
+    {"item": "utilruntime.Must for scheme registration", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [],
+  "issues_found": [
+    {
+      "id": "V3-1",
+      "severity": "blocker",
+      "check_id": "V3",
+      "description": ".golangci.yml uses golangci-lint v2 format (version: \"2\", linters.exclusions.paths) but installed version is v1.64.8. make lint fails with: 'you are using a configuration file for golangci-lint v2 with golangci-lint v1'. golangci-lint config verify fails with: 'additional properties version not allowed'. This was flagged in review #1 (C1-1) but the fix overcorrected — converted from v1 syntax to v2 syntax instead of fixing the v1 config.",
+      "location": ".golangci.yml:1-17",
+      "fix": "Rewrite to golangci-lint v1.64.x format. Remove version: \"2\". Replace linters.exclusions.paths with issues.exclude-rules:\n\nrun:\n  timeout: 5m\n\nlinters:\n  enable:\n    - govet\n    - errcheck\n    - staticcheck\n    - unused\n    - gosimple\n    - ineffassign\n    - typecheck\n    - gocritic\n\nissues:\n  exclude-rules:\n    - path: \"zz_generated.*\\\\.go$\"\n      linters:\n        - govet\n        - errcheck\n        - staticcheck\n        - unused\n        - gosimple\n        - ineffassign\n        - gocritic\n\nVerify with: golangci-lint config verify && make lint"
+    },
+    {
+      "id": "C1-2",
+      "severity": "blocker",
+      "check_id": "C1",
+      "description": "Two compiled Go binaries (41MB each, 82MB total) are tracked in git: operators/keystone/keystone and operators/c5c3/c5c3. These are ELF executables produced by go build. The .gitignore has patterns for *.exe, *.test, *.out but misses extensionless Linux binaries. This bloats the repository, slows clones, and violates the review criteria '.gitignore covers Go build artifacts'.",
+      "location": ".gitignore:6-14, operators/keystone/keystone, operators/c5c3/c5c3",
+      "fix": "1. Add to .gitignore:\n\n# Compiled operator binaries\noperators/keystone/keystone\noperators/c5c3/c5c3\n\n2. Remove from git tracking:\n   git rm --cached operators/keystone/keystone operators/c5c3/c5c3\n\n3. Consider also adding a generic bin pattern or using the Makefile's -o flag to output binaries to a bin/ directory (already gitignored)."
+    },
+    {
+      "id": "C2-1",
+      "severity": "critical",
+      "check_id": "C2",
+      "description": "The plan specifies enabling 8 linters (govet, errcheck, staticcheck, unused, gosimple, ineffassign, typecheck, gocritic) but .golangci.yml only enables 6 — missing gosimple and typecheck. While typecheck runs by default and gosimple partially overlaps with staticcheck, the config does not match the specification.",
+      "location": ".golangci.yml:7-12",
+      "fix": "Add gosimple and typecheck to the linters.enable list to match the spec. Both are lightweight and useful: gosimple catches simplifiable code, typecheck catches type errors."
+    }
+  ],
+  "suggested_improvements": [
+    "The sourcery-ai[bot] review flagged Go 1.25.0 as unreleased and controller-runtime v0.23.1 as incompatible with k8s v0.35.x. Both are false positives in the current toolchain (Go 1.25 is installed, controller-runtime v0.23.1 resolves correctly with go mod tidy). No action needed — note for future reviewers.",
+    "Consider outputting go build binaries to the bin/ directory (already gitignored) via -o flag in Makefile, e.g.: go build -o ../../bin/$$dir ./... — this prevents accidental binary commits and centralizes artifacts."
+  ],
+  "next_steps": [
+    "Fix .golangci.yml: rewrite in v1.64.x format, remove version: \"2\", use issues.exclude-rules for zz_generated exclusion, add gosimple and typecheck to enabled linters",
+    "Remove committed binaries: git rm --cached operators/keystone/keystone operators/c5c3/c5c3",
+    "Update .gitignore: add operators/keystone/keystone and operators/c5c3/c5c3 (or redirect build output to bin/)",
+    "Verify: golangci-lint config verify && make lint && make build && git status (no untracked binaries)"
+  ]
+}

@@ -1,0 +1,76 @@
+{
+  "feature_id": "CC-0001",
+  "title": "A001: Scaffold Go workspace and module structure",
+  "date": "2026-02-28",
+  "verdict": "NEEDS_CHANGES",
+  "summary": "Go workspace scaffold is well-structured and functionally correct. All 3 modules compile, go vet passes, go mod tidy is idempotent, GOWORK=off builds succeed, Makefile targets work correctly, and the directory layout matches the architecture spec. One blocking configuration issue: .golangci.yml uses golangci-lint v1 syntax for file exclusions (issues.exclude-files) which is invalid in the installed golangci-lint v2.10.1. The zz_generated file exclusion is silently not applied. golangci-lint config verify fails.",
+  "tests_checklist": [
+    {"item": "go build ./... succeeds via make build (all modules)", "checked": true},
+    {"item": "go vet ./... passes on all modules", "checked": true},
+    {"item": "go mod tidy -diff shows no changes (idempotent)", "checked": true},
+    {"item": "GOWORK=off go build ./... succeeds in each operator dir", "checked": true},
+    {"item": "make build OPERATOR=keystone targets single operator", "checked": true},
+    {"item": "make test runs without errors (no test files, expected)", "checked": true},
+    {"item": "make lint passes (0 issues across all modules)", "checked": true},
+    {"item": "golangci-lint config verify passes", "checked": false},
+    {"item": "Stub targets fail explicitly with $(error)", "checked": true}
+  ],
+  "code_quality_checklist": [
+    {"item": "Module paths match github.com/c5c3/forge/<path> convention", "checked": true},
+    {"item": "Both main.go files follow controller-runtime manager pattern", "checked": true},
+    {"item": "Structured zap logging configured", "checked": true},
+    {"item": "metricsserver.Options used (not deprecated MetricsBindAddress)", "checked": true},
+    {"item": "Leader election IDs are unique per operator", "checked": true},
+    {"item": "Health/readiness probes registered (/healthz, /readyz)", "checked": true},
+    {"item": "No dead code or unused imports", "checked": true},
+    {"item": "Makefile has all 11 required targets", "checked": true},
+    {"item": ".golangci.yml config is valid for installed linter version", "checked": false}
+  ],
+  "security_checklist": [
+    {"item": "No hardcoded secrets or credentials", "checked": true},
+    {"item": "No sensitive data in logs", "checked": true},
+    {"item": "Dependencies from trusted sources (k8s.io, sigs.k8s.io)", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "go.work links all 3 modules correctly", "checked": true},
+    {"item": "Replace directives enable standalone module builds", "checked": true},
+    {"item": "Directory structure matches architecture spec", "checked": true},
+    {"item": "Placeholder dirs have .gitkeep files", "checked": true},
+    {"item": ".gitignore covers Go build artifacts", "checked": true},
+    {"item": "go.work.sum tracked (not gitignored)", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No unnecessary dependencies in internal/common", "checked": true},
+    {"item": "No premature abstractions", "checked": true},
+    {"item": "Stub targets fail fast instead of silently doing nothing", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Manager creation errors cause os.Exit(1)", "checked": true},
+    {"item": "Health probe setup errors cause os.Exit(1)", "checked": true},
+    {"item": "Stub Makefile targets fail with $(error)", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "ctrl.GetConfigOrDie() used for kubeconfig", "checked": true},
+    {"item": "utilruntime.Must for scheme registration", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [],
+  "issues_found": [
+    {
+      "id": "C1-1",
+      "severity": "critical",
+      "check_id": "C1",
+      "description": ".golangci.yml uses golangci-lint v1 syntax: issues.exclude-files is not a valid key in golangci-lint v2. The zz_generated file exclusion is silently ignored. golangci-lint config verify fails with: 'additional properties exclude-files not allowed'.",
+      "location": ".golangci.yml:15-17",
+      "fix": "Replace issues.exclude-files with the v2 equivalent. Move file exclusion to linters.exclusions.paths:\n\nlinters:\n  exclusions:\n    generated: strict\n    paths:\n      - \"zz_generated.*\\\\.go$\"\n\nRemove the entire issues: section (or keep only valid v2 keys). Run golangci-lint config verify to confirm."
+    }
+  ],
+  "suggested_improvements": [
+    "Minor: go version inconsistency — internal/common/go.mod uses 'go 1.25' while go.work and operator go.mod files use 'go 1.25.0'. Consider running go mod tidy in internal/common to normalize to 'go 1.25.0' for consistency.",
+    "Minor: The blank import '_ github.com/c5c3/forge/internal/common' in both main.go files currently has no side effects (no init() in common). It validates the replace directive works but could confuse readers. Consider adding a comment explaining its purpose, or removing it until common has actual exports."
+  ],
+  "next_steps": [
+    "Fix .golangci.yml to use golangci-lint v2 syntax for file exclusions",
+    "Verify fix with: golangci-lint config verify && make lint"
+  ]
+}
