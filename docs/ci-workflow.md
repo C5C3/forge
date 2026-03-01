@@ -30,7 +30,7 @@ Runs `golangci-lint` against the Go workspace root.
 | Step | Action                              | Config             |
 |------|-------------------------------------|--------------------|
 | 1    | `actions/checkout@v4`               |                    |
-| 2    | `golangci/golangci-lint-action@v9`  | `version: v2.10`   |
+| 2    | `golangci/golangci-lint-action@v9`  | `version: v2.10.1` |
 
 The lint action handles Go installation internally — no separate `actions/setup-go` step is needed.
 It uses the project's `.golangci.yml` configuration from the repository root.
@@ -48,6 +48,11 @@ Runs unit tests via `make test`.
 ### `test-integration`
 
 Runs envtest-based integration tests via `make test-integration`.
+
+**Gated:** This job only runs when the repository variable `ENABLE_INTEGRATION_TESTS`
+is set to `"true"`. It is disabled by default because S002 (shared test infrastructure
+providing `KUBEBUILDER_ASSETS`) has not yet been implemented. Enable it once the
+`make install-test-deps` step is available.
 
 | Step | Action                  | Config                         |
 |------|-------------------------|--------------------------------|
@@ -86,7 +91,8 @@ at the top level, and no job overrides this.
 ## Dependencies
 
 - **CC-0001 Makefile targets**: `make test` and `make test-integration` are defined in the
-  root `Makefile`. They iterate over all modules listed in the `OPERATORS` variable.
+  root `Makefile`. They iterate over all modules listed in `ALL_MODULE_DIRS`
+  (`internal/common` plus each directory in `OPERATORS`).
 - **CC-0001 `.golangci.yml`**: The lint job relies on this configuration file at the
   repository root.
 - **CC-0001 `go.work`**: Used by `actions/setup-go` to determine the Go version.

@@ -24,7 +24,19 @@ jobs:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
         with:
-          version: v2.10
+          version: v2.10.1
+
+  lint-actions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0
+        with:
+          go-version-file: go.work
+      - name: Run actionlint
+        run: |
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.11
+          actionlint -color
 
   test:
     runs-on: ubuntu-latest
@@ -37,6 +49,9 @@ jobs:
         run: make test
 
   test-integration:
+    # Gate behind repository variable until S002 provides KUBEBUILDER_ASSETS setup.
+    # Enable by setting the ENABLE_INTEGRATION_TESTS repository variable to "true".
+    if: ${{ vars.ENABLE_INTEGRATION_TESTS == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1

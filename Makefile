@@ -14,7 +14,7 @@ endif
 MODULE_DIRS = $(addprefix operators/,$(OPERATORS))
 ALL_MODULE_DIRS = internal/common $(MODULE_DIRS)
 
-.PHONY: build test lint generate manifests docker-build helm-package e2e deploy-infra install-test-deps test-integration
+.PHONY: build test lint lint-actions generate manifests docker-build helm-package e2e deploy-infra install-test-deps test-integration
 
 ## Build all operator binaries (output to bin/ to avoid accidental commits)
 build:
@@ -40,6 +40,10 @@ lint:
 		echo "Linting $$dir..."; \
 		(cd $$dir && golangci-lint run) || exit 1; \
 	done
+
+## Lint GitHub Actions workflow files (requires: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.11)
+lint-actions:
+	actionlint
 
 ## Generate code (no-op until controller-gen is configured)
 generate:
