@@ -1,0 +1,165 @@
+{
+  "feature_id": "CC-0002",
+  "title": "A002: Implement shared test infrastructure",
+  "date": "2026-02-28",
+  "verdict": "NEEDS_CHANGES",
+  "summary": "Shared test infrastructure implements all 9 requirements: SetupEnvTest with envtest bootstrap, 11 fake CRD YAMLs across 5 operators, SecretBuilder with fluent API, 4 simulator functions, 4 assertion helpers, Chainsaw v0.3+ config with E2E directory structure, and reference documentation. Unit tests pass (builders + assertions), go vet and golangci-lint are clean. Integration tests are properly gated behind //go:build integration. Three major issues require changes: a reimplemented stdlib function (nestedSlice), silently discarded errors in EventuallyCondition, and missing test coverage for idempotency and SecretBuilder.Create().",
+  "tests_checklist": [
+    {"item": "Unit tests exist and pass for builders and assertions", "checked": true},
+    {"item": "Integration tests exist for envtest setup and simulators (gated by build tag)", "checked": true},
+    {"item": "go vet passes with no errors", "checked": true},
+    {"item": "golangci-lint passes with no errors", "checked": true},
+    {"item": "Table-driven tests used for assertions", "checked": true},
+    {"item": "SecretBuilder Build() independent copies tested", "checked": true},
+    {"item": "SecretBuilder.Create() method tested", "checked": false},
+    {"item": "All 4 simulators have idempotency tests", "checked": false},
+    {"item": "Nil conditions edge case tested in AssertCondition", "checked": false},
+    {"item": "FakeCRDsPath() directly tested", "checked": false}
+  ],
+  "code_quality_checklist": [
+    {"item": "All exported functions have Go doc comments", "checked": true},
+    {"item": "Error wrapping uses fmt.Errorf with %w consistently", "checked": true},
+    {"item": "Package doc.go files present for all packages", "checked": true},
+    {"item": "No unused imports or variables", "checked": true},
+    {"item": "No reimplemented stdlib functions", "checked": false},
+    {"item": "DRY - no significant code duplication", "checked": false},
+    {"item": "Functions ≤40 lines", "checked": false},
+    {"item": "No silently discarded errors", "checked": false}
+  ],
+  "security_checklist": [
+    {"item": "No hardcoded secrets in source code", "checked": true},
+    {"item": "No sensitive data in logs", "checked": true},
+    {"item": "Test data uses obviously fake values", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "No new go.mod created (extends existing internal/common module)", "checked": true},
+    {"item": "Packages organized under internal/common/testutil/", "checked": true},
+    {"item": "Integration tests gated with //go:build integration", "checked": true},
+    {"item": "FakeCRDsPath uses runtime.Caller for portable path resolution", "checked": true},
+    {"item": "Teardown function logs errors without panicking", "checked": true},
+    {"item": "Solution is as simple as possible", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No unnecessary abstractions", "checked": true},
+    {"item": "No future-proofing beyond current requirements", "checked": true},
+    {"item": "No duplicated code (≥3 occurrences)", "checked": false},
+    {"item": "Uses existing stdlib utilities where available", "checked": false}
+  ],
+  "fail_fast_checklist": [
+    {"item": "SetupEnvTest panics on startup failure (fail fast)", "checked": true},
+    {"item": "Simulators return errors with context", "checked": true},
+    {"item": "EventuallyCondition surfaces errors from nested field extraction", "checked": false}
+  ],
+  "defensive_checklist": [
+    {"item": "WithLabels handles nil labels map", "checked": true},
+    {"item": "Simulators handle AlreadyExists errors (idempotent)", "checked": true},
+    {"item": "Build() returns deep copies preventing mutation", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [],
+  "issues_found": [
+    {
+      "id": "Q3-1",
+      "check_id": "Q3",
+      "severity": "major",
+      "file": "internal/common/testutil/assertions/conditions.go",
+      "line": "66-83",
+      "description": "The unexported function nestedSlice reimplements k8s.io/apimachinery/pkg/apis/meta/v1/unstructured.NestedSlice which has identical signature and behavior. The project's own simulator tests already import and use the standard unstructured.NestedSlice. This custom version is unnecessary duplication.",
+      "fix": "Remove the nestedSlice function. Import k8s.io/apimachinery/pkg/apis/meta/v1/unstructured and replace the call on line 46 with unstructured.NestedSlice(unstrMap, \"status\", \"conditions\")."
+    },
+    {
+      "id": "C3-1",
+      "check_id": "C3",
+      "severity": "major",
+      "file": "internal/common/testutil/assertions/conditions.go",
+      "line": "46",
+      "description": "The found and err return values from nestedSlice (line 46) are silently discarded via blank identifiers: rawConditions, _, _ := nestedSlice(...). If the object has no .status.conditions field or conversion fails, rawConditions will be nil and the subsequent AssertCondition will fail with a misleading message ('condition not found') rather than surfacing the actual problem. This will cause confusing test failures for downstream consumers.",
+      "fix": "Check found and err and surface them in the gomega assertion chain: rawConditions, found, err := unstructured.NestedSlice(unstrMap, \"status\", \"conditions\"); eg.Expect(err).NotTo(gomega.HaveOccurred(), \"failed to read status.conditions\"); eg.Expect(found).To(gomega.BeTrue(), \"status.conditions field not found on object\")"
+    },
+    {
+      "id": "P1-1",
+      "check_id": "P1",
+      "severity": "major",
+      "file": "internal/common/testutil/simulators/mariadb.go and memcached.go",
+      "line": "19-64",
+      "description": "SimulateMariaDBReady and SimulateMemcachedReady are ~95% identical code. They differ only in the GVK strings and message literals. Combined with the create-or-get pattern repeated across all 4 simulators (8 lines × 4 = 32 lines of identical logic), this represents significant duplication.",
+      "fix": "Extract an unexported helper: func simulateUnstructuredReady(ctx, c, gvk, name, namespace, readyMsg string) error — containing the shared create-or-get and status patching logic. Also extract the create-or-get pattern into a func createOrGet(ctx, c, obj, kind string) error for use by all simulators."
+    },
+    {
+      "id": "TE2-1",
+      "check_id": "TE2",
+      "severity": "major",
+      "file": "internal/common/testutil/simulators/simulators_integration_test.go",
+      "line": "102",
+      "description": "SimulateMariaDBReady has an idempotency test (TestSimulateMariaDBReady_Idempotent), but SimulateMemcachedReady, SimulateExternalSecretSync, and SimulateJobComplete do not. All four simulators share identical create-or-get-then-patch logic designed to be idempotent. This contract should be verified uniformly — the review criteria explicitly state 'All simulator functions are idempotent — integration tests call each twice without error'.",
+      "fix": "Add TestSimulateMemcachedReady_Idempotent, TestSimulateExternalSecretSync_Idempotent, and TestSimulateJobComplete_Idempotent following the same pattern as the existing MariaDB idempotency test."
+    },
+    {
+      "id": "TE2-2",
+      "check_id": "TE2",
+      "severity": "major",
+      "file": "internal/common/testutil/builders/secret_test.go",
+      "line": "176",
+      "description": "The exported method SecretBuilder.Create(ctx, c) (defined at secret.go:73) is not tested. While it is a thin wrapper around Build() + client.Create(), the plan task 1.4 explicitly requires testing Create(). A test with a fake client would verify the method works end-to-end and catches error propagation.",
+      "fix": "Add TestSecretBuilder_Create using fake.NewClientBuilder(). Test: (a) successful creation returns non-nil secret with correct fields, (b) duplicate creation returns error."
+    },
+    {
+      "id": "Q2-1",
+      "check_id": "Q2",
+      "severity": "minor",
+      "file": "internal/common/testutil/assertions/conditions.go",
+      "line": "27-30",
+      "description": "The fallthrough case for 'condition not found' uses g.Expect(false).To(gomega.BeTrue(), ...) which is a roundabout way to unconditionally fail. This is not idiomatic gomega.",
+      "fix": "Restructure to find first, then assert: var found *metav1.Condition; for range...; g.Expect(found).NotTo(gomega.BeNil(), ...); g.Expect(found.Status).To(gomega.Equal(status), ...)"
+    },
+    {
+      "id": "TE1-1",
+      "check_id": "TE1",
+      "severity": "minor",
+      "file": "internal/common/testutil/assertions/conditions_test.go",
+      "line": "16",
+      "description": "TestAssertCondition tests empty conditions slice ([]metav1.Condition{}) but never tests nil conditions slice. While Go handles nil range identically, this is an important boundary condition to verify explicitly.",
+      "fix": "Add a table test case with conditions: nil."
+    },
+    {
+      "id": "Q6-1",
+      "check_id": "Q6",
+      "severity": "minor",
+      "file": "internal/common/testutil/assertions/conditions.go",
+      "line": "60",
+      "description": "The polling interval 250 * time.Millisecond is an inline magic number. While documented in the comment, a named constant would be more self-documenting.",
+      "fix": "Define const defaultPollingInterval = 250 * time.Millisecond and use it on line 60."
+    },
+    {
+      "id": "Q2-2",
+      "check_id": "Q2",
+      "severity": "minor",
+      "file": "internal/common/testutil/envtest/setup.go",
+      "line": "78-86",
+      "description": "Three identical scheme registration blocks could be consolidated into a loop for extensibility.",
+      "fix": "Use a loop: for _, addFn := range []func(*k8sruntime.Scheme) error{corev1.AddToScheme, appsv1.AddToScheme, batchv1.AddToScheme} { ... }"
+    },
+    {
+      "id": "TE7-1",
+      "check_id": "TE7",
+      "severity": "minor",
+      "file": "internal/common/testutil/assertions/conditions_test.go",
+      "line": "73-79",
+      "description": "Tests verify pass/fail state via a boolean flag but do not assert on the failure message content. If failure messages become empty or misleading due to a regression, tests would not catch it.",
+      "fix": "Capture the failure message in the custom handler and assert it contains relevant details (e.g., the condition type name) for failure cases."
+    }
+  ],
+  "suggested_improvements": [
+    "Consider adding a TestFakeCRDsPath_ReturnsExistingDirectory unit test (non-integration) that verifies the returned path exists and is a directory",
+    "The Chainsaw config uses XML format and 'e2e-report' name — verify these match CI pipeline expectations (spec mentioned JUnit format and 'chainsaw-report' name)",
+    "Consider adding x-kubernetes-preserve-unknown-fields at spec/status level in fake CRDs to prevent silent field pruning during tests"
+  ],
+  "next_steps": [
+    "Fix Q3-1: Replace custom nestedSlice with unstructured.NestedSlice from k8s.io/apimachinery",
+    "Fix C3-1: Handle found/err return values in EventuallyCondition instead of discarding them",
+    "Fix P1-1: Extract shared create-or-get and simulateUnstructuredReady helpers to eliminate duplication in simulators",
+    "Fix TE2-1: Add idempotency tests for SimulateMemcachedReady, SimulateExternalSecretSync, SimulateJobComplete",
+    "Fix TE2-2: Add unit test for SecretBuilder.Create() using fake client",
+    "Re-request review after all major issues are addressed"
+  ]
+}

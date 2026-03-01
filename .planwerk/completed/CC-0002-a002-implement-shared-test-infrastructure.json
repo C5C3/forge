@@ -2,8 +2,8 @@
   "feature_id": "CC-0002",
   "title": "A002: Implement shared test infrastructure",
   "slug": "a002-implement-shared-test-infrastructure",
-  "status": "prepared",
-  "phase": null,
+  "status": "completed",
+  "phase": "awaiting_external_review",
   "summary": "",
   "description": "**Size:** 🏗️ large\n**Category:** infrastructure\n**Priority:** high\n\n## Summary\n\nImplement the shared test infrastructure in `internal/common/testutil/` that all operator integration and E2E tests will depend on. This includes: an envtest bootstrap function starting a local API server + etcd with project and external CRDs; minimal fake CRD YAML schemas for five external operators (MariaDB, ESO, cert-manager, Memcached, RabbitMQ); a `SecretBuilder` establishing the fluent builder pattern; external operator simulators that patch CR status to mimic readiness; custom gomega assertion helpers for condition checking and resource existence; and a Chainsaw E2E directory structure with global configuration targeting Chainsaw v0.3+.\n\n## Scope\n\n**Included:**\n- `internal/common/testutil/envtest/` — `SetupEnvTest()` function: starts `envtest.Environment`, installs CRDs from `config/crd/bases` (own) and `fake_crds/` (external), registers schemes, returns `*rest.Config` + `client.Client` + teardown func. Follows the pattern from `architecture/06-testing.md:90-104`\n- `internal/common/testutil/fake_crds/` — Minimal CRD YAML schemas (only fields operators interact with: `.status.conditions`, `.status.ready`, referenced `.spec` fields) for: MariaDB Operator (`MariaDB`, `Database`, `User`, `Grant`), ESO (`ExternalSecret`, `PushSecret`, `ClusterSecretStore`), cert-manager (`Certificate`, `ClusterIssuer`), Memcached Operator (`Memcached`), RabbitMQ Cluster Operator (`RabbitmqCluster`)\n- `internal/common/testutil/builders/` — `SecretBuilder` with chainable `WithName()`, `WithNamespace()`, `WithData()`, `WithStringData()`, `WithLabels()`, `WithOwnerRef()`, `Build()`, `Create(ctx, client)`. Establishes the fluent builder pattern that operator-specific builders (S011/S019) will follow\n- `internal/common/testutil/simulators/` — `SimulateMariaDBReady(ctx, client, name, namespace)`, `SimulateMemcachedReady(...)`, `SimulateExternalSecretSync(...)`, `SimulateJobComplete(...)` — each creates the CR if absent, then patches its status to indicate readiness\n- `internal/common/testutil/assertions/` — `AssertCondition(g, conditions, condType, status)`, `EventuallyCondition(ctx, client, obj, condType, status, timeout)`, `AssertResourceExists(ctx, client, key, obj)`, `AssertResourceNotExists(ctx, client, key, obj)`\n- `tests/e2e/chainsaw-config.yaml` — Global Chainsaw v0.3+ configuration (`apiVersion: chainsaw.kyverno.io/v1alpha1`, default timeouts, cleanup, parallel, JUnit output)\n- `tests/e2e/{keystone,c5c3,infrastructure}/.gitkeep` — Directory placeholders\n- Unit tests for assertions and builders; integration test verifying `SetupEnvTest()` starts/stops cleanly\n\n**Excluded (with rationale):**\n- `KeystoneBuilder`, `ControlPlaneBuilder` — API types don't exist until S011/S019; builder pattern established via `SecretBuilder` (YAGNI)\n- Actual Chainsaw test scenarios — S012, S016, S022; only directory structure and config here\n- CI pipeline integration — S003\n- Makefile `test-integration` / `install-test-deps` targets — S001 stubs, S003 implements\n- Controller-runtime reconciler test wiring — S014, reconciler-specific\n- OpenBao/ESO test doubles beyond `SimulateExternalSecretSync` — S010\n\n## Visualization\n\n```mermaid\nflowchart TD\n    subgraph testutil[\"internal/common/testutil/\"]\n        envtest_pkg[\"envtest/\\nSetupEnvTest()\"]\n        builders[\"builders/\\nSecretBuilder\"]\n        simulators[\"simulators/\\nSimulateMariaDBReady\\nSimulateMemcachedReady\\nSimulateExternalSecretSync\\nSimulateJobComplete\"]\n        assertions[\"assertions/\\nAssertCondition\\nEventuallyCondition\\nAssertResourceExists\\nAssertResourceNotExists\"]\n        fake_crds[\"fake_crds/\\nmariadb/ eso/ cert-manager/\\nmemcached/ rabbitmq/\"]\n    end\n\n    subgraph consumers[\"Future Consumers\"]\n        s012[\"S012: Keystone CRD Tests\"]\n        s014[\"S014: Keystone Reconciler Tests\"]\n        s022[\"S022: c5c3-operator Tests\"]\n    end\n\n    subgraph e2e[\"tests/e2e/\"]\n        chainsaw_cfg[\"chainsaw-config.yaml\"]\n        ks_dir[\"keystone/\"]\n        c5c3_dir[\"c5c3/\"]\n        infra_dir[\"infrastructure/\"]\n    end\n\n    envtest_pkg -->|\"loads\"| fake_crds\n    s012 -->|\"imports\"| envtest_pkg\n    s012 -->|\"imports\"| assertions\n    s014 -->|\"imports\"| envtest_pkg\n    s014 -->|\"imports\"| builders\n    s014 -->|\"imports\"| simulators\n    s014 -->|\"imports\"| assertions\n    s022 -->|\"imports\"| envtest_pkg\n    s022 -->|\"imports\"| simulators\n```\n\n```mermaid\nsequenceDiagram\n    participant T as Test Suite\n    participant E as SetupEnvTest\n    participant API as envtest API Server\n    participant etcd as etcd\n\n    T->>E: SetupEnvTest(crdPaths...)\n    E->>etcd: Start etcd process\n    E->>API: Start API server\n    E->>API: Install own CRDs from config/crd/bases\n    E->>API: Install fake external CRDs\n    E->>E: Register schemes\n    E-->>T: config, client, teardownFn\n\n    Note over T: Run tests using client...\n\n    T->>T: teardownFn()\n    T->>API: Stop API server\n    T->>etcd: Stop etcd\n```\n\n## Key Components\n\n- **`testutil/envtest/setup.go`** — `SetupEnvTest(crdPaths ...string) (*rest.Config, client.Client, func())`: boots envtest with API server + etcd, installs CRDs from provided paths plus `fake_crds/`, registers all relevant schemes (core, apps, batch + external operator types), returns config + client + teardown closure\n- **`testutil/fake_crds/{mariadb,eso,cert-manager,memcached,rabbitmq}/`** — Minimal CRD YAMLs defining only the spec/status fields operators interact with. Derived from `internal/common/database/`, `secrets/`, `tls/` function signatures in `architecture/02-shared-library.md`\n- **`testutil/builders/secret.go`** — Fluent `SecretBuilder` returning `*corev1.Secret`. Pattern reference for operator-specific builders added in S011/S019\n- **`testutil/simulators/{mariadb,memcached,externalsecret,job}.go`** — Create external CRs with ready status to simulate third-party operator behavior in envtest. Each creates the CR if absent, patches `.status.ready = true` and condition `Ready=True`\n- **`testutil/assertions/conditions.go`** — Typed gomega helpers: `EventuallyCondition` polls via `Eventually()` + `client.Get()` until condition reaches expected status\n- **`testutil/assertions/resources.go`** — `AssertResourceExists` / `AssertResourceNotExists` for existence checks\n- **`tests/e2e/chainsaw-config.yaml`** — Global Chainsaw v0.3+ config: 120s assert timeout, 30s apply timeout, cleanup enabled, parallel execution, JUnit report output\n- **`tests/e2e/{keystone,c5c3,infrastructure}/.gitkeep`** — Empty directory structure for future test scenarios",
   "stories": [
@@ -399,6 +399,7 @@
       "description": "Create four minimal CRD YAML files under `internal/common/testutil/fake_crds/mariadb/`: mariadb.yaml (group: k8s.mariadb.com, kind: MariaDB, spec: replicas/image, status: ready/conditions), database.yaml (kind: Database, spec: mariaDbRef/name, status: ready/conditions), user.yaml (kind: User, spec: mariaDbRef/name/passwordSecretKeyRef, status: ready/conditions), grant.yaml (kind: Grant, spec: mariaDbRef/database/table/username/privileges, status: ready/conditions). All CRDs must have status subresource enabled, use v1alpha1 version, and only include fields referenced in architecture/02-shared-library.md database/ package.",
       "level": 1,
       "estimate_minutes": 25,
+      "status": "done",
       "requirements": [
         "REQ-002"
       ]
@@ -409,6 +410,7 @@
       "description": "Create three minimal CRD YAML files under `internal/common/testutil/fake_crds/eso/`: externalsecret.yaml (group: external-secrets.io, kind: ExternalSecret, spec: refreshInterval/secretStoreRef/target/data, status: conditions/syncedResourceVersion), pushsecret.yaml (kind: PushSecret, spec: secretStoreRefs/selector/data, status: conditions), clustersecretstore.yaml (kind: ClusterSecretStore, spec: provider, status: conditions). All with status subresource. Fields derived from architecture/02-shared-library.md secrets/ package.",
       "level": 1,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-002"
       ]
@@ -419,6 +421,7 @@
       "description": "Create five minimal CRD YAML files: `fake_crds/cert-manager/certificate.yaml` (group: cert-manager.io, kind: Certificate, spec: secretName/issuerRef/dnsNames, status: conditions), `fake_crds/cert-manager/clusterissuer.yaml` (kind: ClusterIssuer, spec: selfSigned/ca, status: conditions), `fake_crds/memcached/memcached.yaml` (group: opsv1.memcached.com or similar, kind: Memcached, spec: replicas, status: ready/conditions/serverList), `fake_crds/rabbitmq/rabbitmqcluster.yaml` (group: rabbitmq.com, kind: RabbitmqCluster, spec: replicas, status: conditions/defaultUser). All with status subresource.",
       "level": 1,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-002"
       ]
@@ -429,6 +432,7 @@
       "description": "Create `internal/common/testutil/builders/secret.go` with SecretBuilder struct and methods: NewSecretBuilder() *SecretBuilder, WithName(string) *SecretBuilder, WithNamespace(string) *SecretBuilder, WithData(map[string][]byte) *SecretBuilder, WithStringData(map[string]string) *SecretBuilder, WithLabels(map[string]string) *SecretBuilder, WithOwnerRef(metav1.OwnerReference) *SecretBuilder, Build() *corev1.Secret, Create(ctx context.Context, c client.Client) (*corev1.Secret, error). Create `internal/common/testutil/builders/secret_test.go` with table-driven unit tests covering: all With* methods, Build() returns independent copies, Create() error on missing name/namespace.",
       "level": 1,
       "estimate_minutes": 25,
+      "status": "done",
       "requirements": [
         "REQ-003"
       ]
@@ -439,6 +443,7 @@
       "description": "Create `internal/common/testutil/assertions/conditions.go` with: AssertCondition(g gomega.Gomega, conditions []metav1.Condition, condType string, status metav1.ConditionStatus) — asserts condition found with expected status, fails with descriptive message. Create `internal/common/testutil/assertions/resources.go` with: AssertResourceExists(ctx, client, key types.NamespacedName, obj client.Object) — asserts client.Get succeeds. AssertResourceNotExists(ctx, client, key, obj) — asserts client.Get returns NotFound. Create `internal/common/testutil/assertions/conditions_test.go` and `resources_test.go` with table-driven tests covering found/not-found/wrong-status scenarios.",
       "level": 1,
       "estimate_minutes": 25,
+      "status": "done",
       "requirements": [
         "REQ-005"
       ]
@@ -449,6 +454,7 @@
       "description": "Create `internal/common/testutil/envtest/setup.go` with: func SetupEnvTest(crdPaths ...string) (*rest.Config, client.Client, func()). Implementation: create envtest.Environment with CRDDirectoryPaths combining user-provided paths + embedded fake_crds/ path (resolved via runtime.Caller or filepath). Call testEnv.Start(). Register schemes: corev1, appsv1, batchv1. Create client via client.New(cfg, client.Options{Scheme: scheme}). Return cfg, client, and teardown closure that calls testEnv.Stop(). Add helper FakeCRDsPath() string returning the absolute path to fake_crds/. Add necessary dependencies to internal/common/go.mod (sigs.k8s.io/controller-runtime envtest, gomega). Run go mod tidy.",
       "level": 2,
       "estimate_minutes": 30,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-008"
@@ -460,6 +466,7 @@
       "description": "Add to `internal/common/testutil/assertions/conditions.go`: func EventuallyCondition(ctx context.Context, c client.Client, obj client.Object, condType string, status metav1.ConditionStatus, timeout time.Duration). Implementation: use gomega.Eventually with polling that calls c.Get() to refresh obj, then extracts .Status.Conditions and checks for matching condition. Uses gomega.NewWithT or accepts gomega.Gomega parameter. Requires obj to have a Status.Conditions field — use unstructured or interface assertion. Add tests in conditions_test.go — requires envtest client from SetupEnvTest, so test is in a _test.go file that imports envtest.",
       "level": 2,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-005"
       ]
@@ -470,6 +477,7 @@
       "description": "Create `internal/common/testutil/simulators/mariadb.go` with: func SimulateMariaDBReady(ctx context.Context, c client.Client, name, namespace string) error. Implementation: use unstructured.Unstructured to create MariaDB CR (GVK k8s.mariadb.com/v1alpha1/MariaDB) if not exists (ignore AlreadyExists), then patch status subresource with .status.ready=true and .status.conditions=[{type:Ready,status:True,reason:Ready}]. Create `internal/common/testutil/simulators/memcached.go` with SimulateMemcachedReady following the same pattern for Memcached GVK.",
       "level": 2,
       "estimate_minutes": 25,
+      "status": "done",
       "requirements": [
         "REQ-004"
       ]
@@ -480,6 +488,7 @@
       "description": "Create `internal/common/testutil/simulators/externalsecret.go` with: func SimulateExternalSecretSync(ctx context.Context, c client.Client, name, namespace string, targetSecretData map[string][]byte) error. Implementation: create ExternalSecret CR (GVK external-secrets.io/v1beta1/ExternalSecret) if not exists, patch status with SecretSynced=True condition, and create the target K8s Secret with provided data. Create `internal/common/testutil/simulators/job.go` with: func SimulateJobComplete(ctx context.Context, c client.Client, name, namespace string) error. Uses batchv1.Job (native type, not unstructured), creates if absent, patches status with .succeeded=1 and Complete=True condition.",
       "level": 2,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-004"
       ]
@@ -490,6 +499,7 @@
       "description": "Create `tests/e2e/chainsaw-config.yaml` with: apiVersion: chainsaw.kyverno.io/v1alpha1, kind: Configuration, spec with timeouts (assert: 120s, apply: 30s, delete: 60s, cleanup: 60s), cleanup: {enabled: true}, parallel: {enabled: true}, report: {format: JUnit, name: chainsaw-report}. Create `tests/e2e/keystone/.gitkeep`, `tests/e2e/c5c3/.gitkeep`, `tests/e2e/infrastructure/.gitkeep` as directory placeholders.",
       "level": 3,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-006"
       ]
@@ -500,6 +510,7 @@
       "description": "Create `internal/common/testutil/envtest/setup_test.go` with: TestSetupEnvTest_StartStop — calls SetupEnvTest() with no extra CRD paths, asserts config is non-nil, client can create a Namespace, then calls teardown and asserts no error. TestSetupEnvTest_FakeCRDsInstalled — calls SetupEnvTest(), uses client to list resources for each fake CRD group (k8s.mariadb.com, external-secrets.io, cert-manager.io, etc.), asserts discovery API returns the expected kinds. TestSetupEnvTest_SchemeRegistered — verifies client's scheme recognizes corev1.Secret, appsv1.Deployment, batchv1.Job.",
       "level": 3,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002"
@@ -511,19 +522,9 @@
       "description": "Create `internal/common/testutil/simulators/simulators_test.go` with: TestSimulateMariaDBReady — calls SetupEnvTest(), then SimulateMariaDBReady, then verifies CR exists with .status.ready=true via unstructured Get. TestSimulateMariaDBReady_Idempotent — calls SimulateMariaDBReady twice, second call should not error. TestSimulateMemcachedReady — same pattern. TestSimulateExternalSecretSync — verifies CR exists and target Secret is created. TestSimulateJobComplete — verifies Job exists with .status.succeeded=1. All tests use a shared TestMain that calls SetupEnvTest once.",
       "level": 3,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-004"
-      ]
-    },
-    {
-      "id": "4.1",
-      "title": "Run go vet, golangci-lint, and full test suite across all testutil packages (REQ-007, REQ-008)",
-      "description": "Run `go vet ./internal/common/testutil/...` and verify zero issues. Run `golangci-lint run ./internal/common/testutil/...` and fix any errors. Run `go test ./internal/common/testutil/...` and verify all tests pass. Run `go build ./...` from workspace root to verify no compilation errors. Add Go doc comments to all exported functions if missing.",
-      "level": 4,
-      "estimate_minutes": 15,
-      "requirements": [
-        "REQ-007",
-        "REQ-008"
       ]
     },
     {
@@ -532,6 +533,7 @@
       "description": "Add a new section to architecture/06-testing.md or create a dedicated page at architecture/06-testing-infrastructure.md (prefer extending existing). Content: Package overview table (envtest, builders, assertions, simulators, fake_crds), SetupEnvTest() full signature + usage example, fake CRD inventory (group, version, kinds for each operator), SecretBuilder method chain example, simulator function signatures + behavior, assertion helper signatures + gomega integration example. Follow the existing doc style from 02-shared-library.md (function tables, code blocks).",
       "level": 5,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-009"
       ]
@@ -682,8 +684,18 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-22T21:59:24.703951"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-02-28T22:21:09.233432"
+    },
+    "completed": {
+      "github_account": "berendt",
+      "timestamp": "2026-03-01T09:19:55.697589"
     }
   },
+  "github_pr": "https://github.com/C5C3/forge/pull/2",
+  "pr_number": 2,
   "execution_history": [
     {
       "run_id": "e45a1b78-e8a3-4fc2-9ac7-f08de390122d",
@@ -695,6 +707,56 @@
           "name": "prepare",
           "duration": 243.69066262245178,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "01a0ea59-f542-4ae9-8e09-77e86c4ed38b",
+      "timestamp": "2026-02-28T23:08:38.208915",
+      "total_duration": 2681.8652770519257,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (5 tasks)",
+          "duration": 316.8010776042938,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (4 tasks)",
+          "duration": 476.58058500289917,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (3 tasks)",
+          "duration": 651.8973047733307,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 5 (1 tasks)",
+          "duration": 135.17010760307312,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[CC-0002] Code Review",
+          "duration": 300.76152086257935,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[CC-0002] Improvements",
+          "duration": 623.7507965564728,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[CC-0002] Simplify",
+          "duration": 176.90388464927673,
+          "type": "simplify",
           "status": "done"
         }
       ]

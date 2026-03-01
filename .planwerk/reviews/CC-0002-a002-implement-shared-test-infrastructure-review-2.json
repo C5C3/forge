@@ -1,0 +1,109 @@
+{
+  "feature_id": "CC-0002",
+  "title": "A002: Implement shared test infrastructure",
+  "date": "2026-03-01",
+  "verdict": "NEEDS_CHANGES",
+  "summary": "All review #1 major issues are resolved: custom nestedSlice replaced with stdlib, EventuallyCondition now checks found/err, simulators extracted into shared helpers, idempotency tests added for all 4 simulators, and SecretBuilder.Create() is tested. Automated verification passes cleanly (go vet, golangci-lint, all unit tests). All 9 requirements are implemented with 11 fake CRD YAMLs, 4 simulators, 4 assertion helpers, SecretBuilder with fluent API, envtest bootstrap, Chainsaw config, and E2E directory structure. One major issue remains: the reference documentation at architecture/07-testutil-reference.md has incorrect function signatures for SetupEnvTest (shows 3-return, actual is 4-return with error) and FakeCRDsPath (shows no error return, actual returns error), and incorrectly states SetupEnvTest panics on failure when it returns an error. Three minor issues noted.",
+  "tests_checklist": [
+    {"item": "Unit tests exist and pass for builders and assertions", "checked": true},
+    {"item": "Integration tests exist for envtest setup and simulators (gated by build tag)", "checked": true},
+    {"item": "go vet passes with no errors", "checked": true},
+    {"item": "golangci-lint passes with no errors", "checked": true},
+    {"item": "Table-driven tests used for assertions", "checked": true},
+    {"item": "SecretBuilder Build() independent copies tested", "checked": true},
+    {"item": "SecretBuilder.Create() method tested with fake client", "checked": true},
+    {"item": "All 4 simulators have idempotency tests", "checked": true},
+    {"item": "Nil conditions edge case tested in AssertCondition", "checked": true},
+    {"item": "FakeCRDsPath() and fakeCRDSubDirs() directly tested", "checked": true},
+    {"item": "Idempotency tests verify state after second call (not just no-error)", "checked": false}
+  ],
+  "code_quality_checklist": [
+    {"item": "All exported functions have Go doc comments", "checked": true},
+    {"item": "Error wrapping uses fmt.Errorf with %w consistently", "checked": false},
+    {"item": "Package doc.go files present for all packages", "checked": true},
+    {"item": "No unused imports or variables", "checked": true},
+    {"item": "No reimplemented stdlib functions", "checked": true},
+    {"item": "DRY - shared helpers eliminate simulator duplication", "checked": true},
+    {"item": "Functions ≤40 lines", "checked": true},
+    {"item": "No silently discarded errors in EventuallyCondition (nestedSlice)", "checked": true},
+    {"item": "Scheme registration uses data-driven loop", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "No hardcoded secrets in source code", "checked": true},
+    {"item": "No sensitive data in logs", "checked": true},
+    {"item": "Test data uses obviously fake values", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "No new go.mod created (extends existing internal/common module)", "checked": true},
+    {"item": "Packages organized under internal/common/testutil/", "checked": true},
+    {"item": "Integration tests gated with //go:build integration", "checked": true},
+    {"item": "FakeCRDsPath uses runtime.Caller for portable path resolution", "checked": true},
+    {"item": "Teardown function logs errors without panicking", "checked": true},
+    {"item": "Solution is as simple as possible", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No unnecessary abstractions", "checked": true},
+    {"item": "No future-proofing beyond current requirements", "checked": true},
+    {"item": "No duplicated code (≥3 occurrences)", "checked": true},
+    {"item": "Uses existing stdlib utilities where available", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "SetupEnvTest returns errors with context on startup failure", "checked": true},
+    {"item": "Simulators return errors with context", "checked": true},
+    {"item": "EventuallyCondition surfaces errors from nested field extraction", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "WithLabels handles nil labels map", "checked": true},
+    {"item": "Simulators handle AlreadyExists errors (idempotent)", "checked": true},
+    {"item": "Build() returns deep copies preventing mutation", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [],
+  "issues_found": [
+    {
+      "id": "DA2-1",
+      "check_id": "DA2",
+      "severity": "major",
+      "file": "architecture/07-testutil-reference.md",
+      "line": "21-22, 44, 51-52, 68",
+      "description": "Documentation shows incorrect function signatures that don't match the implementation. (1) SetupEnvTest is documented as returning 3 values `(*rest.Config, client.Client, func())` but actually returns 4 values `(*rest.Config, client.Client, func(), error)`. (2) Line 44 states 'Panics if the environment cannot start' but the function returns an error instead. (3) FakeCRDsPath is documented as `func FakeCRDsPath() string` but actually returns `(string, error)`. (4) All code examples use the 3-return-value signature (e.g., line 51: `cfg, k8sClient, teardown := envtest.SetupEnvTest()`).",
+      "fix": "Update the documentation to match the actual signatures: `func SetupEnvTest(crdPaths ...string) (*rest.Config, client.Client, func(), error)` and `func FakeCRDsPath() (string, error)`. Replace panic description with error-return behavior. Update all examples to handle the 4th error return value, e.g., `cfg, k8sClient, teardown, err := envtest.SetupEnvTest()`."
+    },
+    {
+      "id": "Q3-1",
+      "check_id": "Q3",
+      "severity": "minor",
+      "file": "internal/common/testutil/builders/secret.go",
+      "line": "76",
+      "description": "SecretBuilder.Create() returns the raw error from c.Create() without wrapping it via fmt.Errorf. Every other error-returning site in the codebase (envtest/setup.go, simulators/*.go) wraps errors with context using fmt.Errorf('...: %w', err). This inconsistency makes it harder to identify which builder call failed when multiple secrets are created in a test.",
+      "fix": "Wrap the error: `return nil, fmt.Errorf(\"builders: creating Secret %s/%s: %w\", secret.Namespace, secret.Name, err)`"
+    },
+    {
+      "id": "TE7-1",
+      "check_id": "TE7",
+      "severity": "minor",
+      "file": "internal/common/testutil/simulators/simulators_integration_test.go",
+      "line": "94-106, 152-164, 308-320",
+      "description": "Three of four idempotency tests (MariaDB, Memcached, Job) only verify the second call returns no error, but do not re-read the object and assert its state is preserved. TestSimulateExternalSecretSync_Idempotent (lines 221-276) correctly re-reads and re-asserts both the CR status and the target Secret data after the second call. The other three should follow the same pattern for consistency.",
+      "fix": "After the second call in each idempotency test, re-fetch the object via k8sClient.Get and assert that status.ready is still true and the Ready=True condition is still present, mirroring the ExternalSecret idempotency test pattern."
+    },
+    {
+      "id": "DA3-1",
+      "check_id": "DA3",
+      "severity": "minor",
+      "file": "tests/e2e/chainsaw-config.yaml",
+      "line": "9-20",
+      "description": "Chainsaw config has minor deviations from the plan specification: cleanup timeout is 30s (plan says 60s), delete timeout is 15s (plan says 60s), report format is 'XML' (plan says 'JUnit'), report name is 'e2e-report' (plan says 'chainsaw-report'). These are functionally equivalent (JUnit is XML format in Chainsaw) and the actual timeouts are reasonable, but the config should match the specification or the discrepancy should be documented.",
+      "fix": "Either update chainsaw-config.yaml to match the spec (cleanup: 60s, delete: 60s, name: chainsaw-report) or document why the deviations were chosen."
+    }
+  ],
+  "suggested_improvements": [
+    "Consider adding x-kubernetes-preserve-unknown-fields at spec/status level in fake CRDs (beyond the 2 that already have it) to prevent silent field pruning during tests with fields not defined in the schema",
+    "Add a comment in simulators/externalsecret.go explaining why it does not use simulateUnstructuredReady (ExternalSecret has different status shape: no status.ready field)",
+    "Consider adding a comment in simulators/memcached.go documenting that the opsv1.memcached.com group is a fabricated placeholder — the group name unusually encodes the API version (opsv1) in the group field"
+  ],
+  "next_steps": [
+    "Fix DA2-1: Update architecture/07-testutil-reference.md to match actual function signatures (4-return SetupEnvTest, error-returning FakeCRDsPath) and update all code examples",
+    "Re-request review after documentation is corrected"
+  ]
+}
