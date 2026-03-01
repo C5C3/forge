@@ -1,0 +1,20 @@
+apiVersion: chainsaw.kyverno.io/v1alpha1
+kind: Configuration
+metadata:
+  name: default
+spec:
+  timeouts:
+    apply: 30s
+    assert: 2m0s
+    cleanup: 60s
+    delete: 60s
+    error: 30s
+    exec: 5m0s
+  cleanup:
+    delayBeforeCleanup: 0s
+  execution:
+    parallel: 4
+    repeatCount: 1
+  report:
+    format: JUnit
+    name: chainsaw-report
