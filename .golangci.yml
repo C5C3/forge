@@ -1,26 +1,24 @@
+version: "2"
+
 run:
   timeout: 5m
 
 linters:
+  default: none
   enable:
     - govet
     - errcheck
     - staticcheck
     - unused
-    - gosimple
     - ineffassign
-    - typecheck
     - gocritic
-
-issues:
-  exclude-rules:
-    - path: "zz_generated.*\\.go$"
-      linters:
-        - govet
-        - errcheck
-        - staticcheck
-        - unused
-        - gosimple
-        - ineffassign
-        - typecheck
-        - gocritic
+  exclusions:
+    rules:
+      - path: "zz_generated.*\\.go$"
+        linters:
+          - govet
+          - errcheck
+          - staticcheck
+          - unused
+          - ineffassign
+          - gocritic
