@@ -1,0 +1,85 @@
+{
+  "feature_id": "CC-0003",
+  "title": "A003: Add minimal GitHub Actions CI workflow",
+  "date": "2026-03-01",
+  "verdict": "APPROVED",
+  "summary": "Clean, minimal GitHub Actions CI workflow with 3 parallel jobs (lint, test, test-integration). YAML is valid, follows plan conventions (SPDX header, quoted 'on', permissions: contents: read, concurrency group). All 12 tasks fully implemented. Reference docs accurate. One minor scope observation: Makefile test-integration target was unstubbed to make CI viable.",
+  "review_process": {
+    "intent": "Create .github/workflows/ci.yaml with lint, test, and test-integration jobs running in parallel on push to main and PRs.",
+    "scope_check": "4 files changed: ci.yaml (new, in scope), docs/ci-workflow.md (new, in scope per task 3.1), planwerk progress JSON (status tracking), Makefile (test-integration unstubbed — minor scope concern, pragmatically necessary).",
+    "verification": "YAML syntax validated via python3 yaml.safe_load — VALID. No Go code changes requiring go vet/golangci-lint. Infrastructure YAML has no unit-testable logic.",
+    "patterns": "No existing workflows on main branch to compare against. Implementation follows conventions specified in the plan (SPDX header format, .yaml extension, quoted 'on', ubuntu-latest, permissions model).",
+    "tests": "N/A — GitHub Actions workflow YAML cannot be unit tested. Verification performed via schema validation and manual checklist (tasks 2.1–2.6).",
+    "security": "permissions: contents: read (least privilege). No secrets used. No write permissions. No untrusted input flows. Actions pinned to major version tags (@v4, @v5, @v9) per plan spec.",
+    "complexity": "47 lines of YAML. Minimal, clean, no unnecessary complexity.",
+    "completeness": "All 12 tasks (1.1–1.4, 2.1–2.6, 3.1–3.2) implemented and verified. No stubs, no TODOs, no placeholders."
+  },
+  "tests_checklist": [
+    {"item": "YAML syntax validates without errors", "checked": true},
+    {"item": "No unit tests applicable (infrastructure YAML)", "checked": true},
+    {"item": "Verification tasks 2.1-2.6 completed via manual inspection", "checked": true}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows conventions specified in plan (SPDX header, quoted 'on', .yaml extension)", "checked": true},
+    {"item": "Minimal and clean — 47 lines, no unnecessary complexity", "checked": true},
+    {"item": "No code duplication beyond intentional parallel job structure", "checked": true},
+    {"item": "Clear naming (job names match their purpose)", "checked": true},
+    {"item": "No dead code or commented-out sections", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "permissions: contents: read (least privilege) at top level", "checked": true},
+    {"item": "No job-level permission overrides", "checked": true},
+    {"item": "No secrets or tokens used", "checked": true},
+    {"item": "No untrusted input flows to shell commands", "checked": true},
+    {"item": "Actions pinned to version tags (@v4, @v5, @v9)", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "3 parallel jobs with no needs: dependencies", "checked": true},
+    {"item": "Concurrency group matches plan spec exactly", "checked": true},
+    {"item": "Trigger events correct (push: main, pull_request)", "checked": true},
+    {"item": "go-version-file: go.work (not hardcoded version)", "checked": true},
+    {"item": "go.work and .golangci.yml exist in repo", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No excluded items present (no image builds, no Helm, no E2E, no coverage, no matrix)", "checked": true},
+    {"item": "No over-engineering — minimal viable CI", "checked": true},
+    {"item": "No workflow_dispatch or tag triggers beyond spec", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "CI jobs fail immediately on error (make targets use || exit 1)", "checked": true},
+    {"item": "cancel-in-progress: true prevents wasted runs", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "Least privilege permissions model", "checked": true},
+    {"item": "No external action inputs from untrusted sources", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [],
+  "issues_found": [
+    {
+      "id": "SCOPE-1",
+      "severity": "minor",
+      "check_id": "P1",
+      "location": "Makefile:72-77",
+      "description": "The test-integration Makefile target was changed from a stub ($(error test-integration target requires S002 implementation)) to a real implementation (go test -tags=integration ./...). This change is outside the explicit scope of CC-0003 — the plan states 'Hard dependency on CC-0001 (Go workspace, Makefile targets)' implying the target should already exist. The original stub references S002.",
+      "fix": "Pragmatically acceptable: without this change, `make test-integration` would hard-error in CI, making the test-integration job non-functional. The change is minimal (4 lines) and correct. No action required, but note this for CC-0002/S002 tracking."
+    },
+    {
+      "id": "INFO-1",
+      "severity": "minor",
+      "check_id": "D2",
+      "location": ".github/workflows/ci.yaml",
+      "description": "Actions are pinned to major version tags (@v4, @v5, @v9) rather than full SHA pins. This is standard practice and matches the plan spec, but SHA pinning would provide stronger supply chain security.",
+      "fix": "No action required for this feature. Consider SHA pinning as a future hardening measure if the project adopts a dependency pinning policy."
+    }
+  ],
+  "suggested_improvements": [
+    "Consider SHA-pinning actions (e.g., actions/checkout@<sha>) for supply chain hardening in a future iteration",
+    "When envtest-based integration tests are added (CC-0002/S002), the test-integration CI job may need a setup step for KUBEBUILDER_ASSETS or a make install-test-deps call"
+  ],
+  "next_steps": [
+    "Merge CI workflow to main",
+    "Enable branch protection rules requiring lint, test, and test-integration status checks (separate repo setting, outside workflow scope)",
+    "Implement CC-0002/S002 for full envtest support and install-test-deps target"
+  ]
+}

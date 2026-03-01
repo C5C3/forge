@@ -69,6 +69,9 @@ deploy-infra:
 install-test-deps:
 	$(error install-test-deps target requires S002 implementation)
 
-## Run integration tests (stub - requires S002)
+## Run integration tests for all modules (requires KUBEBUILDER_ASSETS)
 test-integration:
-	$(error test-integration target requires S002 implementation)
+	@for dir in $(ALL_MODULE_DIRS); do \
+		echo "Integration testing $$dir..."; \
+		(cd $$dir && go test -tags=integration ./...) || exit 1; \
+	done
