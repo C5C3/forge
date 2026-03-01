@@ -1,0 +1,69 @@
+{
+  "feature_id": "CC-0003",
+  "title": "A003: Add minimal GitHub Actions CI workflow",
+  "date": "2026-03-01",
+  "verdict": "APPROVED",
+  "summary": "Minimal GitHub Actions CI workflow implemented as a single `.github/workflows/ci.yaml` file with three parallel jobs (lint, test, test-integration). Follows all specified conventions: SPDX header, quoted `\"on\"`, `permissions: contents: read`, concurrency group matching mega-linter.yml. Reference documentation added at `docs/ci-workflow.md`. All plan tasks (1.1-1.4, 2.1-2.6, 3.1-3.2) are fulfilled. No excluded scope items present.",
+  "tests_checklist": [
+    {"item": "YAML syntax validated (yaml.safe_load parses without error)", "checked": true},
+    {"item": "GitHub Actions schema structure validated (name, on, permissions, concurrency, jobs keys present and correct)", "checked": true},
+    {"item": "All three jobs verified parallel (no `needs:` keys)", "checked": true},
+    {"item": "Action versions validated (checkout@v4, golangci-lint-action@v9 with v2.10, setup-go@v5)", "checked": true},
+    {"item": "go-version-file: go.work confirmed (not hardcoded go-version)", "checked": true},
+    {"item": "Module caching not explicitly disabled (actions/setup-go default cache: true)", "checked": true}
+  ],
+  "code_quality_checklist": [
+    {"item": "Follows existing project conventions (SPDX header, .yaml extension, quoted on)", "checked": true},
+    {"item": "Minimal and focused — 46 lines, no unnecessary configuration", "checked": true},
+    {"item": "No dead code or commented-out sections", "checked": true},
+    {"item": "Clear step naming (Run unit tests, Run integration tests)", "checked": true},
+    {"item": "File location matches project structure (.github/workflows/)", "checked": true}
+  ],
+  "security_checklist": [
+    {"item": "Least-privilege permissions: top-level `contents: read` only", "checked": true},
+    {"item": "No job-level permission overrides", "checked": true},
+    {"item": "No secrets referenced or hardcoded", "checked": true},
+    {"item": "No workflow_dispatch trigger (prevents unauthorized manual runs)", "checked": true},
+    {"item": "Actions pinned to major versions (@v4, @v9, @v5)", "checked": true}
+  ],
+  "architecture_checklist": [
+    {"item": "Solution is minimal — three jobs, no complex dependencies or matrix builds", "checked": true},
+    {"item": "Delegates to Makefile targets (test, test-integration) — no duplicated build logic", "checked": true},
+    {"item": "Uses go.work for Go version (single source of truth)", "checked": true},
+    {"item": "Concurrency group scoped per-branch per-workflow", "checked": true}
+  ],
+  "dry_yagni_checklist": [
+    {"item": "No duplicated configuration across jobs (only necessary per-job setup)", "checked": true},
+    {"item": "No excluded scope items present (no image builds, helm, E2E, coverage, matrix)", "checked": true},
+    {"item": "No future-proofing or over-engineering", "checked": true}
+  ],
+  "fail_fast_checklist": [
+    {"item": "Concurrency cancel-in-progress cancels superseded runs immediately", "checked": true},
+    {"item": "Jobs run in parallel for fastest feedback", "checked": true}
+  ],
+  "defensive_checklist": [
+    {"item": "Permissions restricted to minimum required (contents: read)", "checked": true},
+    {"item": "No external inputs or user-controlled parameters in workflow", "checked": true}
+  ],
+  "security_findings": [],
+  "architecture_findings": [],
+  "issues_found": [
+    {
+      "id": "NOTE-1",
+      "severity": "info",
+      "check_id": "C5",
+      "description": "The `make test-integration` target in the Makefile is currently a stub that calls `$(error ...)` on main. The CI job will fail until this target is properly implemented. This is a known dependency (CC-0002 scope item S002) and not a defect in the CI workflow itself — the workflow correctly delegates to the Makefile target.",
+      "location": "Makefile:73-74",
+      "fix": "No action required for CC-0003. The Makefile target will be implemented by the relevant future task."
+    }
+  ],
+  "suggested_improvements": [
+    "Consider pinning actions to full SHA refs (e.g., actions/checkout@<sha>) instead of major version tags for supply-chain hardening — this is a future enhancement, not blocking for the minimal CI gate",
+    "When the `test-integration` Makefile target is implemented, verify the CI job passes end-to-end on a real PR"
+  ],
+  "next_steps": [
+    "Merge this workflow and verify all three jobs execute successfully on the first real PR",
+    "Configure branch protection rules (repo setting) to require lint, test, and test-integration as required status checks",
+    "Implement the `test-integration` Makefile target (S002 dependency) so the test-integration CI job passes"
+  ]
+}

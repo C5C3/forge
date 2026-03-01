@@ -2,8 +2,8 @@
   "feature_id": "CC-0003",
   "title": "A003: Add minimal GitHub Actions CI workflow",
   "slug": "a003-add-minimal-github-actions-ci-workflow",
-  "status": "prepared",
-  "phase": null,
+  "status": "processing",
+  "phase": "awaiting_external_review",
   "summary": "",
   "description": "**Size:** 🔧 small\n**Category:** infrastructure\n**Priority:** medium\n\n## Summary\n\nCreate a GitHub Actions CI workflow (`.github/workflows/ci.yaml`) that runs three parallel jobs — `lint`, `test`, and `test-integration` — on every PR and push to `main`. The workflow uses Go workspace mode via `go.work`, includes concurrency control to cancel superseded runs, and depends on the Makefile and Go workspace scaffolded by CC-0001.\n\n## Scope\n\n**Included:**\n- `.github/workflows/ci.yaml` with triggers on `push` to `main` and `pull_request`\n- `lint` job using `golangci/golangci-lint-action` against the Go workspace root\n- `test` job running `make test` (unit tests)\n- `test-integration` job running `make test-integration` (envtest-based integration tests)\n- `actions/setup-go` with Go version read from `go.mod` and module caching\n- SPDX license header (matching existing `reuse.yaml` / `deploy-docs.yaml` conventions)\n- `permissions: contents: read` (least privilege, matching `reuse.yaml`)\n- Concurrency group `${{ github.ref }}-${{ github.workflow }}` with `cancel-in-progress: true` (matching `mega-linter.yml` pattern)\n\n**Excluded (with rationale):**\n- Container image builds — CC-0007, separate workflow\n- Helm chart packaging/push — S017/S018, YAGNI until charts exist\n- E2E/Chainsaw tests — S018, requires kind cluster setup, not part of minimal CI\n- Code coverage reporting/thresholds — S018, YAGNI for the minimal CI gate\n- Branch protection rule configuration — repo setting, not a workflow file\n- Matrix builds per operator module — Makefile abstracts this via `OPERATORS` variable; Go workspace mode with `go.work` provides single cache/download\n\n## Visualization\n\n```mermaid\nflowchart TD\n    trigger[\"Push to main / PR\"]\n\n    trigger --> lint\n    trigger --> test\n    trigger --> integ\n\n    subgraph lint[\"lint\"]\n        L1[\"actions/checkout@v4\"] --> L2[\"actions/setup-go\"]\n        L2 --> L3[\"golangci-lint-action\"]\n    end\n\n    subgraph test[\"test\"]\n        T1[\"actions/checkout@v4\"] --> T2[\"actions/setup-go\"]\n        T2 --> T3[\"make test\"]\n    end\n\n    subgraph integ[\"test-integration\"]\n        I1[\"actions/checkout@v4\"] --> I2[\"actions/setup-go\"]\n        I2 --> I3[\"make test-integration\"]\n    end\n\n    lint --> merge[\"PR Merge Gate\"]\n    test --> merge\n    integ --> merge\n```\n\n```mermaid\nsequenceDiagram\n    participant Dev as Developer\n    participant GH as GitHub\n    participant CI as CI Workflow\n    participant Lint as lint job\n    participant Test as test job\n    participant Integ as test-integration job\n\n    Dev->>GH: Push / Open PR\n    GH->>CI: Trigger ci.yaml\n    par All jobs run in parallel\n        CI->>Lint: golangci-lint-action\n        CI->>Test: make test\n        CI->>Integ: make test-integration\n    end\n    Lint-->>CI: pass/fail\n    Test-->>CI: pass/fail\n    Integ-->>CI: pass/fail\n    CI-->>GH: All checks status\n    GH-->>Dev: PR status update\n```\n\n## Key Components\n\n- **`.github/workflows/ci.yaml`** — Single workflow file with 3 parallel jobs. Follows existing conventions: SPDX header (`Copyright 2026 SAP SE or an SAP affiliate company`), `\"on\"` quoting, `ubuntu-latest`, `permissions: contents: read`. Uses `.yaml` extension matching `reuse.yaml` and `deploy-docs.yaml`\n- **`lint` job** — Uses `golangci/golangci-lint-action` (handles installation, caching, version pinning); targets the Go workspace root. No separate `actions/setup-go` needed — the action handles Go setup internally\n- **`test` job** — `actions/setup-go` with `go-version-file: go.mod` + module caching, then `make test`. Relies on CC-0001 Makefile iterating over `OPERATORS`\n- **`test-integration` job** — Same Go setup as `test`, then `make test-integration`. May require envtest binaries — depends on whether CC-0001's Makefile handles `setup-envtest` download within the target or needs a separate `make install-test-deps` step first\n- **Concurrency group** — `${{ github.ref }}-${{ github.workflow }}` with `cancel-in-progress: true`, mirroring `mega-linter.yml:32-34`\n- **Dependency** — Hard dependency on CC-0001 (Go workspace, Makefile targets, `.golangci.yml`) and CC-0002 (test infrastructure for `test-integration` to be meaningful)",
   "stories": [
@@ -322,6 +322,7 @@
       "title": "Create `.github/workflows/ci.yaml` with SPDX header (Copyright 2026 SAP SE or an SAP affiliate company, Apache-2.0), `---` separator, workflow name `CI`, quoted `\"on\"` triggers (push branches: [main] + pull_request), top-level `permissions: contents: read`, concurrency group `${{ github.ref }}-${{ github.workflow }}` with cancel-in-progress: true (REQ-001, REQ-006, REQ-007, REQ-008)",
       "level": 1,
       "estimate_minutes": 15,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-006",
@@ -334,6 +335,7 @@
       "title": "Add `lint` job to ci.yaml — runs-on: ubuntu-latest, step 1: actions/checkout@v4, step 2: golangci/golangci-lint-action@v9 with `version: v2.10` pinned. No separate actions/setup-go step (action handles Go setup internally). No `needs:` key. (REQ-002, REQ-005)",
       "level": 1,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-002",
         "REQ-005"
@@ -344,6 +346,7 @@
       "title": "Add `test` job to ci.yaml — runs-on: ubuntu-latest, step 1: actions/checkout@v4, step 2: actions/setup-go@v5 with `go-version-file: go.work` (module caching enabled by default), step 3: name 'Run unit tests' with `run: make test`. No `needs:` key. (REQ-003, REQ-005)",
       "level": 1,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-003",
         "REQ-005"
@@ -354,6 +357,7 @@
       "title": "Add `test-integration` job to ci.yaml — runs-on: ubuntu-latest, step 1: actions/checkout@v4, step 2: actions/setup-go@v5 with `go-version-file: go.work` (identical to test job), step 3: name 'Run integration tests' with `run: make test-integration`. No `needs:` key. (REQ-004, REQ-005)",
       "level": 1,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-004",
         "REQ-005"
@@ -364,6 +368,7 @@
       "title": "Validate complete ci.yaml YAML syntax and GitHub Actions workflow schema correctness — valid `on`/`jobs`/`steps` structure, no YAML parsing errors, all action references use valid `owner/repo@version` format (REQ-001)",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-001"
       ]
@@ -373,6 +378,7 @@
       "title": "Verify SPDX header matches deploy-docs.yaml exactly: first line `# SPDX-FileCopyrightText: Copyright 2026 SAP SE or an SAP affiliate company`, second line `#`, third line `# SPDX-License-Identifier: Apache-2.0`, followed by `---` separator (REQ-008)",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-008"
       ]
@@ -382,6 +388,7 @@
       "title": "Verify concurrency group key is exactly `${{ github.ref }}-${{ github.workflow }}` with `cancel-in-progress: true`, matching mega-linter.yml lines 32-34 character-for-character (REQ-006)",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-006"
       ]
@@ -391,6 +398,7 @@
       "title": "Verify lint job has only 2 steps (checkout + golangci-lint-action), no actions/setup-go step, no working-directory override, and golangci-lint-action targets the workspace root implicitly (REQ-002)",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-002"
       ]
@@ -400,6 +408,7 @@
       "title": "Verify test and test-integration jobs both use `go-version-file: go.work` (not hardcoded `go-version:`), and that actions/setup-go module caching is not explicitly disabled (default cache: true) (REQ-003, REQ-004)",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-003",
         "REQ-004"
@@ -410,6 +419,7 @@
       "title": "Verify all three jobs (lint, test, test-integration) have no `needs:` key — confirming they run in parallel with no inter-job dependencies (REQ-005)",
       "level": 2,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-005"
       ]
@@ -419,6 +429,7 @@
       "title": "Add reference documentation for CI workflow: file location (.github/workflows/ci.yaml), trigger events, job descriptions (lint/test/test-integration), Go setup convention (go-version-file: go.work), concurrency behavior, dependency on CC-0001 Makefile targets and .golangci.yml (REQ-001 to REQ-008)",
       "level": 3,
       "estimate_minutes": 20,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002",
@@ -435,6 +446,7 @@
       "title": "Cross-reference implementation against feature scope checklist — verify all 'Included' items present (triggers, lint, test, test-integration, setup-go, SPDX, permissions, concurrency) and all 'Excluded' items absent (no image builds, no helm, no E2E/Chainsaw, no coverage, no branch protection, no matrix builds) (all REQs)",
       "level": 3,
       "estimate_minutes": 10,
+      "status": "done",
       "requirements": [
         "REQ-001",
         "REQ-002",
@@ -590,6 +602,10 @@
     "prepared": {
       "github_account": "berendt",
       "timestamp": "2026-02-22T22:51:47.893430"
+    },
+    "processing": {
+      "github_account": "berendt",
+      "timestamp": "2026-03-01T09:29:26.354834"
     }
   },
   "execution_history": [
@@ -603,6 +619,50 @@
           "name": "prepare",
           "duration": 410.0031588077545,
           "type": "prepare",
+          "status": "done"
+        }
+      ]
+    },
+    {
+      "run_id": "bfd8923c-7c70-46f8-9569-cf0e41335bc2",
+      "timestamp": "2026-03-01T09:45:06.550519",
+      "total_duration": 807.3583419322968,
+      "status": "completed",
+      "timings": [
+        {
+          "name": "Level 1 (4 tasks)",
+          "duration": 105.38839960098267,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 2 (6 tasks)",
+          "duration": 66.77299308776855,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "Level 3 (2 tasks)",
+          "duration": 198.62502026557922,
+          "type": "level",
+          "status": "done"
+        },
+        {
+          "name": "[CC-0003] Code Review",
+          "duration": 156.1170859336853,
+          "type": "review",
+          "status": "done"
+        },
+        {
+          "name": "[CC-0003] Improvements",
+          "duration": 146.03618097305298,
+          "type": "improve",
+          "status": "done"
+        },
+        {
+          "name": "[CC-0003] Simplify",
+          "duration": 134.41866207122803,
+          "type": "simplify",
           "status": "done"
         }
       ]
