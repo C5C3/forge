@@ -3385,6 +3385,555 @@ spec:
                     - message: services.keystone.caBundleSecretRef is forbidden when
                         services.keystone.mode is External
                       rule: '!(has(self.mode) && self.mode == ''External'') || !has(self.caBundleSecretRef)'
+                  neutron:
+                    description: |-
+                      Neutron configures the network service projected by the reconciler. The
+                      ControlPlane projects one Neutron CR, registers the network catalog entry
+                      and the neutron service account for it, and hands the child the shared bus
+                      from spec.infrastructure.messaging as a brownfield Secret. The projection
+                      is gated on KeystoneReady (the network service authenticates against the
+                      ControlPlane's Keystone child) and on OVNReady, the condition that mirrors
+                      the OVNCentral named by ovn.centralRef: the ML2/OVN mechanism driver has no
+                      logical network model to write to until that central serves its databases.
+                      Optional: a ControlPlane with services.neutron unset manages no network
+                      service and the reconciler reports NeutronReady as not-managed
+                      (NeutronNotManaged). Flipping this from set to nil preserves the
+                      previously-projected Neutron child unless the ControlPlane carries the
+                      annotation c5c3.io/allow-neutron-deletion: "true".
+                    properties:
+                      databaseCredentialsMode:
+                        description: |-
+                          DatabaseCredentialsMode overrides spec.infrastructure.database.credentialsMode
+                          for THIS service on the managed SHARED database, so a staged migration can run
+                          Neutron on one mode while another service stays on the other. Empty (the
+                          default) inherits the ControlPlane-wide mode; it is deliberately NOT
+                          materialized by the defaulting webhook, so "inherit" stays distinguishable
+                          from an explicit override. A dedicated per-service database is Static-only
+                          (its own credentialsMode lives in dedicatedBackingServices.database, where the
+                          webhook already rejects Dynamic), so a Dynamic override on a service that
+                          declares one is rejected; Dynamic also requires the shared database to be
+                          managed (clusterRef set), mirroring the commonv1.DatabaseSpec contract, so a
+                          Dynamic override on a brownfield shared database is rejected too. A Static
+                          override is always admitted.
+                        enum:
+                        - Static
+                        - Dynamic
+                        type: string
+                      dedicatedBackingServices:
+                        description: |-
+                          DedicatedBackingServices opts the network service out of the
+                          ControlPlane-wide shared instances declared in spec.infrastructure and gives
+                          it backing services of its own. Omitting it (the default) keeps Neutron on
+                          the ControlPlane's shared database cluster and cache, isolated only logically
+                          (its own logical database, its own credentials). See
+                          NeutronDedicatedBackingServicesSpec.
+                        properties:
+                          cache:
+                            description: |-
+                              Cache gives Neutron its own cache instead of the shared
+                              spec.infrastructure.cache. Managed (clusterRef) and brownfield (servers)
+                              modes are both supported.
+                            properties:
+                              backend:
+                                description: Backend is the cache backend (e.g. dogpile.cache.pymemcache).
+                                type: string
+                              clusterRef:
+                                description: ClusterRef references a Memcached CR
+                                  in the cluster (managed mode).
+                                properties:
+                                  name:
+                                    default: ""
+                                    description: |-
+                                      Name of the referent.
+                                      This field is effectively required, but due to backwards compatibility is
+                                      allowed to be empty. Instances of this type with an empty value here are
+                                      almost certainly wrong.
+                                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                    type: string
+                                type: object
+                                x-kubernetes-map-type: atomic
+                              replicas:
+                                default: 3
+                                description: |-
+                                  Replicas is the number of Memcached pod replicas in the referenced cluster
+                                  (managed mode). Used to generate the correct number of StatefulSet pod
+                                  endpoints. Only used when ClusterRef is set.
+                                format: int32
+                                minimum: 1
+                                type: integer
+                              servers:
+                                description: Servers is the list of cache server endpoints
+                                  (brownfield mode).
+                                items:
+                                  pattern: ^[^\n\r]*$
+                                  type: string
+                                type: array
+                            required:
+                            - backend
+                            type: object
+                            x-kubernetes-validations:
+                            - message: exactly one of clusterRef or servers must be
+                                set
+                              rule: has(self.clusterRef) != (has(self.servers) &&
+                                size(self.servers) > 0)
+                            - message: clusterRef.name must not contain a newline
+                                or carriage return
+                              rule: '!has(self.clusterRef) || !self.clusterRef.name.matches(''[\n\r]'')'
+                          database:
+                            description: |-
+                              Database gives Neutron its own database cluster instead of the shared
+                              spec.infrastructure.database. Managed (clusterRef) and brownfield (host)
+                              modes are both supported.
+
+                              A dedicated managed database uses credentialsMode Static (the webhook
+                              materializes it and rejects Dynamic): the OpenBao database engine is
+                              bootstrapped once per namespace against the shared cluster, so no engine role
+                              exists that could issue credentials for a dedicated instance. Seed and rotate
+                              the credential at the OpenBao source.
+                            properties:
+                              clusterRef:
+                                description: ClusterRef references a MariaDB CR in
+                                  the cluster (managed mode).
+                                properties:
+                                  name:
+                                    default: ""
+                                    description: |-
+                                      Name of the referent.
+                                      This field is effectively required, but due to backwards compatibility is
+                                      allowed to be empty. Instances of this type with an empty value here are
+                                      almost certainly wrong.
+                                      More info: https://kubernetes.io/docs/concepts/overview/working-with-objects/names/#names
+                                    type: string
+                                type: object
+                                x-kubernetes-map-type: atomic
+                              credentialsMode:
+                                description: |-
+                                  CredentialsMode selects how the service DB credential in SecretRef is
+                                  provisioned. "Static" (the default when empty) has the operator manage
+                                  the MariaDB User/Grant CRs with a long-lived password from SecretRef.
+                                  "Dynamic" has an external secrets engine issue short-lived credentials on
+                                  demand: SecretRef then carries both a username and password, no User/Grant
+                                  CRs are managed, and no long-lived DB password remains at rest. Dynamic is
+                                  only valid in managed mode (ClusterRef set).
+                                enum:
+                                - Static
+                                - Dynamic
+                                type: string
+                              database:
+                                description: |-
+                                  Database is the database name within the cluster. Constrained to the MySQL
+                                  identifier character set and the 64-character identifier limit.
+                                maxLength: 64
+                                minLength: 1
+                                pattern: ^[A-Za-z0-9_]+$
+                                type: string
+                              host:
+                                description: |-
+                                  Host is the database hostname (brownfield mode). The pattern is a
+                                  permissive host matcher that accepts DNS names, IPv4, and IPv6 literals
+                                  while rejecting empty strings and shell/path metacharacters; it is not a
+                                  strict RFC-1123 validator, deliberately, so airgapped/mirror endpoints are
+                                  not rejected at admission.
+                                minLength: 1
+                                pattern: ^[a-zA-Z0-9._:-]+$
+                                type: string
+                              port:
+                                description: |-
+                                  Port is the database port (brownfield mode, default 3306). Omitted (managed
+                                  mode) leaves it unset; an explicit value must be a valid TCP port.
+                                format: int32
+                                maximum: 65535
+                                minimum: 1
+                                type: integer
+                              replicas:
+                                default: 3
+                                description: |-
+                                  Replicas is the number of managed MariaDB replicas provisioned in
+                                  fresh-create mode. It mirrors CacheSpec.Replicas: only the c5c3 operator's
+                                  managed-mode projection honours it (a single replica yields a
+                                  single-instance non-Galera MariaDB, three or more yield a Galera cluster),
+                                  so a constrained cluster such as a single-node kind can schedule the
+                                  fresh-create path. Operators that adopt an existing MariaDB (the c5c3 adopted-infra path,
+                                  and every service operator) ignore it. Only meaningful when ClusterRef is
+                                  set.
+                                format: int32
+                                minimum: 1
+                                type: integer
+                              secretRef:
+                                description: SecretRef references the K8s Secret with
+                                  credentials.
+                                properties:
+                                  key:
+                                    type: string
+                                  name:
+                                    description: |-
+                                      Name is the referenced Secret's name. It must be a non-empty DNS-1123
+                                      subdomain (the Kubernetes object-name grammar). Tightening the shared type
+                                      fixes every consumer at once — a service operator adminPasswordSecretRef /
+                                      database.secretRef / messaging / TLS cert refs and the c5c3
+                                      passwordSecretRef — so an empty name no longer slips through "required".
+                                    minLength: 1
+                                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                                    type: string
+                                required:
+                                - name
+                                type: object
+                              storageSize:
+                                default: 100Gi
+                                description: |-
+                                  StorageSize is the persistent-volume size requested for each managed
+                                  MariaDB replica in fresh-create mode. Like Replicas, only the c5c3
+                                  operator's managed-mode projection honours it (it is written to the owned
+                                  MariaDB's spec.storage.size); operators that adopt an existing MariaDB
+                                  (the c5c3 adopted-infra path, and every service operator) ignore it. The default 100Gi
+                                  mirrors the production baseline (deploy/flux-system/infrastructure/
+                                  mariadb.yaml); a constrained cluster such as a single-node kind can pin a
+                                  far smaller value (e.g. 512Mi) so CI does not request a 100Gi volume it
+                                  never fills. Immutable after creation: the mariadb-operator rejects
+                                  changing spec.storage.size on a live CR, so the ControlPlane validating
+                                  webhook freezes it too. Only meaningful when ClusterRef is set. The pattern
+                                  admits binary IEC units (Mi/Gi/Ti) matching the Kubernetes quantity grammar
+                                  the operator parses with resource.ParseQuantity.
+                                pattern: ^[0-9]+(Mi|Gi|Ti)$
+                                type: string
+                              tls:
+                                description: |-
+                                  TLS optionally enables TLS/mTLS for the database connection. The pointer keeps the field opt-in and non-mutating: a nil
+                                  TLS means plaintext TCP, preserving the pre-existing behavior for all
+                                  existing DatabaseSpec consumers.
+                                properties:
+                                  caBundleSecretRef:
+                                    description: |-
+                                      CABundleSecretRef references the K8s Secret holding the server CA
+                                      bundle the client trusts when verifying the database endpoint.
+                                    properties:
+                                      key:
+                                        type: string
+                                      name:
+                                        description: |-
+                                          Name is the referenced Secret's name. It must be a non-empty DNS-1123
+                                          subdomain (the Kubernetes object-name grammar). Tightening the shared type
+                                          fixes every consumer at once — a service operator adminPasswordSecretRef /
+                                          database.secretRef / messaging / TLS cert refs and the c5c3
+                                          passwordSecretRef — so an empty name no longer slips through "required".
+                                        minLength: 1
+                                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                                        type: string
+                                    required:
+                                    - name
+                                    type: object
+                                  clientCertSecretRef:
+                                    description: |-
+                                      ClientCertSecretRef references the K8s Secret holding the client
+                                      keypair presented to the database for mutual TLS.
+                                    properties:
+                                      key:
+                                        type: string
+                                      name:
+                                        description: |-
+                                          Name is the referenced Secret's name. It must be a non-empty DNS-1123
+                                          subdomain (the Kubernetes object-name grammar). Tightening the shared type
+                                          fixes every consumer at once — a service operator adminPasswordSecretRef /
+                                          database.secretRef / messaging / TLS cert refs and the c5c3
+                                          passwordSecretRef — so an empty name no longer slips through "required".
+                                        minLength: 1
+                                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                                        type: string
+                                    required:
+                                    - name
+                                    type: object
+                                  mode:
+                                    description: |-
+                                      Mode selects the TLS verification strength applied to the connection:
+                                        - disabled:       TLS is off; certificate references are ignored.
+                                        - prefer/require: encrypt the connection only (no peer verification).
+                                        - verify-ca:      additionally verify the server certificate chain
+                                                           against the trusted CA bundle.
+                                        - verify-full:    additionally verify the server certificate chain
+                                                           and that the server hostname matches the
+                                                           certificate identity.
+                                    enum:
+                                    - disabled
+                                    - prefer
+                                    - require
+                                    - verify-ca
+                                    - verify-full
+                                    type: string
+                                required:
+                                - caBundleSecretRef
+                                - clientCertSecretRef
+                                type: object
+                            required:
+                            - database
+                            - secretRef
+                            type: object
+                            x-kubernetes-validations:
+                            - message: exactly one of clusterRef or host must be set
+                              rule: has(self.clusterRef) != has(self.host)
+                            - message: credentialsMode Dynamic requires clusterRef
+                                (managed mode)
+                              rule: '!has(self.credentialsMode) || self.credentialsMode
+                                != ''Dynamic'' || has(self.clusterRef)'
+                        type: object
+                        x-kubernetes-validations:
+                        - message: dedicatedBackingServices must declare at least
+                            one backing-service class (database, cache)
+                          rule: has(self.database) || has(self.cache)
+                      extraConfig:
+                        additionalProperties:
+                          additionalProperties:
+                            type: string
+                          type: object
+                        description: |-
+                          ExtraConfig is a free-form INI block for the network service. It is merged
+                          key by key with spec.globalExtraConfig (sections unioned, this per-service
+                          value winning per key), and the merged result is projected onto the Neutron
+                          child's spec.extraConfig, which carries the neutron.conf and ml2_conf.ini
+                          sections alike.
+                        type: object
+                      gateway:
+                        description: |-
+                          Gateway optionally exposes the projected Neutron API externally via a
+                          Gateway API HTTPRoute. When nil (the default) the reconciler does NOT
+                          project a gateway and the Neutron API is reachable in-cluster only.
+                        properties:
+                          annotations:
+                            additionalProperties:
+                              type: string
+                            description: |-
+                              Annotations are passed through to the generated HTTPRoute metadata
+                              verbatim, allowing implementation-specific configuration (rate limits,
+                              CORS) without extending the CRD; the route timeout is operator-managed,
+                              not annotation-driven.
+                            type: object
+                          hostname:
+                            description: |-
+                              Hostname is the externally reachable host (SNI / Host header) that the
+                              HTTPRoute matches. Required.
+                            minLength: 1
+                            type: string
+                          parentRef:
+                            description: |-
+                              ParentRef identifies the pre-existing Gateway that the HTTPRoute attaches
+                              to.
+                            properties:
+                              name:
+                                description: Name is the Gateway resource name. Required.
+                                minLength: 1
+                                type: string
+                              namespace:
+                                description: |-
+                                  Namespace is the namespace of the referenced Gateway. When empty, the
+                                  Gateway is assumed to live in the referencing CR's namespace.
+                                type: string
+                              sectionName:
+                                description: |-
+                                  SectionName targets a specific listener on the Gateway (e.g. "https") when
+                                  the Gateway defines multiple listeners. When empty, the HTTPRoute attaches
+                                  to all compatible listeners.
+                                type: string
+                            required:
+                            - name
+                            type: object
+                          path:
+                            description: |-
+                              Path is the URL path prefix matched by the HTTPRoute. Defaults to "/" when
+                              empty.
+                            type: string
+                        required:
+                        - hostname
+                        - parentRef
+                        type: object
+                      image:
+                        description: |-
+                          Image optionally overrides the Neutron container image. When nil the
+                          reconciler derives the image from spec.openStackRelease.
+                        properties:
+                          digest:
+                            description: |-
+                              Digest pins the image by immutable content digest (e.g.
+                              "sha256:<64 hex chars>"). Optional: exactly one of Tag or Digest must be
+                              set. A pinned digest closes the supply-chain gap where a mutable tag can be
+                              re-pushed behind a stable name, at the cost of disabling release tracking.
+                            pattern: ^sha256:[a-f0-9]{64}$
+                            type: string
+                          repository:
+                            description: |-
+                              Repository is the OCI image repository, optionally including the registry
+                              host (e.g. "ghcr.io/c5c3/<service>" or "c5c3/<service>"). The pattern is a
+                              permissive OCI reference — lowercase alphanumeric components separated by
+                              ".", "_", "-", "/", or ":" (registry port) — so mirror and host:port forms
+                              are accepted while an empty string (which "required" alone admits) and
+                              obvious garbage are rejected.
+                            minLength: 1
+                            pattern: ^[a-z0-9]+([._:/-][a-z0-9]+)*$
+                            type: string
+                          tag:
+                            description: |-
+                              Tag is the OCI image tag (e.g. "2025.2"). It follows the OCI tag grammar:
+                              up to 128 characters of word characters, dots, and dashes, and must not
+                              begin with a dot or dash. Optional: exactly one of Tag or Digest must be
+                              set. The pattern is enforced only when a tag is present.
+                            pattern: ^[a-zA-Z0-9_][a-zA-Z0-9._-]{0,127}$
+                            type: string
+                        required:
+                        - repository
+                        type: object
+                        x-kubernetes-validations:
+                        - message: exactly one of image.tag or image.digest must be
+                            set
+                          rule: has(self.tag) != has(self.digest)
+                      namespace:
+                        description: |-
+                          Namespace places the network service, and the backing services, secret
+                          store, and credential material that follow it, in a namespace of its own
+                          instead of the ControlPlane's. Omitting it (the default) keeps Neutron in
+                          the ControlPlane's namespace. The assignment is create-only: the validating
+                          webhook freezes the block after creation (see ServiceNamespaceSpec), because
+                          moving a live service across namespaces would strand its database, its
+                          credential material, and its tenant store with no migration path.
+                        properties:
+                          lifecycle:
+                            default: Managed
+                            description: |-
+                              Lifecycle selects whether the operator owns the namespace (Managed: it is
+                              created, labelled, and deleted with the ControlPlane) or merely uses a
+                              pre-existing one (External: never created, never deleted). Defaults to
+                              Managed via both the CRD schema default and the defaulting webhook.
+                            enum:
+                            - Managed
+                            - External
+                            type: string
+                          name:
+                            description: |-
+                              Name is the namespace the service is placed in. It must differ from the
+                              ControlPlane's own namespace — omit the whole block to keep the service
+                              there — and be an RFC-1123 label, the shape Kubernetes requires of a
+                              namespace name.
+                            maxLength: 63
+                            minLength: 1
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      ovn:
+                        description: |-
+                          OVN names the OVN control plane the projected Neutron programs. It is
+                          REQUIRED: the ML2/OVN mechanism driver writes every network, subnet, and
+                          port into an OVN Northbound database, so a Neutron with no central to
+                          address would park unready for as long as it exists.
+                        properties:
+                          centralRef:
+                            description: |-
+                              CentralRef names the OVNCentral whose Northbound and Southbound databases
+                              the ML2/OVN mechanism driver connects to.
+                            properties:
+                              name:
+                                description: Name is the OVNCentral's name.
+                                minLength: 1
+                                type: string
+                              namespace:
+                                description: |-
+                                  Namespace is the namespace the OVNCentral lives in. The defaulting webhook
+                                  fills an empty value with the ControlPlane's own namespace.
+
+                                  A central on a different cluster than the network service has to publish
+                                  both databases with externallyReachable: true, because the Neutron pods then
+                                  reach them over the node network rather than through cluster DNS.
+
+                                  The value must name a namespace this ControlPlane already reaches: its own,
+                                  or one it claims through a services.<service>.namespace assignment whose
+                                  lifecycle is External. The webhook refuses any other namespace. A foreign one
+                                  is refused because consuming a central out of it mirrors that central's
+                                  client certificate — a full mTLS identity for its Northbound and Southbound
+                                  databases — into this plane; a claimed one with lifecycle Managed is refused
+                                  because the teardown deletes such a namespace together with the plane, and
+                                  the cascade would take the referenced central, and the logical network model
+                                  in its databases, with it.
+
+                                  That reach rule bounds the topology: a namespace belongs to at most one
+                                  ControlPlane cluster-wide, so one OVNCentral serves one ControlPlane. A
+                                  central shared by several planes has no shape here — a second plane can
+                                  neither claim the namespace it lives in, which is already occupied, nor
+                                  reference it without claiming it. Give each ControlPlane its own OVNCentral.
+                                maxLength: 63
+                                pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                                type: string
+                            required:
+                            - name
+                            type: object
+                        required:
+                        - centralRef
+                        type: object
+                      publicEndpoint:
+                        description: |-
+                          PublicEndpoint is the externally routable Neutron endpoint URL
+                          (e.g. "https://neutron.127-0-0-1.nip.io:8443"). It is used ONLY for the
+                          K-ORC public network catalog Endpoint; unlike the keystone override it is
+                          projected into no child CR (the Neutron child's keystoneEndpoint is
+                          Keystone's endpoint, a separate concern). When empty and Gateway is set, the
+                          reconciler derives "https://{gateway.hostname}" (the default-443 form); set
+                          it explicitly when the externally reachable port differs (e.g. a kind
+                          host-port mapping like :8443), since the port cannot be derived from the
+                          hostname alone. The pattern and the 512-character bound mirror
+                          ServiceKeystoneSpec.PublicEndpoint, whose value flows into the same K-ORC
+                          Endpoint URL field.
+
+                          The keystone override is re-validated on the projected Keystone child; this
+                          one is projected nowhere, so the validating webhook is the only gate on the
+                          URL every client resolves to create its networks, subnets, and ports. It
+                          therefore enforces what the markers cannot: a parseable bare origin (no
+                          path, query, or fragment, since the Neutron API is served at the root), and,
+                          whenever a gateway is configured, an https scheme and a host equal to
+                          gateway.hostname. Without a gateway an http:// value stays legal for
+                          development but raises an admission warning.
+                        maxLength: 512
+                        pattern: ^https?://
+                        type: string
+                      replicas:
+                        description: |-
+                          Replicas overrides the number of Neutron API replicas. When nil the
+                          reconciler applies the neutron operator's own default (3).
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      targetClusterRef:
+                        description: |-
+                          TargetClusterRef names the registered target cluster the network service is
+                          placed on. The projected Neutron CR and the per-namespace objects that
+                          support it (its database, its cache, its credential material) are created
+                          there instead of on the local cluster; omitting it (the default) keeps
+                          everything on the local (management) cluster. A placed service needs a
+                          namespace of its own (webhook enforced), and the ref is frozen after creation
+                          by the validating webhook. See ServiceKeystoneSpec.TargetClusterRef.
+                        properties:
+                          name:
+                            description: |-
+                              Name is the registered target cluster's name. It must be a non-empty
+                              DNS-1123 subdomain (the Kubernetes object-name grammar), matching
+                              SecretStoreRefSpec.Name.
+                            minLength: 1
+                            pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      workerReplicas:
+                        description: |-
+                          WorkerReplicas overrides the replica count of the two RPC worker
+                          Deployments the neutron child runs beside its API, the periodic workers and
+                          the OVN maintenance worker. It is projected onto the child's
+                          spec.workers.deployment.replicas, which sizes both. When nil the reconciler
+                          applies the neutron operator's own default (3), which is six worker pods.
+                          The knob exists because a single-node devstack cannot carry six idle worker
+                          pods beside the rest of the control plane.
+                        format: int32
+                        minimum: 1
+                        type: integer
+                    required:
+                    - ovn
+                    type: object
                   placement:
                     description: |-
                       Placement configures the Placement service projected by the reconciler.

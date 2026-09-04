@@ -167,9 +167,9 @@ type InfrastructureSpec struct {
 }
 
 // ServicesSpec declares the per-service configuration of the control plane.
-// Keystone, Horizon, Glance, Placement, and Barbican are modeled today;
-// additional services are added as optional pointer fields as the operator
-// grows.
+// Keystone, Horizon, Glance, Placement, Barbican, and Neutron are modeled
+// today; additional services are added as optional pointer fields as the
+// operator grows.
 type ServicesSpec struct {
 	// Keystone configures the Keystone service projected by the reconciler.
 	// Optional: a ControlPlane with services.keystone unset manages no Keystone
@@ -217,6 +217,22 @@ type ServicesSpec struct {
 	// previously-projected Barbican child.
 	// +optional
 	Barbican *ServiceBarbicanSpec `json:"barbican,omitempty"`
+
+	// Neutron configures the network service projected by the reconciler. The
+	// ControlPlane projects one Neutron CR, registers the network catalog entry
+	// and the neutron service account for it, and hands the child the shared bus
+	// from spec.infrastructure.messaging as a brownfield Secret. The projection
+	// is gated on KeystoneReady (the network service authenticates against the
+	// ControlPlane's Keystone child) and on OVNReady, the condition that mirrors
+	// the OVNCentral named by ovn.centralRef: the ML2/OVN mechanism driver has no
+	// logical network model to write to until that central serves its databases.
+	// Optional: a ControlPlane with services.neutron unset manages no network
+	// service and the reconciler reports NeutronReady as not-managed
+	// (NeutronNotManaged). Flipping this from set to nil preserves the
+	// previously-projected Neutron child unless the ControlPlane carries the
+	// annotation c5c3.io/allow-neutron-deletion: "true".
+	// +optional
+	Neutron *ServiceNeutronSpec `json:"neutron,omitempty"`
 }
 
 // ServiceKeystoneSpec is a CURATED LOCAL subset of the knobs the ControlPlane
@@ -1527,6 +1543,210 @@ type BarbicanDedicatedBackingServicesSpec struct {
 	Cache *commonv1.CacheSpec `json:"cache,omitempty"`
 }
 
+// ServiceNeutronSpec is a CURATED LOCAL subset of the knobs the ControlPlane
+// exposes for the network service, mirroring the ServiceKeystoneSpec and
+// ServicePlacementSpec DECISION above: the reconciler (L2) PROJECTS this struct
+// into a Neutron CR; the database, cache, message bus, and Keystone endpoint of
+// that Neutron CR are DERIVED from the ControlPlane (infrastructure.* and the
+// Keystone child's naming convention) rather than set by the user here, and the
+// L1 api package stays free of a dependency on the neutron module.
+//
+// Two fields have no counterpart on the other services: the required ovn block,
+// because Neutron's ML2/OVN mechanism driver has no logical network model to
+// write to without an OVN control plane, and workerReplicas, because the child
+// runs its RPC workers in Deployments beside the API.
+type ServiceNeutronSpec struct {
+	// Replicas overrides the number of Neutron API replicas. When nil the
+	// reconciler applies the neutron operator's own default (3).
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	Replicas *int32 `json:"replicas,omitempty"`
+
+	// WorkerReplicas overrides the replica count of the two RPC worker
+	// Deployments the neutron child runs beside its API, the periodic workers and
+	// the OVN maintenance worker. It is projected onto the child's
+	// spec.workers.deployment.replicas, which sizes both. When nil the reconciler
+	// applies the neutron operator's own default (3), which is six worker pods.
+	// The knob exists because a single-node devstack cannot carry six idle worker
+	// pods beside the rest of the control plane.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	WorkerReplicas *int32 `json:"workerReplicas,omitempty"`
+
+	// Image optionally overrides the Neutron container image. When nil the
+	// reconciler derives the image from spec.openStackRelease.
+	// +optional
+	Image *commonv1.ImageSpec `json:"image,omitempty"`
+
+	// Gateway optionally exposes the projected Neutron API externally via a
+	// Gateway API HTTPRoute. When nil (the default) the reconciler does NOT
+	// project a gateway and the Neutron API is reachable in-cluster only.
+	// +optional
+	Gateway *commonv1.GatewaySpec `json:"gateway,omitempty"`
+
+	// PublicEndpoint is the externally routable Neutron endpoint URL
+	// (e.g. "https://neutron.127-0-0-1.nip.io:8443"). It is used ONLY for the
+	// K-ORC public network catalog Endpoint; unlike the keystone override it is
+	// projected into no child CR (the Neutron child's keystoneEndpoint is
+	// Keystone's endpoint, a separate concern). When empty and Gateway is set, the
+	// reconciler derives "https://{gateway.hostname}" (the default-443 form); set
+	// it explicitly when the externally reachable port differs (e.g. a kind
+	// host-port mapping like :8443), since the port cannot be derived from the
+	// hostname alone. The pattern and the 512-character bound mirror
+	// ServiceKeystoneSpec.PublicEndpoint, whose value flows into the same K-ORC
+	// Endpoint URL field.
+	//
+	// The keystone override is re-validated on the projected Keystone child; this
+	// one is projected nowhere, so the validating webhook is the only gate on the
+	// URL every client resolves to create its networks, subnets, and ports. It
+	// therefore enforces what the markers cannot: a parseable bare origin (no
+	// path, query, or fragment, since the Neutron API is served at the root), and,
+	// whenever a gateway is configured, an https scheme and a host equal to
+	// gateway.hostname. Without a gateway an http:// value stays legal for
+	// development but raises an admission warning.
+	// +optional
+	// +kubebuilder:validation:MaxLength=512
+	// +kubebuilder:validation:Pattern=`^https?://`
+	PublicEndpoint string `json:"publicEndpoint,omitempty"`
+
+	// DatabaseCredentialsMode overrides spec.infrastructure.database.credentialsMode
+	// for THIS service on the managed SHARED database, so a staged migration can run
+	// Neutron on one mode while another service stays on the other. Empty (the
+	// default) inherits the ControlPlane-wide mode; it is deliberately NOT
+	// materialized by the defaulting webhook, so "inherit" stays distinguishable
+	// from an explicit override. A dedicated per-service database is Static-only
+	// (its own credentialsMode lives in dedicatedBackingServices.database, where the
+	// webhook already rejects Dynamic), so a Dynamic override on a service that
+	// declares one is rejected; Dynamic also requires the shared database to be
+	// managed (clusterRef set), mirroring the commonv1.DatabaseSpec contract, so a
+	// Dynamic override on a brownfield shared database is rejected too. A Static
+	// override is always admitted.
+	// +optional
+	// +kubebuilder:validation:Enum=Static;Dynamic
+	DatabaseCredentialsMode string `json:"databaseCredentialsMode,omitempty"`
+
+	// ExtraConfig is a free-form INI block for the network service. It is merged
+	// key by key with spec.globalExtraConfig (sections unioned, this per-service
+	// value winning per key), and the merged result is projected onto the Neutron
+	// child's spec.extraConfig, which carries the neutron.conf and ml2_conf.ini
+	// sections alike.
+	// +optional
+	ExtraConfig map[string]map[string]string `json:"extraConfig,omitempty"`
+
+	// OVN names the OVN control plane the projected Neutron programs. It is
+	// REQUIRED: the ML2/OVN mechanism driver writes every network, subnet, and
+	// port into an OVN Northbound database, so a Neutron with no central to
+	// address would park unready for as long as it exists.
+	OVN NeutronOVNSpec `json:"ovn"`
+
+	// DedicatedBackingServices opts the network service out of the
+	// ControlPlane-wide shared instances declared in spec.infrastructure and gives
+	// it backing services of its own. Omitting it (the default) keeps Neutron on
+	// the ControlPlane's shared database cluster and cache, isolated only logically
+	// (its own logical database, its own credentials). See
+	// NeutronDedicatedBackingServicesSpec.
+	// +optional
+	DedicatedBackingServices *NeutronDedicatedBackingServicesSpec `json:"dedicatedBackingServices,omitempty"`
+
+	// Namespace places the network service, and the backing services, secret
+	// store, and credential material that follow it, in a namespace of its own
+	// instead of the ControlPlane's. Omitting it (the default) keeps Neutron in
+	// the ControlPlane's namespace. The assignment is create-only: the validating
+	// webhook freezes the block after creation (see ServiceNamespaceSpec), because
+	// moving a live service across namespaces would strand its database, its
+	// credential material, and its tenant store with no migration path.
+	// +optional
+	Namespace *ServiceNamespaceSpec `json:"namespace,omitempty"`
+
+	// TargetClusterRef names the registered target cluster the network service is
+	// placed on. The projected Neutron CR and the per-namespace objects that
+	// support it (its database, its cache, its credential material) are created
+	// there instead of on the local cluster; omitting it (the default) keeps
+	// everything on the local (management) cluster. A placed service needs a
+	// namespace of its own (webhook enforced), and the ref is frozen after creation
+	// by the validating webhook. See ServiceKeystoneSpec.TargetClusterRef.
+	// +optional
+	TargetClusterRef *commonv1.TargetClusterRefSpec `json:"targetClusterRef,omitempty"`
+}
+
+// NeutronOVNSpec names the OVN control plane the projected Neutron programs.
+type NeutronOVNSpec struct {
+	// CentralRef names the OVNCentral whose Northbound and Southbound databases
+	// the ML2/OVN mechanism driver connects to.
+	CentralRef NeutronOVNCentralRef `json:"centralRef"`
+}
+
+// NeutronOVNCentralRef names an OVNCentral the ControlPlane only REFERENCES. The
+// central is deployed outside the plane, the way the infrastructure clusters in
+// spec.infrastructure are: the ControlPlane never projects it, never updates it,
+// and never deletes it, it only reads the databases it publishes and mirrors its
+// readiness into the OVNReady condition.
+//
+// Deployed outside the plane does not mean shared BETWEEN planes: see the reach
+// bound on Namespace.
+type NeutronOVNCentralRef struct {
+	// Name is the OVNCentral's name.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// Namespace is the namespace the OVNCentral lives in. The defaulting webhook
+	// fills an empty value with the ControlPlane's own namespace.
+	//
+	// A central on a different cluster than the network service has to publish
+	// both databases with externallyReachable: true, because the Neutron pods then
+	// reach them over the node network rather than through cluster DNS.
+	//
+	// The value must name a namespace this ControlPlane already reaches: its own,
+	// or one it claims through a services.<service>.namespace assignment whose
+	// lifecycle is External. The webhook refuses any other namespace. A foreign one
+	// is refused because consuming a central out of it mirrors that central's
+	// client certificate — a full mTLS identity for its Northbound and Southbound
+	// databases — into this plane; a claimed one with lifecycle Managed is refused
+	// because the teardown deletes such a namespace together with the plane, and
+	// the cascade would take the referenced central, and the logical network model
+	// in its databases, with it.
+	//
+	// That reach rule bounds the topology: a namespace belongs to at most one
+	// ControlPlane cluster-wide, so one OVNCentral serves one ControlPlane. A
+	// central shared by several planes has no shape here — a second plane can
+	// neither claim the namespace it lives in, which is already occupied, nor
+	// reference it without claiming it. Give each ControlPlane its own OVNCentral.
+	// +optional
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Namespace string `json:"namespace,omitempty"`
+}
+
+// NeutronDedicatedBackingServicesSpec declares the backing-service instances the
+// network service gets for itself instead of the ControlPlane-wide shared ones.
+// Neutron consumes both a database and a cache, so it can take either or both
+// dedicated; a class left unset resolves to the ControlPlane-wide instance in
+// spec.infrastructure. See KeystoneDedicatedBackingServicesSpec for the full
+// contract.
+//
+// The block is optional, but must declare at least one class when present.
+//
+// +kubebuilder:validation:XValidation:rule="has(self.database) || has(self.cache)",message="dedicatedBackingServices must declare at least one backing-service class (database, cache)"
+type NeutronDedicatedBackingServicesSpec struct {
+	// Database gives Neutron its own database cluster instead of the shared
+	// spec.infrastructure.database. Managed (clusterRef) and brownfield (host)
+	// modes are both supported.
+	//
+	// A dedicated managed database uses credentialsMode Static (the webhook
+	// materializes it and rejects Dynamic): the OpenBao database engine is
+	// bootstrapped once per namespace against the shared cluster, so no engine role
+	// exists that could issue credentials for a dedicated instance. Seed and rotate
+	// the credential at the OpenBao source.
+	// +optional
+	Database *commonv1.DatabaseSpec `json:"database,omitempty"`
+
+	// Cache gives Neutron its own cache instead of the shared
+	// spec.infrastructure.cache. Managed (clusterRef) and brownfield (servers)
+	// modes are both supported.
+	// +optional
+	Cache *commonv1.CacheSpec `json:"cache,omitempty"`
+}
+
 // KORCSpec configures the K-ORC (OpenStack Resource Controller) integration of
 // the control plane. It declares how the admin application credential
 // is bootstrapped and rotated and which bootstrap resources are reconciled.
@@ -1987,6 +2207,13 @@ func barbicanDedicatedBlock(cp *ControlPlane) *BarbicanDedicatedBackingServicesS
 	return nil
 }
 
+func neutronDedicatedBlock(cp *ControlPlane) *NeutronDedicatedBackingServicesSpec {
+	if nt := cp.Spec.Services.Neutron; nt != nil {
+		return nt.DedicatedBackingServices
+	}
+	return nil
+}
+
 // DedicatedKeystoneDatabase returns the database instance declared FOR the
 // Keystone service alone, or nil when Keystone shares the ControlPlane-wide
 // instance (the default).
@@ -2073,6 +2300,25 @@ func (cp *ControlPlane) DedicatedBarbicanCache() *commonv1.CacheSpec {
 	return nil
 }
 
+// DedicatedNeutronDatabase returns the database instance declared FOR the
+// network service alone, or nil when Neutron shares the ControlPlane-wide
+// instance (the default).
+func (cp *ControlPlane) DedicatedNeutronDatabase() *commonv1.DatabaseSpec {
+	if b := neutronDedicatedBlock(cp); b != nil {
+		return b.Database
+	}
+	return nil
+}
+
+// DedicatedNeutronCache returns the cache instance declared for the network
+// service alone, or nil when Neutron shares the ControlPlane-wide instance.
+func (cp *ControlPlane) DedicatedNeutronCache() *commonv1.CacheSpec {
+	if b := neutronDedicatedBlock(cp); b != nil {
+		return b.Cache
+	}
+	return nil
+}
+
 // keystoneNamespaceBlock / horizonNamespaceBlock are the single nil-safe walk of
 // the per-service namespace BLOCK, shared by the webhook (defaulting, claim and
 // immutability rules) and by the resolvers below. The webhook needs the block
@@ -2110,6 +2356,13 @@ func placementNamespaceBlock(cp *ControlPlane) *ServiceNamespaceSpec {
 func barbicanNamespaceBlock(cp *ControlPlane) *ServiceNamespaceSpec {
 	if bn := cp.Spec.Services.Barbican; bn != nil {
 		return bn.Namespace
+	}
+	return nil
+}
+
+func neutronNamespaceBlock(cp *ControlPlane) *ServiceNamespaceSpec {
+	if nt := cp.Spec.Services.Neutron; nt != nil {
+		return nt.Namespace
 	}
 	return nil
 }
@@ -2166,6 +2419,16 @@ func (cp *ControlPlane) BarbicanNamespace() string {
 	return cp.Namespace
 }
 
+// NeutronNamespace resolves the namespace the network service, and the database,
+// cache, tenant store, and credential material that follow it, is placed in. See
+// KeystoneNamespace.
+func (cp *ControlPlane) NeutronNamespace() string {
+	if ns := neutronNamespaceBlock(cp); ns != nil && ns.Name != "" {
+		return ns.Name
+	}
+	return cp.Namespace
+}
+
 // DedicatedServiceNamespaces returns the namespaces the ControlPlane places
 // services in OUTSIDE its own, deduplicated by name and in a stable order
 // (keystone first). It is the enumeration every cross-namespace concern walks:
@@ -2182,7 +2445,7 @@ func (cp *ControlPlane) DedicatedServiceNamespaces() []ServiceNamespaceSpec {
 	seen := map[string]struct{}{}
 	for _, ns := range []*ServiceNamespaceSpec{
 		keystoneNamespaceBlock(cp), horizonNamespaceBlock(cp), glanceNamespaceBlock(cp),
-		placementNamespaceBlock(cp), barbicanNamespaceBlock(cp),
+		placementNamespaceBlock(cp), barbicanNamespaceBlock(cp), neutronNamespaceBlock(cp),
 	} {
 		if ns == nil || ns.Name == "" || ns.Name == cp.Namespace {
 			continue
@@ -2248,9 +2511,32 @@ func (cp *ControlPlane) BarbicanTargetClusterRef() *commonv1.TargetClusterRefSpe
 	return nil
 }
 
+// NeutronTargetClusterRef resolves the target cluster the network service, and
+// the database, cache, and credential material that follow it, is placed on. See
+// KeystoneTargetClusterRef.
+func (cp *ControlPlane) NeutronTargetClusterRef() *commonv1.TargetClusterRefSpec {
+	if nt := cp.Spec.Services.Neutron; nt != nil {
+		return nt.TargetClusterRef
+	}
+	return nil
+}
+
+// NeutronOVNCentralNamespace resolves the namespace the OVNCentral named by
+// services.neutron.ovn.centralRef lives in: the namespace on the ref when it
+// carries one, and the ControlPlane's own namespace otherwise. That is the same
+// resolution the defaulting webhook writes into the ref, so a CR that bypassed
+// admission resolves to the same central as one that went through it. A
+// ControlPlane without a neutron block resolves to its own namespace.
+func (cp *ControlPlane) NeutronOVNCentralNamespace() string {
+	if nt := cp.Spec.Services.Neutron; nt != nil && nt.OVN.CentralRef.Namespace != "" {
+		return nt.OVN.CentralRef.Namespace
+	}
+	return cp.Namespace
+}
+
 // TargetClusterNames returns the names of the target clusters the ControlPlane
 // places services on, deduplicated and in a stable order (keystone, horizon,
-// glance, placement, barbican — first occurrence wins), mirroring
+// glance, placement, barbican, neutron — first occurrence wins), mirroring
 // DedicatedServiceNamespaces one level up.
 //
 // Two services placed on one cluster yield ONE entry: the enumeration answers
@@ -2262,7 +2548,7 @@ func (cp *ControlPlane) TargetClusterNames() []string {
 	seen := map[string]struct{}{}
 	for _, ref := range []*commonv1.TargetClusterRefSpec{
 		cp.KeystoneTargetClusterRef(), cp.HorizonTargetClusterRef(), cp.GlanceTargetClusterRef(),
-		cp.PlacementTargetClusterRef(), cp.BarbicanTargetClusterRef(),
+		cp.PlacementTargetClusterRef(), cp.BarbicanTargetClusterRef(), cp.NeutronTargetClusterRef(),
 	} {
 		if ref == nil || ref.Name == "" {
 			continue

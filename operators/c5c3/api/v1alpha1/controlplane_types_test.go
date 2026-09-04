@@ -458,10 +458,10 @@ func TestGlanceNamespace(t *testing.T) {
 }
 
 // TestDedicatedServiceNamespacesIncludesGlance asserts the Glance, Placement,
-// and Barbican assignments are enumerated alongside keystone and horizon, in the
-// stable keystone→horizon→glance→placement→barbican order, and that co-located
-// services collapse to a single entry (services sharing a namespace share its
-// backing services and tenant store).
+// Barbican, and Neutron assignments are enumerated alongside keystone and
+// horizon, in the stable keystone→horizon→glance→placement→barbican→neutron
+// order, and that co-located services collapse to a single entry (services
+// sharing a namespace share its backing services and tenant store).
 func TestDedicatedServiceNamespacesIncludesGlance(t *testing.T) {
 	cpIn := func(services ServicesSpec) *ControlPlane {
 		return &ControlPlane{
@@ -482,15 +482,38 @@ func TestDedicatedServiceNamespacesIncludesGlance(t *testing.T) {
 			want: []string{"images"},
 		},
 		{
-			name: "each service in its own namespace enumerates in keystone→horizon→glance→placement→barbican order",
+			name: "each service in its own namespace enumerates in keystone→horizon→glance→placement→barbican→neutron order",
 			cp: cpIn(ServicesSpec{
 				Keystone:  &ServiceKeystoneSpec{Namespace: &ServiceNamespaceSpec{Name: "identity"}},
 				Horizon:   &ServiceHorizonSpec{Namespace: &ServiceNamespaceSpec{Name: "dashboard"}},
 				Glance:    &ServiceGlanceSpec{Namespace: &ServiceNamespaceSpec{Name: "images"}},
 				Placement: &ServicePlacementSpec{Namespace: &ServiceNamespaceSpec{Name: "placement"}},
 				Barbican:  &ServiceBarbicanSpec{Namespace: &ServiceNamespaceSpec{Name: "barbican"}},
+				Neutron:   &ServiceNeutronSpec{Namespace: &ServiceNamespaceSpec{Name: "neutron"}},
 			}),
-			want: []string{"identity", "dashboard", "images", "placement", "barbican"},
+			want: []string{"identity", "dashboard", "images", "placement", "barbican", "neutron"},
+		},
+		{
+			name: "neutron takes a namespace of its own",
+			cp: cpIn(ServicesSpec{
+				Neutron: &ServiceNeutronSpec{Namespace: &ServiceNamespaceSpec{Name: "neutron"}},
+			}),
+			want: []string{"neutron"},
+		},
+		{
+			name: "neutron co-located with barbican yields one entry",
+			cp: cpIn(ServicesSpec{
+				Barbican: &ServiceBarbicanSpec{Namespace: &ServiceNamespaceSpec{Name: "shared-ns"}},
+				Neutron:  &ServiceNeutronSpec{Namespace: &ServiceNamespaceSpec{Name: "shared-ns"}},
+			}),
+			want: []string{"shared-ns"},
+		},
+		{
+			name: "a neutron assignment naming the ControlPlane namespace contributes nothing",
+			cp: cpIn(ServicesSpec{
+				Neutron: &ServiceNeutronSpec{Namespace: &ServiceNamespaceSpec{Name: "openstack"}},
+			}),
+			want: nil,
 		},
 		{
 			name: "barbican takes a namespace of its own",
@@ -960,6 +983,202 @@ func TestServiceBarbicanSpecDeepCopy(t *testing.T) {
 	}
 }
 
+// TestNeutronNamespace exercises the nil-safe namespace resolver for the
+// network service across the states the accessor can be in: no service block
+// and a block without an assignment (both default to the ControlPlane's
+// namespace), a webhook-bypass empty name (also a fallback), and an explicit
+// assignment.
+func TestNeutronNamespace(t *testing.T) {
+	cpIn := func(neutron *ServiceNeutronSpec) *ControlPlane {
+		return &ControlPlane{
+			ObjectMeta: metav1.ObjectMeta{Name: "cp", Namespace: "openstack"},
+			Spec:       ControlPlaneSpec{Services: ServicesSpec{Neutron: neutron}},
+		}
+	}
+	tests := []struct {
+		name string
+		cp   *ControlPlane
+		want string
+	}{
+		{"no neutron block defaults to the ControlPlane namespace", cpIn(nil), "openstack"},
+		{"neutron block without an assignment defaults to the ControlPlane namespace", cpIn(&ServiceNeutronSpec{}), "openstack"},
+		{"an empty assignment name falls back to the ControlPlane namespace", cpIn(&ServiceNeutronSpec{Namespace: &ServiceNamespaceSpec{}}), "openstack"},
+		{"neutron takes a namespace of its own", cpIn(&ServiceNeutronSpec{Namespace: &ServiceNamespaceSpec{Name: "neutron"}}), "neutron"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.cp.NeutronNamespace(); got != tc.want {
+				t.Errorf("NeutronNamespace() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDedicatedNeutronBackingServicesAccessors exercises the nil-safe reads for
+// the network service across the states it can be in: no service block
+// (services.neutron nil), a block that shares the ControlPlane-wide instances
+// (dedicatedBackingServices nil), and one that opted into a dedicated database, a
+// dedicated cache, or both.
+func TestDedicatedNeutronBackingServicesAccessors(t *testing.T) {
+	tests := []struct {
+		name         string
+		cp           *ControlPlane
+		wantDatabase bool
+		wantCache    bool
+	}{
+		{
+			name: "no neutron block",
+			cp:   &ControlPlane{},
+		},
+		{
+			name: "neutron shares the ControlPlane-wide instances",
+			cp: &ControlPlane{Spec: ControlPlaneSpec{Services: ServicesSpec{
+				Neutron: &ServiceNeutronSpec{},
+			}}},
+		},
+		{
+			name: "neutron takes a dedicated database only",
+			cp: &ControlPlane{Spec: ControlPlaneSpec{Services: ServicesSpec{
+				Neutron: &ServiceNeutronSpec{
+					DedicatedBackingServices: &NeutronDedicatedBackingServicesSpec{
+						Database: &commonv1.DatabaseSpec{Database: "neutron"},
+					},
+				},
+			}}},
+			wantDatabase: true,
+		},
+		{
+			name: "neutron takes a dedicated cache only",
+			cp: &ControlPlane{Spec: ControlPlaneSpec{Services: ServicesSpec{
+				Neutron: &ServiceNeutronSpec{
+					DedicatedBackingServices: &NeutronDedicatedBackingServicesSpec{
+						Cache: &commonv1.CacheSpec{Backend: commonv1.DefaultCacheBackend},
+					},
+				},
+			}}},
+			wantCache: true,
+		},
+		{
+			name: "neutron takes both dedicated instances",
+			cp: &ControlPlane{Spec: ControlPlaneSpec{Services: ServicesSpec{
+				Neutron: &ServiceNeutronSpec{
+					DedicatedBackingServices: &NeutronDedicatedBackingServicesSpec{
+						Database: &commonv1.DatabaseSpec{Database: "neutron"},
+						Cache:    &commonv1.CacheSpec{Backend: commonv1.DefaultCacheBackend},
+					},
+				},
+			}}},
+			wantDatabase: true,
+			wantCache:    true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.cp.DedicatedNeutronDatabase() != nil; got != tc.wantDatabase {
+				t.Errorf("DedicatedNeutronDatabase() present = %v, want %v", got, tc.wantDatabase)
+			}
+			if got := tc.cp.DedicatedNeutronCache() != nil; got != tc.wantCache {
+				t.Errorf("DedicatedNeutronCache() present = %v, want %v", got, tc.wantCache)
+			}
+		})
+	}
+}
+
+// TestServiceNeutronSpecDeepCopy verifies the curated Neutron subset round-trips
+// through DeepCopy with independent storage, in particular the extraConfig map,
+// the worker replica count, and the dedicated-backing-services pointer: the
+// reconciler DeepCopies the projected spec onto the Neutron child, so an aliased
+// nested map here would let a child projection mutate the ControlPlane spec it
+// was derived from.
+func TestServiceNeutronSpecDeepCopy(t *testing.T) {
+	replicas, workerReplicas := int32(2), int32(1)
+	spec := ServiceNeutronSpec{
+		Replicas:       &replicas,
+		WorkerReplicas: &workerReplicas,
+		Image:          &commonv1.ImageSpec{Repository: "ghcr.io/c5c3/neutron", Tag: "2026.1"},
+		ExtraConfig:    map[string]map[string]string{"ml2": {"tenant_network_types": "geneve"}},
+		OVN: NeutronOVNSpec{
+			CentralRef: NeutronOVNCentralRef{Name: "ovn", Namespace: "networking"},
+		},
+		DedicatedBackingServices: &NeutronDedicatedBackingServicesSpec{
+			Database: &commonv1.DatabaseSpec{Database: "neutron"},
+		},
+		Namespace: &ServiceNamespaceSpec{Name: "neutron"},
+	}
+
+	clone := spec.DeepCopy()
+	if clone.Replicas == spec.Replicas {
+		t.Errorf("DeepCopy did not allocate a new *int32 for Replicas")
+	}
+	if clone.WorkerReplicas == spec.WorkerReplicas {
+		t.Errorf("DeepCopy did not allocate a new *int32 for WorkerReplicas")
+	}
+	if clone.Image == spec.Image {
+		t.Errorf("DeepCopy did not allocate a new *ImageSpec for Image")
+	}
+	if clone.DedicatedBackingServices == spec.DedicatedBackingServices {
+		t.Errorf("DeepCopy did not allocate a new *NeutronDedicatedBackingServicesSpec")
+	}
+	if clone.DedicatedBackingServices.Database == spec.DedicatedBackingServices.Database {
+		t.Errorf("DeepCopy did not allocate a new *DatabaseSpec for the dedicated database")
+	}
+	if clone.Namespace == spec.Namespace {
+		t.Errorf("DeepCopy did not allocate a new *ServiceNamespaceSpec for Namespace")
+	}
+
+	// Mutating the clone's nested extraConfig section and its OVN reference must
+	// not touch the source.
+	clone.ExtraConfig["ml2"]["tenant_network_types"] = "vlan"
+	if spec.ExtraConfig["ml2"]["tenant_network_types"] != "geneve" {
+		t.Errorf("DeepCopy aliased the nested extraConfig section: source value changed to %q",
+			spec.ExtraConfig["ml2"]["tenant_network_types"])
+	}
+	clone.OVN.CentralRef.Namespace = "other"
+	if spec.OVN.CentralRef.Namespace != "networking" {
+		t.Errorf("DeepCopy aliased the OVN central reference: source namespace changed to %q",
+			spec.OVN.CentralRef.Namespace)
+	}
+
+	var nilSpec *ServiceNeutronSpec
+	if got := nilSpec.DeepCopy(); got != nil {
+		t.Errorf("(*ServiceNeutronSpec)(nil).DeepCopy() = %v, want nil", got)
+	}
+}
+
+// TestNeutronOVNCentralNamespace pins the resolution of the OVNCentral reference
+// across the states it can be in: a ref carrying a namespace, a webhook-bypass
+// ref with none (the ControlPlane's own namespace, the value the defaulting
+// webhook writes), and no neutron block at all.
+func TestNeutronOVNCentralNamespace(t *testing.T) {
+	cpIn := func(neutron *ServiceNeutronSpec) *ControlPlane {
+		return &ControlPlane{
+			ObjectMeta: metav1.ObjectMeta{Name: "cp", Namespace: "openstack"},
+			Spec:       ControlPlaneSpec{Services: ServicesSpec{Neutron: neutron}},
+		}
+	}
+	central := func(namespace string) *ServiceNeutronSpec {
+		return &ServiceNeutronSpec{OVN: NeutronOVNSpec{
+			CentralRef: NeutronOVNCentralRef{Name: "ovn", Namespace: namespace},
+		}}
+	}
+	tests := []struct {
+		name string
+		cp   *ControlPlane
+		want string
+	}{
+		{"an explicit namespace is returned as written", cpIn(central("networking")), "networking"},
+		{"an empty namespace falls back to the ControlPlane namespace", cpIn(central("")), "openstack"},
+		{"no neutron block falls back to the ControlPlane namespace", cpIn(nil), "openstack"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.cp.NeutronOVNCentralNamespace(); got != tc.want {
+				t.Errorf("NeutronOVNCentralNamespace() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestServiceTargetClusterRefAccessors exercises the nil-safe target-cluster
 // accessors across the states each can be in: no service block at all and a
 // service block without a ref (both mean the service stays on the local cluster)
@@ -995,6 +1214,7 @@ func TestServiceTargetClusterRefAccessors(t *testing.T) {
 				Glance:    &ServiceGlanceSpec{},
 				Placement: &ServicePlacementSpec{},
 				Barbican:  &ServiceBarbicanSpec{},
+				Neutron:   &ServiceNeutronSpec{},
 			}),
 			want: map[string]string{},
 		},
@@ -1006,6 +1226,7 @@ func TestServiceTargetClusterRefAccessors(t *testing.T) {
 				Glance:    &ServiceGlanceSpec{TargetClusterRef: ref("edge-images")},
 				Placement: &ServicePlacementSpec{TargetClusterRef: ref("edge-placement")},
 				Barbican:  &ServiceBarbicanSpec{TargetClusterRef: ref("edge-secrets")},
+				Neutron:   &ServiceNeutronSpec{TargetClusterRef: ref("edge-networking")},
 			}),
 			want: map[string]string{
 				"KeystoneTargetClusterRef":  "edge-identity",
@@ -1013,6 +1234,7 @@ func TestServiceTargetClusterRefAccessors(t *testing.T) {
 				"GlanceTargetClusterRef":    "edge-images",
 				"PlacementTargetClusterRef": "edge-placement",
 				"BarbicanTargetClusterRef":  "edge-secrets",
+				"NeutronTargetClusterRef":   "edge-networking",
 			},
 		},
 		{
@@ -1025,6 +1247,16 @@ func TestServiceTargetClusterRefAccessors(t *testing.T) {
 			}),
 			want: map[string]string{"KeystoneTargetClusterRef": "edge-identity"},
 		},
+		{
+			// A neutron block with no ref beside a placed neutron-less plane:
+			// the accessor must not read through the missing block.
+			name: "a neutron block without a ref resolves to nil",
+			cp: cpIn(ServicesSpec{
+				Neutron:   &ServiceNeutronSpec{},
+				Placement: &ServicePlacementSpec{TargetClusterRef: ref("edge-placement")},
+			}),
+			want: map[string]string{"PlacementTargetClusterRef": "edge-placement"},
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1034,6 +1266,7 @@ func TestServiceTargetClusterRefAccessors(t *testing.T) {
 				"GlanceTargetClusterRef":    tc.cp.GlanceTargetClusterRef(),
 				"PlacementTargetClusterRef": tc.cp.PlacementTargetClusterRef(),
 				"BarbicanTargetClusterRef":  tc.cp.BarbicanTargetClusterRef(),
+				"NeutronTargetClusterRef":   tc.cp.NeutronTargetClusterRef(),
 			}
 			for accessor, gotRef := range got {
 				want := tc.want[accessor]
@@ -1057,7 +1290,7 @@ func TestServiceTargetClusterRefAccessors(t *testing.T) {
 
 // TestTargetClusterNames pins the enumeration of the clusters a ControlPlane
 // places services on: deduplicated, in the stable keystone→horizon→glance→
-// placement→barbican order, and empty for a local-only ControlPlane.
+// placement→barbican→neutron order, and empty for a local-only ControlPlane.
 func TestTargetClusterNames(t *testing.T) {
 	ref := func(name string) *commonv1.TargetClusterRefSpec {
 		return &commonv1.TargetClusterRefSpec{Name: name}
@@ -1086,13 +1319,24 @@ func TestTargetClusterNames(t *testing.T) {
 			// so an accidental sort would show up here.
 			name: "placed services are enumerated in service order, not by name",
 			cp: cpIn(ServicesSpec{
-				Keystone:  &ServiceKeystoneSpec{TargetClusterRef: ref("edge-e")},
-				Horizon:   &ServiceHorizonSpec{TargetClusterRef: ref("edge-d")},
-				Glance:    &ServiceGlanceSpec{TargetClusterRef: ref("edge-c")},
-				Placement: &ServicePlacementSpec{TargetClusterRef: ref("edge-b")},
-				Barbican:  &ServiceBarbicanSpec{TargetClusterRef: ref("edge-a")},
+				Keystone:  &ServiceKeystoneSpec{TargetClusterRef: ref("edge-f")},
+				Horizon:   &ServiceHorizonSpec{TargetClusterRef: ref("edge-e")},
+				Glance:    &ServiceGlanceSpec{TargetClusterRef: ref("edge-d")},
+				Placement: &ServicePlacementSpec{TargetClusterRef: ref("edge-c")},
+				Barbican:  &ServiceBarbicanSpec{TargetClusterRef: ref("edge-b")},
+				Neutron:   &ServiceNeutronSpec{TargetClusterRef: ref("edge-a")},
 			}),
-			want: []string{"edge-e", "edge-d", "edge-c", "edge-b", "edge-a"},
+			want: []string{"edge-f", "edge-e", "edge-d", "edge-c", "edge-b", "edge-a"},
+		},
+		{
+			// The neutron ref is enumerated last, and a nil neutron block
+			// contributes nothing.
+			name: "a placed neutron is enumerated after barbican",
+			cp: cpIn(ServicesSpec{
+				Barbican: &ServiceBarbicanSpec{TargetClusterRef: ref("edge-secrets")},
+				Neutron:  &ServiceNeutronSpec{TargetClusterRef: ref("edge-networking")},
+			}),
+			want: []string{"edge-secrets", "edge-networking"},
 		},
 		{
 			name: "services sharing a cluster yield one entry, first occurrence winning",
