@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright 2026 SAP SE or an SAP affiliate company
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# OVN control plane the neutron-mc CR programs, placed on the target cluster.
+#
+# The shape is tests/e2e/neutron/basic-deployment/01-ovncentral-cr.yaml plus
+# targetClusterRef. Both CRs name the same cluster, so the Neutron reconciler
+# reads the internal database addresses this central publishes; across a
+# boundary it would need the node ports an externally reachable database
+# publishes instead.
+#
+# The children this places are the ones no other CR in the suite produces: two
+# StatefulSets and a PersistentVolumeClaim. Those are the grants of the
+# target-cluster-access chart that nothing had exercised on a real target.
+#
+# Single-member Raft clusters and a single northd keep the bring-up inside the
+# assert budget; the multi-member cluster is what
+# tests/e2e/ovn/central-basic-deployment/ covers.
+#
+# The backup CronJob is suspended: the suite asserts that the volume exists, not
+# that a snapshot ran, and a suspended schedule keeps the hourly dump off a
+# cluster that is also running the rest of this suite.
+#
+# The issuer is the cluster-scoped one the kind overlay ships on the TARGET,
+# where cert-manager and the databases both are. OVN authenticates every
+# connection, so both databases and the client identity the Neutron pods mount
+# are issued from the same CA there.
+#
+# No OVNChassis and no metadata agent: a chassis needs the openvswitch kernel
+# modules on the node and a privileged namespace, and this suite is about where
+# the children land rather than about the datapath.
+apiVersion: ovn.openstack.c5c3.io/v1alpha1
+kind: OVNCentral
+metadata:
+  name: ovn-mc
+  namespace: openstack
+spec:
+  targetClusterRef:
+    name: cobaltcore-target
+  tls:
+    issuerRef:
+      name: openstack-ovn-ca-issuer
+  northbound:
+    replicas: 1
+  southbound:
+    replicas: 1
+  northd:
+    deployment:
+      replicas: 1
+  backup:
+    suspend: true

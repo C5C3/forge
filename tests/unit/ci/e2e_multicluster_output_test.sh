@@ -28,7 +28,7 @@ CI_YAML="$PROJECT_ROOT/.github/workflows/ci.yaml"
 # The operators the two-cluster suite places services on. The resolve script
 # reads FILTER_${op} only for operators named here, so a shorter list would
 # make the FILTER_keystone scenario below assert nothing.
-ALL_OPERATORS_FIXTURE="keystone barbican"
+ALL_OPERATORS_FIXTURE="keystone barbican ovn neutron"
 
 PASS=0
 FAIL=0
@@ -151,6 +151,32 @@ test_job_runs_the_makefile_target() {
     "chainsaw test --config tests/e2e-multicluster/chainsaw-config.yaml tests/e2e-multicluster/"
 }
 
+test_job_deploys_the_network_operators() {
+  echo "Test: the job deploys ovn-operator and neutron-operator and loads their images"
+
+  # The suite places an OVNCentral and a Neutron, and neither CR moves without
+  # its operator on the management cluster. The assertions are scoped to this
+  # job's text: every other e2e job also carries an `OPERATOR: ovn` block, so a
+  # whole-file match would pass with nothing wired here at all.
+  local job
+  job=$(awk '
+    /^  e2e-multicluster:$/ { in_job = 1; next }
+    in_job && /^  ([a-z0-9-]+:$|#)/ { exit }
+    in_job { print }
+  ' "$CI_YAML")
+
+  assert_not_empty "the job exists" "$job"
+  assert_contains "the job deploys ovn-operator" "$job" "OPERATOR: ovn"
+  assert_contains "ovn-operator lands in its own namespace" "$job" "NAMESPACE: ovn-system"
+  assert_contains "the job deploys neutron-operator" "$job" "OPERATOR: neutron"
+  assert_contains "neutron-operator lands in its own namespace" "$job" "NAMESPACE: neutron-system"
+  # The OVN daemon image is tag-pinned in images/ovn/Dockerfile and resolved
+  # into OVN_VERSION by a step of its own. A hard-coded tag here would drift
+  # away from that pin without anything noticing.
+  assert_contains "the OVN daemon image is loaded at the resolved version" \
+    "$job" 'ovn:${{ env.OVN_VERSION }}'
+}
+
 test_job_never_registers_an_admin_kubeconfig() {
   echo "Test: the registration step mints the chart's token instead of taking the admin kubeconfig"
 
@@ -198,6 +224,7 @@ test_tag_push_forces_the_job
 test_ci_yaml_wires_all_four_sides
 test_filter_covers_the_suite_and_the_chart
 test_job_runs_the_makefile_target
+test_job_deploys_the_network_operators
 test_job_never_registers_an_admin_kubeconfig
 test_setup_action_threads_the_target_flags
 

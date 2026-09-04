@@ -1,0 +1,61 @@
+# SPDX-FileCopyrightText: Copyright 2026 SAP SE or an SAP affiliate company
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# Neutron CR fixture for the placed-services E2E test.
+#
+# The shape is tests/e2e/neutron/basic-deployment/02-neutron-cr.yaml with the
+# same two differences as the Keystone and Barbican fixtures: targetClusterRef,
+# and one API replica instead of two.
+#
+# Every name it references is resolved on the TARGET cluster: the openstack-db
+# schema neutron_mc, the openstack-memcached cache, the ESO-synced neutron-db
+# credentials and the pre-seeded keystone-admin service-user password from
+# deploy/kind/infrastructure, and the messaging Secret 03-messaging-secret.yaml
+# applies there. The CR itself lives on the management cluster and reaches none
+# of them from it.
+#
+# keystoneEndpoint names the placed Keystone's Service, which sits on that same
+# cluster; ovn.centralRef names the OVNCentral placed beside it. Both refs
+# resolve where the Neutron pods run, not where the CR does.
+apiVersion: neutron.openstack.c5c3.io/v1alpha1
+kind: Neutron
+metadata:
+  name: neutron-mc
+  namespace: openstack
+spec:
+  targetClusterRef:
+    name: cobaltcore-target
+  openStackRelease: "2025.2"
+  deployment:
+    replicas: 1
+  workers:
+    deployment:
+      replicas: 1
+  image:
+    repository: ghcr.io/c5c3/neutron
+    tag: "2025.2"
+  database:
+    clusterRef:
+      name: openstack-db
+    database: neutron_mc
+    secretRef:
+      name: neutron-db
+  cache:
+    clusterRef:
+      name: openstack-memcached
+  messaging:
+    secretRef:
+      name: neutron-mc-messaging
+  ovn:
+    centralRef:
+      name: ovn-mc
+  keystoneEndpoint: http://keystone-mc.openstack.svc.cluster.local:5000/v3
+  serviceUser:
+    username: admin
+    projectName: admin
+    userDomainName: Default
+    projectDomainName: Default
+    secretRef:
+      name: keystone-admin
+      key: password

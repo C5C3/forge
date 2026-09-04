@@ -4,9 +4,10 @@
 
 # Chainsaw E2E test for placed services across two clusters.
 #
-# The CRs are created on the management cluster, which runs keystone-operator
-# and barbican-operator and no infrastructure. Every child lands on the target
-# cluster, which runs the infrastructure and no operator. What the suite proves:
+# The CRs are created on the management cluster, which runs keystone-operator,
+# barbican-operator, ovn-operator and neutron-operator and no infrastructure.
+# Every child lands on the target cluster, which runs the infrastructure and no
+# operator. What the suite proves:
 #   - A placed Keystone reaches Ready with its Deployment, Service, config
 #     ConfigMap, fernet Secret and MariaDB Database on the TARGET, and none of
 #     them on the management cluster
@@ -16,6 +17,12 @@
 #     probe through the target's service proxy, the provisioner token through
 #     the target's TokenRequest API, and the OpenBao handshake through a
 #     pods/portforward tunnel — all three on the chart's credentials
+#   - A placed OVN control plane and a placed Neutron reach Ready with the two
+#     Raft StatefulSets, the backup volume, the API Deployment and the mirrored
+#     OVN client Secret on the TARGET. Those StatefulSets and that volume are
+#     the two grants of the chart no other CR in the suite uses. No chassis is
+#     placed: the datapath wants kernel modules and a privileged namespace, and
+#     this suite is about where the children land
 #   - Deleting the CRs sweeps their children off the target and leaves the
 #     infrastructure the deploy created there untouched
 #
@@ -290,12 +297,222 @@ spec:
           kubectl get openbaocluster,pods -n openstack -l app.kubernetes.io/name=openbao 2>&1 || true
           echo "=== Events (target cluster) ==="
           kubectl get events -n openstack --sort-by='.lastTimestamp' 2>&1 | tail -30 || true
-  # ── Step 7: Delete the CRs and assert the sweep ─────────────────────────
-  # The store goes first so its credentials Secret is deleted while its parent
-  # still resolves the cluster. Each delete is bounded: the remote sweep runs
-  # under a finalizer, so a target that cannot be reached shows up as a delete
-  # that does not return rather than as a passing teardown.
+  # ── Step 7: Apply the OVN control plane and the Neutron CR ──────────────
+  # The messaging Secret is applied on the TARGET: the neutron-operator reads
+  # spec.messaging.secretRef through the CR's children client, so for a placed
+  # Neutron it has to sit where the children go. The two CRs are applied here,
+  # like every other CR in the suite.
   - try:
+    - apply:
+        cluster: target
+        file: 03-messaging-secret.yaml
+    - apply:
+        file: 04-ovncentral-cr.yaml
+    - apply:
+        file: 05-neutron-cr.yaml
+  # ── Step 8: Assert the placed OVN control plane reaches Ready ───────────
+  # 10m rather than the suite's 5m: cert-manager issues three certificates on
+  # the target and both Raft databases bootstrap there before northd reports
+  # ready, and every write on the way crosses the cluster boundary.
+  - try:
+    - assert:
+        timeout: 10m
+        resource:
+          apiVersion: ovn.openstack.c5c3.io/v1alpha1
+          kind: OVNCentral
+          metadata:
+            name: ovn-mc
+            namespace: openstack
+          status:
+            (conditions[?type == 'Ready']):
+            - status: "True"
+              reason: AllReady
+            northbound:
+              readyReplicas: 1
+            southbound:
+              readyReplicas: 1
+            # The name the neutron-operator mirrors from. The field is
+            # published here, on the management cluster, while the Secret it
+            # names exists only on the target.
+            clientSecretName: ovn-mc-client
+    # The two Raft databases are the only StatefulSets this suite places and the
+    # backup volume the only PersistentVolumeClaim, so this is where the chart's
+    # grants for both kinds are exercised on a real target.
+    - assert:
+        cluster: target
+        resource:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: ovn-mc-nb
+            namespace: openstack
+            labels:
+              openstack.c5c3.io/owner-kind: OVNCentral
+              openstack.c5c3.io/owner-name: ovn-mc
+              openstack.c5c3.io/owner-namespace: openstack
+          status:
+            readyReplicas: 1
+    - assert:
+        cluster: target
+        resource:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: ovn-mc-sb
+            namespace: openstack
+            labels:
+              openstack.c5c3.io/owner-kind: OVNCentral
+              openstack.c5c3.io/owner-name: ovn-mc
+              openstack.c5c3.io/owner-namespace: openstack
+          status:
+            readyReplicas: 1
+    - assert:
+        cluster: target
+        resource:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: ovn-mc-backup
+            namespace: openstack
+            labels:
+              openstack.c5c3.io/owner-kind: OVNCentral
+              openstack.c5c3.io/owner-name: ovn-mc
+              openstack.c5c3.io/owner-namespace: openstack
+    - error:
+        resource:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: ovn-mc-nb
+            namespace: openstack
+    - error:
+        resource:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: ovn-mc-sb
+            namespace: openstack
+    - error:
+        resource:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: ovn-mc-backup
+            namespace: openstack
+    catch:
+    - script:
+        content: |
+          echo "=== OVNCentral CR status (management cluster) ==="
+          kubectl get ovncentral ovn-mc -n $NAMESPACE -o yaml 2>&1 || true
+          echo "=== ovn-operator logs ==="
+          kubectl logs -n ovn-system -l app.kubernetes.io/name=ovn-operator --all-containers --tail=100 2>&1 || true
+    - script:
+        cluster: target
+        content: |
+          echo "=== OVN control plane (target cluster) ==="
+          kubectl get statefulset,pod,pvc -n openstack -l app.kubernetes.io/instance=ovn-mc -o wide 2>&1 || true
+          echo "=== OVN pod logs (target cluster) ==="
+          for pod in $(kubectl get pods -n openstack -l app.kubernetes.io/instance=ovn-mc -o name 2>/dev/null); do
+            echo "--- $pod ---"
+            kubectl logs -n openstack "$pod" --all-containers --tail=60 2>&1 || true
+            kubectl logs -n openstack "$pod" --all-containers --tail=60 --previous 2>&1 || true
+          done
+          echo "=== Certificates (target cluster) ==="
+          kubectl get certificate -n openstack 2>&1 || true
+          echo "=== Events (target cluster) ==="
+          kubectl get events -n openstack --sort-by='.lastTimestamp' 2>&1 | tail -30 || true
+  # ── Step 9: Assert the placed Neutron reaches Ready ─────────────────────
+  # Also 10m: the API image has to be pulled on the target, the schema migrated
+  # there, and the OVN client identity mirrored across from the central's own
+  # children client before the pods can authenticate to either database.
+  - try:
+    - assert:
+        timeout: 10m
+        resource:
+          apiVersion: neutron.openstack.c5c3.io/v1alpha1
+          kind: Neutron
+          metadata:
+            name: neutron-mc
+            namespace: openstack
+          status:
+            (conditions[?type == 'Ready']):
+            - status: "True"
+              reason: AllReady
+    - assert:
+        cluster: target
+        resource:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: neutron-mc
+            namespace: openstack
+            labels:
+              openstack.c5c3.io/owner-kind: Neutron
+              openstack.c5c3.io/owner-name: neutron-mc
+              openstack.c5c3.io/owner-namespace: openstack
+          status:
+            (availableReplicas > `0`): true
+    # The mirrored copy of the OVNCentral's client identity: the keypair the
+    # ML2/OVN mechanism driver presents to both databases and the CA bundle it
+    # verifies them against. It is written through the Neutron's children
+    # client, so it lands beside the pods that mount it rather than beside the
+    # CR that asked for it.
+    - assert:
+        cluster: target
+        resource:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: neutron-mc-ovn-client
+            namespace: openstack
+    - error:
+        resource:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: neutron-mc
+            namespace: openstack
+    catch:
+    - script:
+        content: |
+          echo "=== Neutron CR status (management cluster) ==="
+          kubectl get neutron neutron-mc -n $NAMESPACE -o yaml 2>&1 || true
+          echo "=== neutron-operator logs ==="
+          kubectl logs -n neutron-system -l app.kubernetes.io/name=neutron-operator --all-containers --tail=100 2>&1 || true
+    - script:
+        cluster: target
+        content: |
+          echo "=== Neutron children (target cluster) ==="
+          kubectl get deploy,pod -n openstack -l app.kubernetes.io/instance=neutron-mc -o wide 2>&1 || true
+          echo "=== Neutron pod logs (target cluster) ==="
+          for pod in $(kubectl get pods -n openstack -l app.kubernetes.io/instance=neutron-mc -o name 2>/dev/null); do
+            echo "--- $pod ---"
+            kubectl logs -n openstack "$pod" --all-containers --tail=60 2>&1 || true
+            kubectl logs -n openstack "$pod" --all-containers --tail=60 --previous 2>&1 || true
+          done
+          echo "=== Events (target cluster) ==="
+          kubectl get events -n openstack --sort-by='.lastTimestamp' 2>&1 | tail -30 || true
+  # ── Step 10: Delete the CRs and assert the sweep ────────────────────────
+  # The Neutron goes before its OVNCentral, and the store before its parent
+  # Barbican. In both pairs the dependent still resolves what it reads while it
+  # is being swept. Each delete is bounded: the remote sweep runs under a
+  # finalizer, so a target that cannot be reached shows up as a delete that does
+  # not return rather than as a passing teardown.
+  - try:
+    - delete:
+        timeout: 2m
+        ref:
+          apiVersion: neutron.openstack.c5c3.io/v1alpha1
+          kind: Neutron
+          name: neutron-mc
+          namespace: openstack
+    - delete:
+        timeout: 2m
+        ref:
+          apiVersion: ovn.openstack.c5c3.io/v1alpha1
+          kind: OVNCentral
+          name: ovn-mc
+          namespace: openstack
     - delete:
         timeout: 2m
         ref:
@@ -317,8 +534,32 @@ spec:
           kind: Keystone
           name: keystone-mc
           namespace: openstack
-  # ── Step 8: Assert the children are gone and the infrastructure is not ──
+  # ── Step 11: Assert the children are gone and the infrastructure is not ─
   - try:
+    - error:
+        cluster: target
+        resource:
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: neutron-mc
+            namespace: openstack
+    - error:
+        cluster: target
+        resource:
+          apiVersion: apps/v1
+          kind: StatefulSet
+          metadata:
+            name: ovn-mc-nb
+            namespace: openstack
+    - error:
+        cluster: target
+        resource:
+          apiVersion: v1
+          kind: PersistentVolumeClaim
+          metadata:
+            name: ovn-mc-backup
+            namespace: openstack
     - error:
         cluster: target
         resource:

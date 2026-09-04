@@ -2420,8 +2420,9 @@ jobs:
 
   # Two-cluster placed-services E2E on kind. Brings up a target cluster running
   # the infrastructure and no operator (INFRA_ONLY=true), a management cluster
-  # running keystone-operator and barbican-operator and no infrastructure, and
-  # runs tests/e2e-multicluster/ across both.
+  # running keystone-operator, barbican-operator, ovn-operator and
+  # neutron-operator and no infrastructure, and runs tests/e2e-multicluster/
+  # across both.
   #
   # The management cluster reaches the target EXCLUSIVELY through a kubeconfig
   # minted from the target-cluster-access chart's ServiceAccount token. Running
@@ -2469,6 +2470,10 @@ jobs:
           version: ${{ env.KIND_VERSION }}
           config: hack/kind-config.yaml
           cluster_name: ${{ env.TARGET_CLUSTER }}
+      # images/ovn/Dockerfile holds the pin; resolving it here keeps the tag
+      # out of this workflow.
+      - name: Resolve OVN version
+        run: echo "OVN_VERSION=$(hack/ci-resolve-ovn-version.sh)" >> "$GITHUB_ENV"
       - name: Load E2E images
         uses: ./.github/actions/load-e2e-images
         with:
@@ -2476,14 +2481,22 @@ jobs:
           images: |
             ${{ env.IMAGE_PREFIX }}/keystone-operator:dev
             ${{ env.IMAGE_PREFIX }}/barbican-operator:dev
+            ${{ env.IMAGE_PREFIX }}/ovn-operator:dev
+            ${{ env.IMAGE_PREFIX }}/neutron-operator:dev
             ${{ env.IMAGE_PREFIX }}/keystone:2025.2
             ${{ env.IMAGE_PREFIX }}/barbican:2025.2
+            ${{ env.IMAGE_PREFIX }}/neutron:2025.2
+            ${{ env.IMAGE_PREFIX }}/ovn:${{ env.OVN_VERSION }}
       # The service images run on the target; the operator images run on the
-      # management cluster, which does not exist yet.
+      # management cluster, which does not exist yet. The OVN daemon image is a
+      # service image here: the placed OVNCentral's databases and northd all run
+      # on the target.
       - name: Load service images into the target cluster
         run: |
           kind load docker-image ${{ env.IMAGE_PREFIX }}/keystone:2025.2 --name "$TARGET_CLUSTER"
           kind load docker-image ${{ env.IMAGE_PREFIX }}/barbican:2025.2 --name "$TARGET_CLUSTER"
+          kind load docker-image ${{ env.IMAGE_PREFIX }}/neutron:2025.2 --name "$TARGET_CLUSTER"
+          kind load docker-image ${{ env.IMAGE_PREFIX }}/ovn:${{ env.OVN_VERSION }} --name "$TARGET_CLUSTER"
       - name: Setup target-cluster infrastructure
         uses: ./.github/actions/setup-e2e-infra
         env:
@@ -2497,8 +2510,10 @@ jobs:
         run: |
           kind load docker-image ${{ env.IMAGE_PREFIX }}/keystone-operator:dev --name "$MGMT_CLUSTER"
           kind load docker-image ${{ env.IMAGE_PREFIX }}/barbican-operator:dev --name "$MGMT_CLUSTER"
+          kind load docker-image ${{ env.IMAGE_PREFIX }}/ovn-operator:dev --name "$MGMT_CLUSTER"
+          kind load docker-image ${{ env.IMAGE_PREFIX }}/neutron-operator:dev --name "$MGMT_CLUSTER"
       # hack/deploy-mgmt-cluster.sh left the kubectl context on the management
-      # cluster, which is where both operators are installed.
+      # cluster, which is where all four operators are installed.
       - name: Deploy keystone-operator
         run: hack/ci-deploy-operator.sh
         env:
@@ -2511,6 +2526,27 @@ jobs:
           OPERATOR: barbican
           IMAGE_REPO: ${{ env.IMAGE_PREFIX }}/barbican-operator
           NAMESPACE: barbican-system
+      # The ovn-operator projects the placed central's StatefulSets, its backup
+      # volume and its Certificates onto the target over the registered
+      # kubeconfig. No other operator in this job writes a StatefulSet or a
+      # PersistentVolumeClaim there, so those two grants of the chart are
+      # exercised only while this one runs.
+      - name: Deploy ovn-operator
+        run: hack/ci-deploy-operator.sh
+        env:
+          OPERATOR: ovn
+          IMAGE_REPO: ${{ env.IMAGE_PREFIX }}/ovn-operator
+          NAMESPACE: ovn-system
+      # The neutron-operator reads the central's status on this cluster, where
+      # both CRs live, and places the API Deployment and the mirrored OVN client
+      # Secret on the target. Its OVNCentral CRD comes from the ovn-operator
+      # above, so that one is deployed first.
+      - name: Deploy neutron-operator
+        run: hack/ci-deploy-operator.sh
+        env:
+          OPERATOR: neutron
+          IMAGE_REPO: ${{ env.IMAGE_PREFIX }}/neutron-operator
+          NAMESPACE: neutron-system
       # createNamespaces=false: the openstack namespace already exists on the
       # target from the infrastructure deploy.
       - name: Install the target-cluster-access chart on the target
