@@ -422,8 +422,8 @@ connection, a nil block for a plaintext one.
 
 Declares the per-service configuration of the control plane. Today
 Keystone, the Horizon dashboard, the Glance image service, the Placement
-service, and the Barbican key manager are modeled; additional services are added
-as fields as the operator grows.
+service, the Barbican key manager, and the Neutron network service are modeled;
+additional services are added as fields as the operator grows.
 
 | Field | Type | Required | Default | Description |
 | --- | --- | --- | --- | --- |
@@ -432,6 +432,7 @@ as fields as the operator grows.
 | `glance` | [`*ServiceGlanceSpec`](#serviceglancespec) | No | `nil` | Configuration for the Glance image service projected by the reconciler. Optional: when unset, this ControlPlane manages no image service and `GlanceReady` is reported as not-managed (`GlanceNotManaged`), so the aggregate `Ready` is not blocked. The projection is **gated on `KeystoneReady`** — Glance validates every token against the ControlPlane's Keystone child. **Forbidden in External mode** — Glance needs its own External-mode design. Flipping it from set to `nil` preserves the previously-projected Glance child by default; set the `c5c3.io/allow-glance-deletion: "true"` annotation to opt in to deleting the child (and its `GlanceBackend` children and DB-credential ExternalSecret) on unset. The dynamic DB-credential generator is torn down on unset regardless of the annotation — preserving a running service does not imply preserving a credential minter. |
 | `placement` | [`*ServicePlacementSpec`](#serviceplacementspec) | No | `nil` | Configuration for the Placement service projected by the reconciler. Optional: when unset, this ControlPlane manages no placement service and `PlacementReady` is reported as not-managed (`PlacementNotManaged`), so the aggregate `Ready` is not blocked. The projection is **gated on `KeystoneReady`** (Placement validates every token against the ControlPlane's Keystone child) and on the `AccountReady` of the `KeystoneService` registration the reconciler projects for it. **Forbidden in External mode**: Placement needs its own External-mode design. Flipping it from set to `nil` preserves the previously-projected Placement child by default; set the `c5c3.io/allow-placement-deletion: "true"` annotation to opt in to deleting the child (with its DB-credential ExternalSecret and the placement catalog CRs) on unset. The dynamic DB-credential generator is torn down on unset regardless of the annotation, so no credential minter outlives the service. |
 | `barbican` | [`*ServiceBarbicanSpec`](#servicebarbicanspec) | No | `nil` | Configuration for the Barbican key manager projected by the reconciler. Optional: when unset, this ControlPlane manages no key manager and `BarbicanReady` is reported as not-managed (`BarbicanNotManaged`), so the aggregate `Ready` is not blocked. The projection is **gated on `KeystoneReady`** (Barbican validates every token against the ControlPlane's Keystone child) and on the `AccountReady` of the `KeystoneService` registration the reconciler projects for it. **Forbidden in External mode**: Barbican needs its own External-mode design. Flipping it from set to `nil` preserves the previously-projected Barbican child by default; set the `c5c3.io/allow-barbican-deletion: "true"` annotation to opt in to deleting the child (with its `BarbicanSecretStore`, its DB-credential ExternalSecret, and the key-manager catalog CRs) on unset. The dynamic DB-credential generator is torn down on unset regardless of the annotation. Destroying a **dedicated** OpenBao instance and the secrets in it takes a second annotation on top, `c5c3.io/allow-barbican-secret-store-data-deletion: "true"`; see [ServiceBarbicanSecretStoreSpec](#servicebarbicansecretstorespec). |
+| `neutron` | [`*ServiceNeutronSpec`](#serviceneutronspec) | No | `nil` | Configuration for the Neutron network service projected by the reconciler. Optional: when unset, this ControlPlane manages no network service and `NeutronReady` is reported as not-managed (`NeutronNotManaged`), so the aggregate `Ready` is not blocked. The projection is **gated on `KeystoneReady`** (Neutron validates every token against the ControlPlane's Keystone child), on **`OVNReady`** (the ML2/OVN mechanism driver writes every network into the referenced central's Northbound database), and on the `AccountReady` of the `KeystoneService` registration the reconciler projects for it. It also **requires `spec.infrastructure.messaging`**: the Neutron CRD requires `spec.messaging`, and the child's transport URL is derived from the shared bus, so the webhook rejects a `neutron` block declared without one. **Forbidden in External mode**: Neutron needs its own External-mode design. Flipping it from set to `nil` preserves the previously-projected Neutron child by default; set the `c5c3.io/allow-neutron-deletion: "true"` annotation to opt in to deleting the child (with its DB-credential ExternalSecret, the two messaging Secrets, and the network catalog registration) on unset. The dynamic DB-credential generator is torn down on unset regardless of the annotation. The referenced `OVNCentral` is never deleted: the ControlPlane only reads it. |
 
 ---
 
@@ -789,6 +790,160 @@ resolve on every path the projection takes.
 
 ---
 
+## ServiceNeutronSpec
+
+A **curated local subset** of the knobs the ControlPlane exposes for the Neutron
+network service, mirroring `ServiceKeystoneSpec` and `ServicePlacementSpec`. The
+reconciler (L2) **projects** it into a `Neutron` CR; the database, cache,
+Keystone endpoint, and message bus of that child are **derived** from the
+ControlPlane (`infrastructure.*` and the Keystone child's naming convention)
+rather than set here. `spec.apiServer`, `spec.ovnDBSync`, `spec.networkPolicy`,
+`spec.autoscaling`, and `spec.logging` on the child are not projected, so the
+neutron operator's own uWSGI parameters, OVN schema-sync schedule, network
+policies, autoscaling, and logging stay authoritative.
+
+Two fields have no counterpart on the other services. `ovn` is required, because
+the ML2/OVN mechanism driver writes every network, subnet, and port into an OVN
+Northbound database. `workerReplicas` sizes the RPC worker Deployments the child
+runs beside its API.
+
+Forbidden entirely when `services.keystone.mode` is `External` (Neutron needs its
+own External-mode design), so, like `ServicePlacementSpec`, none of its fields
+carry per-field External-mode forbid-rules.
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `replicas` | `*int32` | No | `nil` | Overrides the number of Neutron API replicas. When `nil` the reconciler applies the neutron operator's own default (3). Minimum 1. |
+| `workerReplicas` | `*int32` | No | `nil` | Overrides the replica count of the two RPC worker Deployments the child runs beside its API, the periodic workers and the OVN maintenance worker. Projected onto the child's `spec.workers.deployment.replicas`, which sizes both. When `nil` the reconciler applies the neutron operator's own default (3), so six worker pods. The knob exists because a single-node devstack cannot carry six idle worker pods beside the rest of the control plane. Minimum 1. |
+| `image` | [`*commonv1.ImageSpec`](../keystone/keystone-crd.md#imagespec) | No | `nil` | Overrides the Neutron container image. When `nil` the reconciler derives `ghcr.io/c5c3/neutron:{spec.openStackRelease}`. When set, the validating webhook mirrors the `commonv1.ImageSpec` tag/digest XOR, so an override naming neither or both is rejected at admission. |
+| `gateway` | [`*commonv1.GatewaySpec`](#gatewayspec) | No | `nil` | Exposes the projected Neutron API externally via a Gateway API HTTPRoute. When `nil` (the default) no HTTPRoute is projected and the Neutron API is reachable in-cluster only. When a `gateway` is set its `hostname` must be non-empty and a usable DNS name, enforced at admission by the validating webhook (see [Validation Rules](#validation-rules)). |
+| `publicEndpoint` | `string` | No | `""` | Externally routable Neutron endpoint URL (e.g. `https://neutron.127-0-0-1.nip.io:8443`). Used **only** for the K-ORC public network catalog Endpoint, the URL every client resolves to create its networks, subnets, and ports; it is projected into no child CR, so the validating webhook is the only gate on it. When set, it must match `^https?://`, parse to a bare origin with a host (no path, query, or fragment, since the Neutron API is served at the root and clients append the API path to the catalog URL), and be at most 512 characters; a single trailing slash is tolerated. When a `gateway` is configured the scheme must be `https` and the host must equal `gateway.hostname` (the port may differ); see [Validation Rules](#validation-rules). Without a gateway an `http://` value stays admissible for development and raises an admission warning, because every network call carries the caller's scoped Keystone token to this URL. When empty and `gateway` is set, the reconciler derives `https://{gateway.hostname}` (the default-443 form); set it explicitly when the externally reachable port differs (e.g. a kind host-port mapping like `:8443`). |
+| `databaseCredentialsMode` | `string` (`Static` \| `Dynamic`) | No | `""` (inherits `spec.infrastructure.database.credentialsMode`) | Per-service override of the ControlPlane-wide credentials mode for the managed **shared** database, so a staged migration can run Neutron on one mode while another service stays on the other. Empty (the default) **inherits** the shared mode, and is not materialized by the defaulting webhook, so "inherit" stays distinguishable from an explicit override. A `Dynamic` override is **rejected** when Neutron declares a [dedicated](#neutrondedicatedbackingservicesspec) database (dedicated is `Static`-only; set `dedicatedBackingServices.database.credentialsMode` instead, see [Credential modes](#credential-modes)) and when the shared database is **brownfield** (`clusterRef` unset); `Static` is always admitted. |
+| `extraConfig` | `map[string]map[string]string` | No | `nil` | Free-form INI sections for the network service. Merged **key by key** with `spec.globalExtraConfig` (this per-service value winning per key) and the merged result projected onto the Neutron child's `spec.extraConfig`, which carries the `neutron.conf` and `ml2_conf.ini` sections alike. Admission runs shape, operator-owned-key, and option-catalog checks on the merged block; the always-rejected owned keys are the two `[ovn]` connection strings, the six `[ovn]` client-certificate and CA paths, `[DEFAULT] transport_url`, `auth_strategy` and `api_paste_config`, `[database] connection`, `[keystone_authtoken] password`, and `[securitygroup] enable_security_group`. See [ExtraConfig admission checks](#extraconfig-admission-checks). |
+| `ovn` | [`NeutronOVNSpec`](#neutronovnspec) | Yes | — | Names the OVN control plane the projected Neutron programs. Required: the ML2/OVN mechanism driver has no logical network model to write to without one, so a Neutron with no central to address would park unready for as long as it exists. |
+| `dedicatedBackingServices` | [`*NeutronDedicatedBackingServicesSpec`](#neutrondedicatedbackingservicesspec) | No | `nil` (shares the ControlPlane-wide instances) | Opts Neutron **out** of the shared `spec.infrastructure` instances and gives it a `database` and/or `cache` of its own. Neutron consumes both classes, so it can take either or both dedicated; a declared block must name at least one. |
+| `namespace` | [`*ServiceNamespaceSpec`](#service-namespaces) | No | `nil` (placed in the ControlPlane's namespace) | Places the Neutron service, and the database, cache, secret store, and credential material that follow it, in a namespace of its own. Create-only: the validating webhook freezes the block after creation. See [Service Namespaces](#service-namespaces). |
+| `targetClusterRef` | [`*commonv1.TargetClusterRefSpec`](../target-clusters.md#the-field) | No | `nil` (the local cluster the operator runs on) | Places the Neutron service, and the database, cache, secret store, and credential material that follow it, on a registered target cluster. The projected `Neutron` CR stays on the management cluster and carries the ref verbatim. Requires a `namespace` block of its own, plus a `publicEndpoint` or a `gateway` so the network catalog advertises an address other clusters resolve (webhook). Create-only: the validating webhook freezes the ref after creation. See [ControlPlane placement](../target-clusters.md#controlplane-placement). |
+
+The logical database name is not exposed here. The projection forces it to
+`neutron` on the child, whether Neutron shares the ControlPlane's database
+cluster or takes a dedicated one: that is the one schema the pre-wired OpenBao
+engine role grants on, so any other name would be issued a credential it cannot
+use.
+
+Setting `services.neutron` requires `spec.infrastructure.messaging` beside it.
+The Neutron CRD requires `spec.messaging`, and the ControlPlane derives the
+child's transport URL from the shared bus, so a network service declared without
+one would project a child its own admission rejects on every pass; the webhook
+reports the omission on `spec.infrastructure.messaging`. The bus is declared and
+read in the ControlPlane's namespace on the management cluster, while Neutron may
+run in a namespace of its own or on another cluster, so the reconciler resolves
+the transport URL itself and hands the child a **brownfield** `secretRef` naming
+`{controlplane.Name}-neutron-messaging` in the Neutron's own namespace on the
+Neutron's own cluster. A managed `clusterRef` and a brownfield `secretRef` on the
+ControlPlane both arrive there as that one Secret. When the shared bus declares
+`tls`, the CA bundle is mirrored beside it as
+`{controlplane.Name}-neutron-messaging-ca` and named by the child's
+`messaging.tls.caBundleSecretRef`; a bus without `tls` leaves no mirror behind.
+
+Setting `services.neutron` makes the reconciler project a `KeystoneService`
+registration named `{controlplane.Name}-neutron` into the namespace Neutron is
+placed in: the `network` catalog entry plus the `neutron` service account, whose
+project `service-neutron` is created with the role `service`. That account is the
+Keystone user the projected child authenticates as, so the Neutron child is not
+projected until the registration reports it provisioned
+(`NeutronReady=False/WaitingForServiceRegistration` until then).
+
+Setting `services.neutron` bounds the ControlPlane's own name too. The projected
+child is `{controlplane.Name}-neutron`, and the Neutron CRD caps `metadata.name`
+at **40** characters so the neutron operator's ovn-db-sync CronJob name
+(`{name}-ovn-db-sync`) still fits the API server's 52-character CronJob bound.
+The ControlPlane name may therefore be at most **32** characters while
+`services.neutron` is set. The rule runs on create and on the update that newly
+enables Neutron.
+
+### NeutronOVNSpec
+
+Names the OVN control plane the projected Neutron programs.
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `centralRef` | [`NeutronOVNCentralRef`](#neutronovncentralref) | Yes | — | The `OVNCentral` whose Northbound and Southbound databases the ML2/OVN mechanism driver connects to. |
+
+### NeutronOVNCentralRef
+
+Names an `OVNCentral` the ControlPlane only **references**. The central is
+deployed outside the plane, the way the infrastructure clusters in
+`spec.infrastructure` are: the ControlPlane never projects it, never updates it,
+and never deletes it. The plane reads the databases the central publishes and
+mirrors its readiness into the [`OVNReady`](#ovnready) condition.
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `name` | `string` | Yes | — | The `OVNCentral`'s name. `MinLength` 1, mirrored by the validating webhook: a reference naming nothing leaves the child with no database to program. |
+| `namespace` | `string` | No | the ControlPlane's own namespace | The namespace the `OVNCentral` lives in. A lowercase alphanumeric RFC-1123 label of at most 63 characters (CRD pattern, mirrored by the webhook). The defaulting webhook fills an empty value with the ControlPlane's own namespace, which is also how the reconciler resolves an empty value, so a CR that bypassed admission addresses the same central as one that went through it. The webhook additionally bounds which namespace it may name — see below. |
+
+A central on a **different cluster** than the network service has to publish both
+databases with `externallyReachable: true`, because the Neutron pods then reach
+them over the node network rather than through cluster DNS. Until it does,
+`OVNReady` reports `OVNCentralNotExternallyReachable`.
+
+The namespace must be one the ControlPlane already reaches: **its own**, or one
+it claims through a `services.<service>.namespace` assignment whose `lifecycle`
+is `External`. The webhook rejects every other value, from two directions:
+
+- A **foreign** namespace, because the reference is not read-only. The
+  neutron-operator mirrors the central's client `Secret` out of that namespace
+  into the Neutron's, so naming another plane's central hands this one a full
+  mTLS identity for its Northbound and Southbound databases — its networks,
+  ports and security groups, readable and writable — and `OVNReady` relays that
+  central's database addresses and status message on the way. It is the
+  isolation [namespace claims](#servicenamespacespec) enforce for service
+  namespaces, one field over.
+- A claimed namespace with lifecycle **`Managed`**, because the teardown deletes
+  such a namespace together with the plane, and the cascade would take the
+  referenced central, and the logical network model in its databases, with it.
+
+That reach rule bounds the topology: a namespace belongs to
+[at most one ControlPlane](#servicenamespacespec) cluster-wide, so **one
+`OVNCentral` serves one ControlPlane**. A central shared by several planes has no
+shape here — a second plane can neither claim the namespace it lives in, which is
+already occupied, nor reference it without claiming it. Give each ControlPlane its
+own `OVNCentral`.
+
+The rule runs on create and on the two updates that can newly violate it, the one
+that enables the network service and the one that moves the ref — never on every
+update, for the reason the [projected child-name bounds](#validation-rules) are
+also gated: an unconditional rule can only reject a CR a previous operator build
+already admitted, and one of those rejections would land on the finalizer-removal
+update that completes a deletion, leaving the ControlPlane in `Terminating` for
+good. `reconcileOVN` re-runs the same check as its controller-side backstop, so a
+CR that never passed admission — an unregistered webhook during install, a GitOps
+or etcd restore replaying stored objects — is refused at
+[`OVNReady`](#ovnready) with `OVNCentralNamespaceForbidden` and the central is
+never read.
+
+### NeutronDedicatedBackingServicesSpec
+
+Declares the backing-service instances the Neutron service gets for itself
+instead of the ControlPlane-wide shared ones, on the same contract as
+[`KeystoneDedicatedBackingServicesSpec`](#dedicatedbackingservices). Neutron
+consumes both a database and a cache, so it can take either or both dedicated; a
+class left unset resolves to the ControlPlane-wide instance in
+`spec.infrastructure`.
+
+The block is optional, but a declared one must name at least one class. A CEL
+`XValidation` rule (`has(self.database) || has(self.cache)`) rejects an empty
+block, which would request nothing, with the message
+`dedicatedBackingServices must declare at least one backing-service class (database, cache)`.
+
+| Field | Type | Required | Default | Description |
+| --- | --- | --- | --- | --- |
+| `database` | [`*commonv1.DatabaseSpec`](../keystone/keystone-crd.md#databasespec) | No | `nil` (shares `spec.infrastructure.database`) | Gives Neutron its own database cluster. In managed mode `clusterRef.name` defaults to `{controlplane}-neutron-db`. A dedicated **managed** database is **`Static`-only**: the defaulting webhook materializes `credentialsMode: Static` and an explicit `Dynamic` is rejected, for the same reason as Keystone (see [Credential modes](#credential-modes)): the OpenBao database engine is bootstrapped once per namespace against the shared cluster, so no engine role can issue credentials for a dedicated instance. Seed and rotate the credential at the OpenBao source. |
+| `cache` | [`*commonv1.CacheSpec`](../keystone/keystone-crd.md#cachespec) | No | `nil` (shares `spec.infrastructure.cache`) | Gives Neutron its own cache. In managed mode `clusterRef.name` defaults to `{controlplane}-neutron-cache`. |
+
+---
+
 ## DedicatedBackingServices
 
 By default every service a ControlPlane manages connects to the **shared**
@@ -986,8 +1141,10 @@ Horizon has a `cache` and no `database`.
 The message bus is modeled outside this block, at
 [`spec.infrastructure.messaging`](#messagingspec): one bus per ControlPlane,
 enumerated at the ControlPlane's own namespace regardless of which services
-consume it. A **dedicated per-service bus** is the next class this recipe
-applies to, with Neutron as its first host (issue #906). It takes:
+consume it. Neutron consumes that shared bus, and the validating webhook
+requires it beside `services.neutron`; no dedicated-bus slot exists on any
+service block. A **dedicated per-service bus** is the class this recipe would
+apply to for a service that needs one. It takes:
 
 - `Messaging *commonv1.MessagingSpec` on the service's dedicated block, listed in
   that block's at-least-one-class CEL rule;
@@ -1357,7 +1514,7 @@ the kind/name and applies it.
 | `conditions` | `[]metav1.Condition` | Latest available observations of the control-plane state. Each condition carries an `observedGeneration`. See [Status Conditions](#status-conditions). |
 | `observedGeneration` | `int64` | The `.metadata.generation` the controller last reconciled, so a stale status is distinguishable from a current one. |
 | `updatePhase` | [`UpdatePhase`](#updatephase) | Current phase of a control-plane release update. Written on every status update; fixed at `Idle` in the current implementation because the release-update state machine is reserved (the other `UpdatePhase` values are not yet set). |
-| `services` | `[]ServiceStatus` | Per-service readiness of the projected service CRs. A `listType=map` list keyed by `name`, so per-service entries merge under server-side apply and can grow per-service conditions cleanly. Written on every status update with one entry per managed service in a stable order — `keystone`, then `horizon`, then `glance`, then `placement` — each present only when its `spec.services.<svc>` is set. Each entry's `ready` mirrors the matching `KeystoneReady` / `HorizonReady` / `GlanceReady` / `PlacementReady` condition and its `release` is `spec.openStackRelease`; an unmanaged service is omitted rather than reported. See [ServiceStatus](#servicestatus). |
+| `services` | `[]ServiceStatus` | Per-service readiness of the projected service CRs. A `listType=map` list keyed by `name`, so per-service entries merge under server-side apply and can grow per-service conditions cleanly. Written on every status update with one entry per managed service in a stable order — `keystone`, `horizon`, `glance`, `placement`, `barbican`, then `neutron` — each present only when its `spec.services.<svc>` is set. Each entry's `ready` mirrors the matching `KeystoneReady` / `HorizonReady` / `GlanceReady` / `PlacementReady` / `BarbicanReady` / `NeutronReady` condition and its `release` is `spec.openStackRelease`; an unmanaged service is omitted rather than reported. See [ServiceStatus](#servicestatus). |
 | `catalog` | [`*CatalogStatus`](#catalogstatus) | Observed state of the External-mode catalog imports. Nil in Managed mode, where the control plane creates the catalog entries rather than importing them. See [CatalogStatus](#catalogstatus). |
 
 > **`updatePhase` vs the Keystone CRD's `upgradePhase`.** These field names are
@@ -1583,7 +1740,7 @@ Keystone discipline:
 | `spec.services.keystone.external.caBundleSecretRef.name` | MinLength 1 (shared `SecretRefSpec` marker) |
 | `spec.services.keystone.caBundleSecretRef.name` | MinLength 1 (shared `SecretRefSpec` marker) |
 | `spec.services.keystone.databaseCredentialsMode` | Enum: `Static`, `Dynamic` |
-| `spec.services.{keystone,horizon,glance,placement,barbican}.targetClusterRef.name` | MinLength 1; Pattern `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` — a DNS-1123 subdomain, from the shared `commonv1.TargetClusterRefSpec` markers, so a name no registration Secret could carry is refused before the resolver ever sees it |
+| `spec.services.{keystone,horizon,glance,placement,barbican,neutron}.targetClusterRef.name` | MinLength 1; Pattern `^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$` — a DNS-1123 subdomain, from the shared `commonv1.TargetClusterRefSpec` markers, so a name no registration Secret could carry is refused before the resolver ever sees it |
 | `spec.korc.adminCredential.applicationCredential.accessRules[].method` | Enum: `CONNECT`, `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT`, `TRACE` |
 | `spec.korc.adminCredential.applicationCredential.accessRules[].path` | Pattern `^/` |
 | `spec.korc.adminCredential.bootstrapResources[].kind` | Enum: `Project`, `Role` |
@@ -1658,8 +1815,8 @@ short-circuit on the first error.
 | External caBundle name required | `spec.services.keystone.external.caBundleSecretRef.name` | `field.Required` | `caBundleSecretRef` set with an empty `name`. Mirrors the shared `SecretRefSpec` MinLength marker. |
 | Managed-only field forbidden in External mode | `spec.services.keystone.{replicas,image,policyOverrides,extraConfig,rotationInterval,gateway,publicEndpoint,federationProxyImage}` | `field.Forbidden` | The field is set while `mode: External`. Defense-in-depth mirror of the per-field CEL rules. |
 | Keystone credentials-mode override forbidden in External mode | `spec.services.keystone.databaseCredentialsMode` | `field.Forbidden` | The per-service override is set while `mode: External` — no managed database is provisioned, so there is no credentials mode to override. Defense-in-depth mirror of the per-field CEL rule. |
-| Dynamic credentials-mode override on a dedicated database | `spec.services.{keystone,glance}.databaseCredentialsMode` | `field.Forbidden` | The override is `Dynamic` while that service declares a dedicated database: the override retargets the shared database the service does not use, and a dedicated database is `Static`-only (set `dedicatedBackingServices.database.credentialsMode` instead). `Static` stays admitted. **Cross-field, webhook-only.** |
-| Dynamic credentials-mode override on a brownfield shared database | `spec.services.{keystone,glance}.databaseCredentialsMode` | `field.Forbidden` | The override is `Dynamic` while the shared database is brownfield (`clusterRef` unset): the dynamic engine issues per-tenant DB users only against a cluster the operator provisions. **Cross-field, webhook-only.** |
+| Dynamic credentials-mode override on a dedicated database | `spec.services.{keystone,glance,placement,barbican,neutron}.databaseCredentialsMode` | `field.Forbidden` | The override is `Dynamic` while that service declares a dedicated database: the override retargets the shared database the service does not use, and a dedicated database is `Static`-only (set `dedicatedBackingServices.database.credentialsMode` instead). `Static` stays admitted. **Cross-field, webhook-only.** |
+| Dynamic credentials-mode override on a brownfield shared database | `spec.services.{keystone,glance,placement,barbican,neutron}.databaseCredentialsMode` | `field.Forbidden` | The override is `Dynamic` while the shared database is brownfield (`clusterRef` unset): the dynamic engine issues per-tenant DB users only against a cluster the operator provisions. **Cross-field, webhook-only.** |
 | Federation proxy image resolvable | `spec.services.keystone.federationProxyImage` | `field.Required` / `field.Invalid` | Empty `repository`, or neither/both of `tag` and `digest`. Surfaces on the ControlPlane the operator edits rather than as an opaque `KeystoneProjectionRejected` condition on the child. |
 | Dashboard public endpoint is a URL | `spec.services.horizon.publicEndpoint` | `field.Invalid` | Not an absolute HTTP(S) URL with a host. Keystone matches the derived WebSSO origin verbatim, so an unusable endpoint could never match any dashboard. |
 | Dashboard public endpoint is a bare origin | `spec.services.horizon.publicEndpoint` | `field.Invalid` | Carries a path, query, or fragment (a single trailing `/` is trimmed and allowed). The `^https?://` pattern anchors only the prefix, so `https://horizon.example.com?utm=1` is schema-legal and would render the trusted origin `https://horizon.example.com?utm=1/auth/websso/` — accepted by Keystone, matched by nothing. **Webhook-only.** |
@@ -1695,10 +1852,19 @@ short-circuit on the first error.
 | Glance ignored-role bounds | `spec.services.glance.importPlugins.injectMetadata.ignoreUserRoles` | `field.TooMany` / `field.Invalid` | The list exceeds 64 items, or an item is empty, longer than 255 characters, or carries a comma, newline, or carriage return. The rendered `ignore_user_roles` is a plain comma join, so a comma would split one role into two. The item markers bound length; the content checks are **webhook-only**. |
 | Glance decompression needs a chosen staging bound | `spec.services.glance.staging.sizeLimit` | `field.Required` | `services.glance.importPlugins.decompression` is set while `services.glance.staging` leaves both `sizeLimit` and `unbounded` unset. The plugin expands the staged image by a ratio the caller picks and nothing caps the result, which makes that bound the only one in the path — and the operator default was sized against the largest download, not the largest unpacked image. Both blocks are projected onto the Glance child untouched, so the same exported validator enforces the pairing there. **Cross-field, webhook-only.** |
 | Glance forbidden in External mode | `spec.services.glance` | `field.Forbidden` | `services.glance` set while `mode: External` (Glance needs its own External-mode design). **Cross-field, webhook-only.** |
-| Target-cluster ref shape | `spec.services.{keystone,horizon,glance,placement,barbican}.targetClusterRef.name` | `field.Required` | The ref is set with an empty `name`. Defense-in-depth mirror of the `MinLength=1` marker on the shared `commonv1.TargetClusterRefSpec`, applied through `validation.TargetClusterRef` for a caller that bypasses CRD schema admission. |
-| Placed service needs a namespace of its own | `spec.services.{keystone,horizon,glance,placement,barbican}.namespace` | `field.Required` | `targetClusterRef` is set while the service declares no `namespace` block. Every namespace maps to exactly one cluster and the ControlPlane's own stays on the local one, so the service's database, tenant store, and credential material would be provisioned in a namespace living on a different cluster than the ref names. **Cross-field, webhook-only.** |
-| Placed catalog service needs a public address | `spec.services.{keystone,glance,placement,barbican}.publicEndpoint` | `field.Required` | The service is placed with neither a `publicEndpoint` nor a `gateway`. The catalog would then advertise the in-cluster Service DNS name, which resolves nowhere outside the cluster that service runs on, so every client reading the catalog from elsewhere gets an address it cannot connect to. Horizon is exempt: the dashboard is reached by a browser rather than looked up in the catalog. **Cross-field, webhook-only.** |
-| Co-located services agree on the target cluster | `spec.services.{keystone,horizon,glance,placement,barbican}.targetClusterRef` | `field.Invalid` | Two services declare the same `namespace.name` but do not name the same cluster — an unplaced service counts as naming the local one. The namespace exists on exactly one cluster, together with the backing services, the tenant store, and the credential material scoped to it. The co-location rule of the `namespace` assignment, one level out. **Cross-item, webhook-only.** |
+| Neutron needs the shared bus | `spec.infrastructure.messaging` | `field.Required` | `services.neutron` is set while `spec.infrastructure` carries no `messaging` block: "is required when services.neutron is set: the Neutron CRD requires spec.messaging, and the ControlPlane derives the child's transport URL from the shared bus". Without it the ControlPlane would project a child its own admission rejects on every pass. A nil `spec.infrastructure` is left to the mode matrix, which already requires the block outside External mode and forbids `services.neutron` inside it. **Cross-field, webhook-only.** |
+| Neutron names its OVN control plane | `spec.services.neutron.ovn.centralRef.name` | `field.Required` | The name is empty: "must be set: it names the OVNCentral the projected Neutron programs". Defense-in-depth mirror of the `MinLength=1` marker; the ML2/OVN mechanism driver writes every network, subnet, and port into that central's Northbound database. |
+| OVN central namespace shape | `spec.services.neutron.ovn.centralRef.namespace` | `field.Invalid` | A non-empty namespace is not a lowercase alphanumeric RFC-1123 label; it names a Kubernetes namespace. Defense-in-depth mirror of the `Pattern` marker. |
+| OVN central stays inside the plane | `spec.services.neutron.ovn.centralRef.namespace` | `field.Forbidden` | The namespace is neither the ControlPlane's own nor one it claims through a `services.<service>.namespace` assignment, or it is such a claim with `lifecycle: Managed`. It is the one ControlPlane field that addresses another namespace: consuming a foreign central mirrors that central's client certificate — a full mTLS identity for its Northbound and Southbound databases — into this plane, and a `Managed` claim is deleted with the plane, taking the referenced central and its databases along. Runs on create and on the two updates that can newly violate it — the one that enables the network service and the one that moves the ref — so a grandfathered CR stays updatable and deletable; `reconcileOVN` re-runs the check as the controller-side backstop. **Cross-field, webhook-only.** |
+| Neutron public endpoint is a URL | `spec.services.neutron.publicEndpoint` | `field.Invalid` | Not an absolute HTTP(S) URL with a host. The value is advertised verbatim as the public network catalog Endpoint and is projected into no child CR, so `https://` would register a hostless URL that no client can resolve and nothing downstream would catch. |
+| Neutron public endpoint is a bare origin | `spec.services.neutron.publicEndpoint` | `field.Invalid` | Carries a path, query, or fragment (a single trailing `/` is allowed). The `^https?://` pattern anchors only the prefix, so `https://neutron.example.com?utm=1` is schema-legal; the Neutron API is served at the root and clients append the API path to the catalog endpoint, yielding `https://neutron.example.com?utm=1/v2.0/networks` and a 404 on every network call. **Webhook-only.** |
+| Neutron public endpoint agrees with the gateway | `spec.services.neutron.publicEndpoint` | `field.Invalid` | With `services.neutron.gateway` set: the scheme is not `https` (the listener terminates TLS, and every network call sends the caller's scoped Keystone token to this endpoint), or its host differs from `gateway.hostname` (the listener is what routes that hostname to the Neutron API). The port may differ, since Gateway API hostnames carry none. **Cross-field, webhook-only.** |
+| Neutron image resolvable | `spec.services.neutron.image` | `field.Invalid` | The image override sets neither or both of `tag` and `digest` (mirrors the `commonv1.ImageSpec` tag/digest XOR). |
+| Projected Neutron name bound | `metadata.name` | `field.Invalid` | The projected child `{controlplane.Name}-neutron` would exceed the 40-character `metadata.name` cap the Neutron CRD enforces, so a 33-character ControlPlane name is rejected ("would be 41 characters") and a 32-character one is accepted. Runs on create and on the update that newly declares `services.neutron`: the ControlPlane name is immutable, so on a routine update the rule could only fire against a CR a pre-upgrade operator already admitted, including the finalizer-removal update that completes its deletion. **Webhook-only.** |
+| Target-cluster ref shape | `spec.services.{keystone,horizon,glance,placement,barbican,neutron}.targetClusterRef.name` | `field.Required` | The ref is set with an empty `name`. Defense-in-depth mirror of the `MinLength=1` marker on the shared `commonv1.TargetClusterRefSpec`, applied through `validation.TargetClusterRef` for a caller that bypasses CRD schema admission. |
+| Placed service needs a namespace of its own | `spec.services.{keystone,horizon,glance,placement,barbican,neutron}.namespace` | `field.Required` | `targetClusterRef` is set while the service declares no `namespace` block. Every namespace maps to exactly one cluster and the ControlPlane's own stays on the local one, so the service's database, tenant store, and credential material would be provisioned in a namespace living on a different cluster than the ref names. **Cross-field, webhook-only.** |
+| Placed catalog service needs a public address | `spec.services.{keystone,glance,placement,barbican,neutron}.publicEndpoint` | `field.Required` | The service is placed with neither a `publicEndpoint` nor a `gateway`. The catalog would then advertise the in-cluster Service DNS name, which resolves nowhere outside the cluster that service runs on, so every client reading the catalog from elsewhere gets an address it cannot connect to. Horizon is exempt: the dashboard is reached by a browser rather than looked up in the catalog. **Cross-field, webhook-only.** |
+| Co-located services agree on the target cluster | `spec.services.{keystone,horizon,glance,placement,barbican,neutron}.targetClusterRef` | `field.Invalid` | Two services declare the same `namespace.name` but do not name the same cluster — an unplaced service counts as naming the local one. The namespace exists on exactly one cluster, together with the backing services, the tenant store, and the credential material scoped to it. The co-location rule of the `namespace` assignment, one level out. **Cross-item, webhook-only.** |
 | Target-cluster ref forbidden in External mode | `spec.services.keystone.targetClusterRef` | `field.Forbidden` | The ref is set while `mode: External` — no Keystone workload is deployed, so there is nothing to place. Defense-in-depth mirror of the per-field CEL rule. |
 | Placed service needs a published Keystone | `spec.services.keystone.publicEndpoint` | `field.Required` | Another service is placed on a target cluster while Keystone advertises neither a `publicEndpoint` nor a `gateway`. That service validates its tokens against Keystone and cannot resolve Keystone's in-cluster Service DNS name from another cluster, so the operator would project an empty `spec.keystoneEndpoint` onto the placed child — which the child's own CRD refuses (`MinLength=1`, `^https?://`) on every pass. The rule above only reaches a service carrying a ref of its own, so an unplaced Keystone falls outside it. **Cross-field, webhook-only.** |
 | Keystone endpoint must use https across a cluster boundary | `spec.services.keystone.publicEndpoint` | `field.Invalid` | The endpoint's scheme is `http` while Keystone carries a `targetClusterRef` **or** another service is placed away from an unplaced Keystone. Either way that URL is the `auth_url` the operator renders the admin password and every service-account password next to, and those credentials cross a cluster boundary to reach it — K-ORC dials it from the management cluster when Keystone moves, a placed service dials it from the target when the service moves. The `^https?://` pattern admits `http://` for the all-local case, where the URL feeds only the bootstrap and the catalog. **Cross-field, webhook-only.** |
@@ -1781,11 +1947,27 @@ Two families run, with different gating:
   when no catalog resolves: a digest-pinned image, an unparseable tag, or a
   release the operator build ships no catalog for.
 
+The network service's catalog is resolved from `spec.openStackRelease` alone and
+exempts no sections: it is the flat union of the `neutron.conf`, `ml2_conf.ini`,
+and `neutron_ovn_metadata_agent.ini` generator files, so it already enumerates
+every section the child configures and the exemptions stay keys-only. Neutron's
+always-rejected owned keys are the two `[ovn]` connection strings
+(`ovn_nb_connection`, `ovn_sb_connection`), the six `[ovn]` client-certificate and
+CA paths (`ovn_nb_private_key`, `ovn_nb_certificate`, `ovn_nb_ca_cert` and their
+`ovn_sb_` twins), `[DEFAULT] transport_url`, `[DEFAULT] auth_strategy`,
+`[DEFAULT] api_paste_config`, `[database] connection`,
+`[keystone_authtoken] password`, and `[securitygroup] enable_security_group`.
+Each one either points the mechanism driver at a logical model the operator does
+not own, copies credential material into the config Secret every pod mounts, or
+takes the API off token validation and the instance ports off their OVN ACLs, and
+all of it lands the moment the pods load the rendered file.
+
 The catalogs consulted here are the ones embedded in the **c5c3-operator** build.
 A deployed service operator of a different build may embed a different catalog;
 the child service webhook remains the defense-in-depth check for that skew, and a
 skewed rejection surfaces as `KeystoneProjectionRejected` /
-`GlanceProjectionRejected` on the ControlPlane's conditions.
+`GlanceProjectionRejected` / `NeutronProjectionRejected` on the ControlPlane's
+conditions.
 
 ::: warning A newly-rejected key wedges a stored ControlPlane
 The ownership family runs on **update** as well as create, so a key that becomes
@@ -1892,7 +2074,7 @@ migration feature can relax it.
 | Messaging clusterRef.name immutable | `spec.infrastructure.messaging.clusterRef.name` | Both managed, but the name changed: "managed messaging clusterRef.name is immutable" |
 | Cloud secretName immutable | `spec.korc.adminCredential.cloudCredentialsRef.secretName` | The value changed |
 | Region immutable | `spec.region` | The region changed |
-| Service target cluster immutable | `spec.services.{keystone,horizon,glance,placement,barbican}.targetClusterRef` | The ref was added, removed, or renamed on a service the old revision already declared; the message contains `targetClusterRef is immutable`, the same string the workload CRDs' CEL transition rules pin. Re-pointing a live service leaves its workload, its database, its tenant store, and its credential material on the cluster they were created on, and nothing in the following reconcile moves or reaps them. Webhook-only, with **no** CEL transition rule, so a migration between clusters can be gated later rather than being blocked forever — the same rationale as the `namespace` freeze. A service the old revision did **not** declare may appear placed: that is the service's creation, not a move. |
+| Service target cluster immutable | `spec.services.{keystone,horizon,glance,placement,barbican,neutron}.targetClusterRef` | The ref was added, removed, or renamed on a service the old revision already declared; the message contains `targetClusterRef is immutable`, the same string the workload CRDs' CEL transition rules pin. Re-pointing a live service leaves its workload, its database, its tenant store, and its credential material on the cluster they were created on, and nothing in the following reconcile moves or reaps them. Webhook-only, with **no** CEL transition rule, so a migration between clusters can be gated later rather than being blocked forever — the same rationale as the `namespace` freeze. A service the old revision did **not** declare may appear placed: that is the service's creation, not a move. |
 | Release downgrade rejected | `spec.openStackRelease` | New release `(year, minor)` is lower than the old (upgrades and same-release updates allowed) |
 
 ---
@@ -2012,7 +2194,15 @@ markers' documented values where a marker also exists.
 | `spec.korc.adminCredential.domainName` | `== ""` | `"Default"` | Marker + webhook |
 | `spec.services.glance.dedicatedBackingServices.database.clusterRef.name` | managed dedicated database declared, `== ""` | `{controlplane}-glance-db` (and `credentialsMode` → `Static`) | Webhook-only, brownfield-guarded |
 | `spec.services.glance.dedicatedBackingServices.cache.clusterRef.name` | managed dedicated cache declared, `len(servers) == 0` | `{controlplane}-glance-cache` | Webhook-only, brownfield-guarded |
-| `spec.services.{keystone,horizon,glance}.namespace.lifecycle` | `== ""` (a `namespace` block is declared) | `Managed` | Marker + webhook |
+| `spec.services.neutron.ovn.centralRef.namespace` | `== ""` (a `neutron` block is declared) | the ControlPlane's own namespace | Webhook-only |
+| `spec.services.neutron.dedicatedBackingServices.database.clusterRef.name` | managed dedicated database declared, `== ""` | `{controlplane}-neutron-db` (and `credentialsMode` → `Static`) | Webhook-only, brownfield-guarded |
+| `spec.services.neutron.dedicatedBackingServices.cache.clusterRef.name` | managed dedicated cache declared, `len(servers) == 0` | `{controlplane}-neutron-cache` | Webhook-only, brownfield-guarded |
+| `spec.services.{keystone,horizon,glance,placement,barbican,neutron}.namespace.lifecycle` | `== ""` (a `namespace` block is declared) | `Managed` | Marker + webhook |
+
+The `centralRef.namespace` default is a convenience only.
+`NeutronOVNCentralNamespace()` reads an empty value as the ControlPlane's
+namespace too, so a CR that bypassed the webhook is reconciled against the same
+`OVNCentral` as one that went through it.
 
 <a id="secretref-default-note"></a>
 > **† `database.secretRef.name` default — managed-mode convenience name only.**
@@ -2085,18 +2275,19 @@ func (w *ControlPlaneWebhook) ValidateDelete(_ context.Context, _ *ControlPlane)
 
 ## Status Conditions
 
-The ControlPlane status is driven by fifteen sub-reconcilers, each owning one
+The ControlPlane status is driven by seventeen sub-reconcilers, each owning one
 condition type, plus an aggregate `Ready` condition. The condition-type
 constants in `controlplane_controller.go` (`subConditionTypes`) are the single
 source of truth; call sites reference the constants rather than inline literals.
 
 The sub-reconcilers run in dependency order; a stage that has not converged
 requeues and stops the chain, so later conditions are never computed against a
-half-built earlier stage. Seven stages additionally gate **explicitly** on an
+half-built earlier stage. Eight stages additionally gate **explicitly** on an
 earlier condition being `True` (`reconcileKeystone` on `InfrastructureReady`,
 `reconcileHorizon` on `KeystoneReady`, `reconcileGlance`, `reconcilePlacement`
 and `reconcileBarbican` on `KeystoneReady` and on the `AccountReady` of the
 `KeystoneService` registration each of them projects for itself,
+`reconcileNeutron` on `KeystoneReady` and `OVNReady` plus its own registration,
 `reconcileAdminCredential` on `KORCReady`, `reconcileCatalog` on
 `AdminCredentialReady`):
 
@@ -2104,7 +2295,8 @@ and `reconcileBarbican` on `KeystoneReady` and on the `AccountReady` of the
 NamespacesReady → InfrastructureReady → ESOTenantStoreReady → DBCredentialsReady
   → AdminPasswordReady → KeystoneReady → HorizonReady → KORCReady
   → AdminCredentialReady → CatalogReady → GlanceReady → PlacementReady
-  → BarbicanReady → ServiceAccountsReady → RegistrationTenantStoresReady
+  → BarbicanReady → OVNReady → NeutronReady → ServiceAccountsReady
+  → RegistrationTenantStoresReady
 ```
 
 `ESOTenantStoreReady` runs ahead of every store-consuming stage because it
@@ -2117,10 +2309,10 @@ in External mode.
 
 `ServiceAccountsReady` and `RegistrationTenantStoresReady` run **last** and carry
 no gate of their own. The first only reads the `KeystoneService` registrations
-the Glance, Placement and Barbican legs wrote earlier in the same pass, so there
-is no projection it could defer. The second writes into namespaces the control
-plane does not own, which is why it sits at the end of the chain rather than
-beside `ESOTenantStoreReady`: a namespace someone else administers must never
+the Glance, Placement, Barbican and Neutron legs wrote earlier in the same pass,
+so there is no projection it could defer. The second writes into namespaces the
+control plane does not own, which is why it sits at the end of the chain rather
+than beside `ESOTenantStoreReady`: a namespace someone else administers must never
 park this control plane's own credential material behind it.
 
 `Ready` is `True` (reason `AllReady`) **only** when all sub-conditions are
@@ -2256,6 +2448,63 @@ Keystone.
 | `False` | `WaitingForGlance` | The Glance CR is ensured but not yet Ready. |
 | `False` | `GlanceProjectionRejected` | The Glance API server rejected the projected Glance spec (HTTP 422) — the projection violates a CRD/webhook rule. Reconcile the ControlPlane spec to a valid projection to recover. |
 | `False` | `GlanceError` | Error create-or-updating the Glance CR. |
+
+### OVNReady
+
+Set by `reconcileOVN`. It carries no gate and writes nothing. The `OVNCentral`
+named by `spec.services.neutron.ovn.centralRef` is deployed outside the plane,
+the way the infrastructure clusters in `spec.infrastructure` are, so this pass
+only reads it and records whether the two databases the ML2/OVN mechanism driver
+needs are usable. The read goes through the local client whatever cluster the
+network service is placed on: the `OVNCentral` CR lives on the management
+cluster, where the ovn-operator reconciles it. Every not-yet arm requeues after
+15s instead of erroring, because nothing this ControlPlane does can converge a
+central it does not own.
+
+| Status | Reason | When |
+| --- | --- | --- |
+| `True` | `OVNCentralReady` | The central reports `Ready` and publishes both database addresses and its client Secret. The message carries the Northbound and Southbound addresses that were selected. |
+| `True` | `OVNNotManaged` | `spec.services.neutron` is unset: no OVN control plane is consumed, so the aggregate `Ready` is not blocked. |
+| `False` | `OVNCentralNamespaceForbidden` | The resolved `centralRef` namespace is outside the plane's reach — the same rule the validating webhook enforces, re-run here because a CR can reach etcd without passing through admission. The central is **not** read, so none of its addresses or status reaches this plane. The message is the webhook's own, naming the field and the direction of the refusal. Requeue 15s. |
+| `False` | `OVNCentralNotFound` | No `OVNCentral` of that name exists in the resolved namespace. The message carries the full `<namespace>/<name>` the ref resolved to. Requeue 15s. |
+| `False` | `OVNCentralReadError` | The `OVNCentral` CRD is not served on this cluster, in which case the message says to install the ovn-operator and the pass requeues after 15s; any other read failure is returned as an error. |
+| `False` | `OVNCentralNotExternallyReachable` | The network service runs on another cluster than the central, and the central does not set both `spec.northbound.externallyReachable` and `spec.southbound.externallyReachable`. The Neutron pods would reach the databases over the node network, which the in-cluster addresses do not serve. Requeue 15s. |
+| `False` | `WaitingForOVNCentral` | The central has not reported `Ready` yet, or reports it not `True`. The central's own reason and message are relayed verbatim, since "not ready" alone names nothing to act on. Requeue 15s. |
+| `False` | `OVNEndpointsPending` | The central reports `Ready` but has not published one of the two database addresses or `status.clientSecretName` yet; the ovn-operator fills them in as its children converge. The message names the missing fields. Requeue 15s. |
+
+### NeutronReady
+
+Set by `reconcileNeutron`. It is gated on `KeystoneReady` (Neutron validates
+every token against the Keystone child), on `OVNReady`, and on the projected
+`KeystoneService` registration having provisioned the `neutron` service account.
+Once gated through, the pass delivers the shared message bus into the namespace
+the network service runs in and ensures the DB credential before it projects the
+child, so the Secrets the child references exist by the time the neutron operator
+resolves them. Neutron is **forbidden in External mode**, so it is only ever
+managed against a Managed-mode Keystone.
+
+| Status | Reason | When |
+| --- | --- | --- |
+| `True` | `NeutronReady` | The projected Neutron CR reports Ready and its registration reports Ready. |
+| `True` | `NeutronNotManaged` | `spec.services.neutron` is unset: no network service is managed, so the aggregate `Ready` is not blocked. Any previously-projected Neutron child (with its DB-credential ExternalSecret, the two messaging Secrets, and the registration) is **preserved** unless the `c5c3.io/allow-neutron-deletion: "true"` annotation opts in to its deletion. The dynamic DB-credential generator, its ServiceAccount, and its client Certificate are torn down **either way**. The referenced `OVNCentral` is never touched. |
+| `False` | `WaitingForKeystone` | `KeystoneReady` is not `True`; Neutron projection deferred. Requeue 5s. |
+| `False` | `WaitingForOVN` | `OVNReady` is not `True`; Neutron projection deferred. A Neutron pointed at a central whose databases do not serve cannot program a single network. Requeue 5s. |
+| `False` | `WaitingForMessagingCredentials` | The shared bus has not delivered its transport URL yet: the `RabbitmqCluster`, its default-user Secret, or the brownfield Secret is missing. Nothing is written, so the child never sees a partial URL. Requeue 15s. |
+| `False` | `WaitingForMessagingCABundle` | `spec.infrastructure.messaging.tls` names a CA bundle Secret that does not exist, or one that carries no data under the referenced key. Requeue 15s. |
+| `False` | `NeutronMessagingError` | Error resolving the shared transport URL, writing either messaging Secret into the Neutron namespace, or removing the stale CA mirror after the `tls` block was dropped. |
+| `False` | `TargetClusterUnavailable` | The cluster the Neutron namespace lives on did not resolve, so the messaging Secrets cannot be written there. The resolver's own message is relayed. Requeue 15s. |
+| `False` | `WaitingForServiceRegistration` | The projected `KeystoneService` registration has not provisioned the `neutron` account yet; projection deferred until its Keystone user and password exist. The message relays the registration's own failing sub-condition, so a collision on the `neutron` user or its catalog row reads here verbatim. |
+| `False` | `ServiceRegistrationError` | Kubernetes-level error writing or reading the `KeystoneService` registration child; a refused adoption of a same-named foreign CR is among them. |
+| `False` | `ServiceRegistrationFieldsReclaimed` | The pass reset a spec field another field manager had written on the registration child (an `adopt` consent, a `rotation` block, or an extra catalog endpoint). The condition names the same fields as the `Warning` event and stands until a pass reads an untampered child. |
+| `False` | `NeutronDBCredentialError` | Error ensuring or reading the Neutron DB-credential objects (managed database only). |
+| `False` | `WaitingForNeutronDBCredential` | `credentialsMode: Dynamic` is in effect but no engine-issued credential has materialised yet: either the generator-backed DB-credential ExternalSecret has not synced, or (on a Static→Dynamic migration, where the ExternalSecret is updated in place and keeps reporting the previous Static sync's `Ready`) the Secret it targets still carries the retired static username. No Neutron CR is projected, and an existing child keeps its current mode, until one does. The message names the `database/mariadb/creds/neutron-<namespace>` path, which only exists once `setup-database-tenant.sh` has onboarded the tenant, or the stale username it found. |
+| `False` | `WaitingForNeutron` | The Neutron CR is ensured but not yet Ready. Requeue 15s. |
+| `False` | `NeutronProjectionRejected` | The Neutron API server rejected the projected Neutron spec (HTTP 422): the projection violates a CRD/webhook rule. Reconcile the ControlPlane spec to a valid projection to recover. |
+| `False` | `NeutronError` | Error create-or-updating the Neutron CR. |
+
+A registration that is provisioned but not yet fully `Ready` relays its own
+first failing sub-condition's reason onto `NeutronReady`, so a catalog-level
+collision surfaces here under the registration's own vocabulary.
 
 ### KORCReady
 
@@ -2404,7 +2653,7 @@ Set by `setReadyCondition`.
 
 | Status | Reason | When |
 | --- | --- | --- |
-| `True` | `AllReady` | All fifteen sub-conditions are `True`. |
+| `True` | `AllReady` | All seventeen sub-conditions are `True`. |
 | `False` | `NotAllReady` | One or more sub-conditions are not `True`. |
 
 ---

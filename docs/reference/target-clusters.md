@@ -21,10 +21,11 @@ so an existing CR keeps its behavior without an edit.
 
 The [ControlPlane](./c5c3/controlplane-crd.md) carries the ref per service
 instead of once per CR: `services.keystone`, `services.horizon`,
-`services.glance`, `services.placement`, and `services.barbican` each take one,
-so one control plane can run its identity service on one cluster and its
-dashboard on another. Everything on this page applies to it, and what is specific
-to it is collected under [ControlPlane placement](#controlplane-placement).
+`services.glance`, `services.placement`, `services.barbican`, and
+`services.neutron` each take one, so one control plane can run its identity
+service on one cluster and its dashboard on another. Everything on this page
+applies to it, and what is specific to it is collected under
+[ControlPlane placement](#controlplane-placement).
 
 ## The field
 
@@ -180,9 +181,9 @@ it, surfaces on the CR's first gate condition:
 
 | CR | Condition | Status | Reason | Message |
 | --- | --- | --- | --- | --- |
-| Keystone, Barbican, Horizon, Glance, Placement | `SecretsReady` | `False` | `TargetClusterUnavailable` | The resolver's error, `cluster not found` for a name that was never registered |
+| Keystone, Barbican, Horizon, Glance, Placement, Neutron | `SecretsReady` | `False` | `TargetClusterUnavailable` | The resolver's error, `cluster not found` for a name that was never registered |
 | BarbicanSecretStore, GlanceBackend | `CredentialsReady` | `False` | `TargetClusterUnavailable` | Same |
-| ControlPlane | `NamespacesReady` usually, since it runs first; otherwise whichever sub-reconciler reaches the cluster first, out of `InfrastructureReady`, `ESOTenantStoreReady`, `DBCredentialsReady`, `AdminPasswordReady`, `GlanceReady`, `PlacementReady`, `BarbicanReady`, `ServiceAccountsReady`, and `KORCReady` | `False` | `TargetClusterUnavailable` | Same |
+| ControlPlane | `NamespacesReady` usually, since it runs first; otherwise whichever sub-reconciler reaches the cluster first, out of `InfrastructureReady`, `ESOTenantStoreReady`, `DBCredentialsReady`, `AdminPasswordReady`, `GlanceReady`, `PlacementReady`, `BarbicanReady`, `NeutronReady`, `ServiceAccountsReady`, and `KORCReady` | `False` | `TargetClusterUnavailable` | Same |
 
 The pass ends there. The CR requeues after 15 seconds, on a flat poll rather than
 a backoff, and nothing is created on any cluster. Resolution runs before any
@@ -594,7 +595,7 @@ spec:
 Five rules apply at admission on top of the name-only shape. A placed service
 needs a `namespace` block of its own, because a namespace exists on exactly one
 cluster and the ControlPlane's own namespace stays where the ControlPlane is. A
-placed catalog service (keystone, glance, placement, barbican) needs a
+placed catalog service (keystone, glance, placement, barbican, neutron) needs a
 `publicEndpoint` or a `gateway`, since its catalog entry would otherwise
 advertise an in-cluster Service DNS name that resolves nowhere else; the
 dashboard is exempt, being reached by a browser rather than looked up in the
@@ -775,8 +776,14 @@ The operators that act on the kinds a placed service takes with it have to run o
 that service's cluster: mariadb-operator, memcached-operator, external-secrets,
 cert-manager, and, for a dedicated Barbican secret store, openbao-operator. The
 service operators are not among them. The `Keystone`, `Horizon`, `Glance`,
-`Placement`, and `Barbican` CRs stay on the management cluster, and their
-operators project onto the target from there.
+`Placement`, `Barbican`, and `Neutron` CRs stay on the management cluster, and
+their operators project onto the target from there. The `OVNCentral` a placed
+network service references is placed the same way: the ovn-operator reconciles it
+on the management cluster and projects its children onto the target its own
+`targetClusterRef` names. When the central and the network service land on
+different clusters, the central has to publish both databases with
+`externallyReachable: true`, because the Neutron pods then reach them over the
+node network rather than through cluster DNS.
 
 The Secrets a placed service reads but does not create have to exist in its
 namespace on its own cluster: the dashboard's `SECRET_KEY` Secret, every Glance

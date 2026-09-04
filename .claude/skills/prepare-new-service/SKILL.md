@@ -45,7 +45,7 @@ Every service in CobaltCore threads through five layers. Keystone
 | 1. Container image | `images/<svc>/Dockerfile`, `releases/*/source-refs.yaml`, `releases/*/extra-packages.yaml`, `tests/container-images/verify_<svc>.sh` | build/test matrix: **yes** (from source-refs keys); hadolint matrix in `build-images.yaml`: **no** |
 | 2. Service operator | `operators/<svc>/` (api, controller — including the recurring-maintenance CronJobs of § Recurring maintenance jobs and the target-cluster placement artefacts of § Placement on target clusters —, webhook, helm chart on `operators/shared/helm/operator-library`), `go.work`, `Makefile` `OPERATORS` | **no** — module + enumerations by hand |
 | 3. CI / e2e / deploy | `ci.yaml` paths-filter + `ALL_OPERATORS` + matrices, `tests/ci/verify_<svc>_ci_pipeline.sh`, `tests/e2e/<svc>/`, `tests/e2e/<svc>-operator/`, `tests/e2e-chaos/<svc>-*/`, `tests/tempest/<svc>-*/`, `deploy/flux-system/releases/<svc>-operator.yaml`, kind devstack wiring (`deploy/kind/base/openstack-gateway.yaml` listener + `deploy/kind/infrastructure/<svc>-nip-io-tls-certificate.yaml`, the `deploy/kind/base/kustomization.yaml` HelmRelease suspend patch **plus its counterparts in `hack/deploy-infra.sh`**: the flux-path un-suspend patch, the `enable_operator_servicemonitor` call, and the `hack/refresh-operator-image-digests.sh` target tuple — a service missing from the un-suspend list stays suspended on the quick-start path, its CRDs never install, and the c5c3-operator's controlplane cache never syncs), OpenBao bootstrap legs (`deploy/openbao/bootstrap/`, `deploy/openbao/policies/`) | chainsaw suites: **yes** (auto-discovered); ci.yaml wiring: **no** (3-step procedure in `hack/ci-resolve-changes.sh` header); devstack/OpenBao wiring: **no** |
-| 4. ControlPlane (c5c3) | `ServicesSpec` in `operators/c5c3/api/v1alpha1/controlplane_types.go` (incl. `publicEndpoint`, `databaseCredentialsMode`, and `targetClusterRef` per-service fields), `reconcile_<svc>.go` (+ `reconcile_<svc>_dbcredentials.go` for DB services), the projected `KeystoneService` registration (a `desired<Svc>Registration` builder in `builtin_registrations.go`, the `reconcileBuiltinRegistration` and `foldBuiltinRegistrationReady` calls in `reconcile_<svc>.go`, the `projectedBuiltinRegistrations` entry in `reconcile_serviceaccounts.go`, the `<svc>CatalogURL` helper in `reconcile_catalog.go`, the `catalog: true` row in `declaredServiceTargetClusters` in `controlplane_webhook.go`, and the registration delete in `deleteOrphaned<Svc>`), teardown in `reconcile_delete.go` + the placed-namespace sweep, condition/instrumentation maps, RBAC markers (the chart's `_rbac-rules.tpl` is generated from them by `make sync-helm-rbac`), scheme, webhook (incl. the per-service placement rules — `tests/e2e/c5c3/invalid-cr/` pins them), envtest full chain (`integration_test.go`) + `tests/e2e/c5c3/full-controlplane-keystone/` | **no** — ~10 enumeration points |
+| 4. ControlPlane (c5c3) | `ServicesSpec` in `operators/c5c3/api/v1alpha1/controlplane_types.go` (incl. `publicEndpoint`, `databaseCredentialsMode`, and `targetClusterRef` per-service fields), `reconcile_<svc>.go` (+ `reconcile_<svc>_dbcredentials.go` for DB services, + `reconcile_<svc>_messaging.go` for a bus consumer), the projected `KeystoneService` registration (a `desired<Svc>Registration` builder in `builtin_registrations.go`, the `reconcileBuiltinRegistration` and `foldBuiltinRegistrationReady` calls in `reconcile_<svc>.go`, the `projectedBuiltinRegistrations` entry in `reconcile_serviceaccounts.go`, the `<svc>CatalogURL` helper in `reconcile_catalog.go`, the `catalog: true` row in `declaredServiceTargetClusters` in `controlplane_webhook.go`, and the registration delete in `deleteOrphaned<Svc>`), teardown in `reconcile_delete.go` + the placed-namespace sweep, condition/instrumentation maps, RBAC markers (the chart's `_rbac-rules.tpl` is generated from them by `make sync-helm-rbac`), scheme, webhook (incl. the per-service placement rules — `tests/e2e/c5c3/invalid-cr/` pins them), envtest full chain (`integration_test.go`) + `tests/e2e/c5c3/full-controlplane-keystone/` | **no** — ~10 enumeration points |
 | 5. Documentation | `docs/reference/<svc>/` (hand-written, `quadrant: operator` frontmatter), VitePress sidebar, per-service guides under `docs/guides/<svc>/`, quick-start extension (`docs/quick-start-controlplane.md`), `tests/unit/docs/` conventions | **no** — no doc generator exists |
 
 ## Procedure
@@ -96,15 +96,22 @@ applies and which decisions need a Phase-0 spike:
   `<instance>-transport-url` Secret, `TransportURLEnvVar` is the
   `OS_DEFAULT__TRANSPORT_URL` override that sources it, `RabbitSection`
   renders the `[oslo_messaging_rabbit]` posture, and `EgressPort` gives the
-  NetworkPolicy port. Neutron is its first consumer (issue #904). The helper
-  reads and writes in the consumer's own namespace through the consumer's own
-  client, so a consumer on another cluster or in another namespace than the
-  bus is handed a brownfield `secretRef` by whoever projects it. A new service
-  still has to answer whether it shares that bus or wants a **dedicated** one,
-  which is a per-service slot nobody has built yet. The recipe for it is
+  NetworkPolicy port. Neutron is its first consumer. The helper reads and
+  writes in the consumer's own namespace through the consumer's own client, so
+  a consumer on another cluster or in another namespace than the bus is handed
+  a brownfield `secretRef` by whoever projects it. On the ControlPlane side that
+  projector is `reconcileNeutronMessaging` (`reconcile_neutron_messaging.go`):
+  it resolves `spec.infrastructure.messaging`
+  read-only through `messaging.ResolveTransportURL`, writes
+  `{cp}-neutron-messaging` (and `{cp}-neutron-messaging-ca` when the bus declares
+  `tls`) into the Neutron's own namespace on the Neutron's own cluster, and hands
+  the child a brownfield `secretRef` naming it. The validating webhook requires
+  `spec.infrastructure.messaging` beside `services.neutron`, because the Neutron
+  CRD requires `spec.messaging`. A new service still has to answer whether it
+  shares that bus or wants a **dedicated** one: no dedicated-bus slot exists on
+  any service block. The recipe for building one is
   `### Adding a backing-service class` in
-  `docs/reference/c5c3/controlplane-crd.md`; Neutron is its first host
-  (issue #906).
+  `docs/reference/c5c3/controlplane-crd.md`.
 - **Extra backing store?** (object store, message queue, cache beyond
   memcached) — a new backing service is its own pre-work issue (#653:
   Garage S3 for glance is the template — operator + declarative

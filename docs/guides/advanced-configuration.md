@@ -122,10 +122,11 @@ cache) is set — never both — for both `database` and `cache`.
 The `ControlPlane` exposes the same free-form configuration escape hatch the
 service CRs carry, at two levels. `spec.globalExtraConfig` applies to every
 INI-configured service the control plane declares (Keystone, Glance, Placement,
-and Barbican today). `spec.services.<svc>.extraConfig` sets one service's own
-block. Both take the INI `map[section][key] = value` shape the child renders into
-its service config (`keystone.conf`, `glance-api.conf`, `placement.conf`,
-`barbican.conf`). The dashboard is the exception:
+Barbican, and Neutron today). `spec.services.<svc>.extraConfig` sets one
+service's own block. Both take the INI `map[section][key] = value` shape the
+child renders into its service config (`keystone.conf`, `glance-api.conf`,
+`placement.conf`, `barbican.conf`, and Neutron's `neutron.conf` plus
+`ml2_conf.ini`, which share one block). The dashboard is the exception:
 `spec.services.horizon.extraConfig` is a flat map of Django settings, covered in
 [Horizon settings are flat, not INI](#horizon-settings-are-flat-not-ini).
 
@@ -138,7 +139,7 @@ metadata:
 spec:
   openStackRelease: "2025.2"
   # Applied to every INI service the control plane declares (Keystone, Glance,
-  # Placement, Barbican):
+  # Placement, Barbican, Neutron):
   globalExtraConfig:
     database:
       pool_timeout: "30"
@@ -170,9 +171,10 @@ render `30`, inherited from the global block.
 The option catalog that guards a service CR's own `spec.extraConfig` guards the
 merged result here too, so a global key must be valid against **every** declared
 INI service's catalog. Because `spec.globalExtraConfig` reaches Glance,
-Placement, and Barbican as well, a Keystone-only option placed there is rejected
-while `services.glance`, `services.placement`, or `services.barbican` is
-declared; the fix is to move that key to `spec.services.keystone.extraConfig`.
+Placement, Barbican, and Neutron as well, a Keystone-only option placed there is
+rejected while `services.glance`, `services.placement`, `services.barbican`, or
+`services.neutron` is declared; the fix is to move that key to
+`spec.services.keystone.extraConfig`.
 
 ### Horizon settings are flat, not INI
 

@@ -134,6 +134,7 @@ kinds (`ClusterSecretStore` and `SecretStore`):
 | `Placement` | `Owns()` | Re-reconciles when the projected Placement child status changes |
 | `Barbican` | `Owns()` | Re-reconciles when the projected Barbican key-manager child status changes |
 | `BarbicanSecretStore` | `Owns()` | Re-reconciles when the projected BarbicanSecretStore status changes |
+| `Neutron` | `Owns()` + cross-namespace `Watches()` | Re-reconciles when the projected Neutron network-service child status changes. The neutron-operator is installed only for a ControlPlane that runs the network service, so both legs sit behind the discovery probe with the other sibling-operator kinds |
 | `OpenBaoCluster`, `OpenBaoTenant` | `Owns()` | Re-reconciles when the OpenBao instance provisioned for a dedicated Barbican secret store, or the tenant admitting its namespace, changes. The openbao-operator is installed only for that mode, so a ControlPlane without one runs on a cluster that never serves these kinds; both legs sit behind the discovery probe with the other sibling-operator kinds (`probeOptionalWatches`, which skips the leg and registers a leader-gated re-check that restarts the operator once the CRD appears) |
 | `RabbitmqCluster` (unstructured `rabbitmqClusterGVK`) | `Owns()` + cross-namespace `Watches()` | Re-reconciles when the managed message-bus child status changes, so `InfrastructureReady` follows `AllReplicasReady` instead of waiting for the periodic requeue. Watched as `*unstructured.Unstructured`, since the c5c3 operator takes no dependency on the RabbitMQ Cluster Operator's Go module. Messaging is opt-in, so both legs sit behind the discovery probe with the openbao kinds: a cluster that does not serve `rabbitmqclusters.rabbitmq.com` starts without them, and `crdWatchGate` restarts the operator once the CRD appears |
 | `OVNCentral` | `Watches()` | Per-CR fan-out via `ovnCentralToControlPlaneMapper`. The central is deployed outside the plane and only named by `spec.services.neutron.ovn.centralRef`, so it carries no owner reference an `Owns()` could match; the leg re-runs `reconcileOVN` when the central's status moves instead of waiting for the periodic requeue. The ovn-operator is installed only for a plane that runs a network service, so the leg sits behind the discovery probe with the other sibling-operator kinds |
@@ -150,7 +151,7 @@ kinds (`ClusterSecretStore` and `SecretStore`):
 | `Secret` | `Watches()` | Maps Secret events to referencing ControlPlane CRs via the `ControlPlaneSecretNameIndexKey` field indexer (`secretToControlPlaneMapper`) |
 | `ClusterSecretStore` | `Watches()` | Per-ref fan-out via `storeToControlPlaneMapper` (bound to the shared `watch.StoreRefFanOut` for the cluster kind): a status change on a cluster-scoped store enqueues only the ControlPlanes whose effective `spec.secretStoreRef` resolves to it |
 | `SecretStore` | `Watches()` | The namespaced twin, scoped to the store's own namespace, so a ControlPlane pinned to a per-tenant `SecretStore` reacts to its backend health (`storeToControlPlaneMapper` for the namespaced kind) |
-| projected service children + `Namespace` (cross-namespace) | `Watches()` | Label-predicate twin of the `Owns()` rows for a service placed in a namespace of its own: a cross-namespace child carries no owner reference (Kubernetes forbids one), so `Keystone` / `Horizon` / `Glance` / `GlanceBackend` / `Placement` / `Barbican` / `BarbicanSecretStore` / `OpenBaoCluster` / `OpenBaoTenant` / `RabbitmqCluster` / `MariaDB` / `Memcached` / `ExternalSecret` / `KeystoneService` — and the `Namespace` itself — are watched a second time through the ownership labels the projections stamp (`crossNamespaceChildHandler` gated by `crossNamespaceChildPredicate`), so same-namespace children keep flowing through `Owns()` alone and neither leg double-enqueues the other's objects |
+| projected service children + `Namespace` (cross-namespace) | `Watches()` | Label-predicate twin of the `Owns()` rows for a service placed in a namespace of its own: a cross-namespace child carries no owner reference (Kubernetes forbids one), so `Keystone` / `Horizon` / `Glance` / `GlanceBackend` / `Placement` / `Barbican` / `BarbicanSecretStore` / `Neutron` / `OpenBaoCluster` / `OpenBaoTenant` / `RabbitmqCluster` / `MariaDB` / `Memcached` / `ExternalSecret` / `KeystoneService` — and the `Namespace` itself — are watched a second time through the ownership labels the projections stamp (`crossNamespaceChildHandler` gated by `crossNamespaceChildPredicate`), so same-namespace children keep flowing through `Owns()` alone and neither leg double-enqueues the other's objects |
 
 The `Secret` watch uses `Watches()` with a `MapFunc` rather than `Owns()`
 because the admin-password Secret
@@ -438,7 +439,14 @@ grants. The markers therefore add `core/namespaces` with
 │  ║           │                                                                    ║ │
 │  ║           ▼                                                                    ║ │
 │  ║  ┌──────────────────────────┐                                                  ║ │
-│  ║  │ reconcileServiceAccounts │  Fold the three registration children's          ║ │
+│  ║  │ reconcileNeutron         │  Deliver the shared bus, then project the        ║ │
+│  ║  │ (gate: KS + OVN + its    │  Neutron network-service child CR                ║ │
+│  ║  │  registration)           │  Sets: NeutronReady (not-managed when unset)     ║ │
+│  ║  └────────┬─────────────────┘  Requeue: 5s gated / 15s child or bus / 10s reg. ║ │
+│  ║           │                                                                    ║ │
+│  ║           ▼                                                                    ║ │
+│  ║  ┌──────────────────────────┐                                                  ║ │
+│  ║  │ reconcileServiceAccounts │  Fold the four registration children's           ║ │
 │  ║  │  (gate: none)            │  readiness. Sets: ServiceAccountsReady           ║ │
 │  ║  └────────┬─────────────────┘  Requeue: 10s while one is not Ready             ║ │
 │  ║           │                                                                    ║ │
@@ -479,24 +487,27 @@ in `instrumenter.Instrument` (see
 error counter are emitted under a stable `sub_reconciler` label.
 
 **Phase 2 — the tail group.** Horizon, KORC, AdminCredential, Catalog, Glance,
-Placement, Barbican, ServiceAccounts and RegistrationTenantStores are the nine
-named members of one `commonreconcile.RunSequentialGroup`, embedded as the
-pipeline's final **bare (unnamed)** `Step`. The group members self-instrument
-through `instrumenter.Instrument` — following the keystone
+Placement, Barbican, OVN, Neutron, ServiceAccounts and RegistrationTenantStores
+are the eleven named members of one `commonreconcile.RunSequentialGroup`,
+embedded as the pipeline's final **bare (unnamed)** `Step`. The group members
+self-instrument through `instrumenter.Instrument` — following the keystone
 self-instrumenting-group convention — which is why the enclosing group step
 carries no `sub_reconciler` name of its own. `RunSequentialGroup` attempts
 **every** member on **every** pass and never short-circuits: each member
 self-gates on the conditions it needs (Horizon on `KeystoneReady`; KORC until the
 admin-password Secret is readable; AdminCredential on `KORCReady`; Catalog on
-`AdminCredentialReady`; Glance, Placement and Barbican on `KeystoneReady` and on
-the `AccountReady` of the `KeystoneService` registration each projects for itself,
-see [Built-in service registrations](#built-in-service-registrations)), so running
-all of them each pass is safe. Barbican carries one gate the others do not: on a
-dedicated secret store it holds the projection until the OpenBao instance it
-provisions serves requests.
+`AdminCredentialReady`; Glance, Placement, Barbican and Neutron on `KeystoneReady`
+and on the `AccountReady` of the `KeystoneService` registration each projects for
+itself, see [Built-in service registrations](#built-in-service-registrations)), so
+running all of them each pass is safe. Barbican carries one gate the others do
+not: on a dedicated secret store it holds the projection until the OpenBao
+instance it provisions serves requests. Neutron carries two: `OVNReady`, and the
+shared message bus having been delivered into its namespace. OVN itself carries
+none, because the `OVNCentral` it mirrors is deployed outside the plane and
+nothing this chain produces can converge it.
 
 The last two members carry **no** gate, and their order in the group is what
-makes that safe. ServiceAccounts only folds the registration children the three
+makes that safe. ServiceAccounts only folds the registration children the four
 service legs wrote earlier in the same pass, so it must run after them and has
 nothing to defer. RegistrationTenantStores consumes no condition this chain
 produces — the trio it writes depends on cert-manager and OpenBao alone, exactly
@@ -519,7 +530,8 @@ pipeline := []commonreconcile.Step{
             []commonreconcile.Step{
                 {Name: "Horizon", Fn: /* ... */},
                 // KORC, AdminCredential, Catalog, Glance, Placement,
-                // Barbican, ServiceAccounts, RegistrationTenantStores
+                // Barbican, OVN, Neutron, ServiceAccounts,
+                // RegistrationTenantStores
             })
     }},
 }
@@ -536,8 +548,9 @@ This guarantees:
 2. **Group (phase 2) — every member runs each pass.** No member's non-zero
    result or error prevents a later member from running, so a still-converging
    or failing Horizon no longer parks KORC, the AdminCredential/Catalog
-   identity bootstrap, Glance, Placement, Barbican, or the two ungated members
-   that close the group. Each member's condition therefore always persists.
+   identity bootstrap, Glance, Placement, Barbican, OVN, Neutron, or the two
+   ungated members that close the group. Each member's condition therefore
+   always persists.
 3. **Group result aggregation.** When no member errors, the group result is the
    **shortest** member requeue (`commonreconcile.ShortestRequeue`) and the error
    is nil. When one or more members error, the group returns `ctrl.Result{}`
@@ -598,7 +611,7 @@ The aggregated sub-condition types (the source-of-truth `subConditionTypes`
 slice in `controlplane_controller.go`) are:
 
 ```text
-NamespacesReady, InfrastructureReady, ESOTenantStoreReady, DBCredentialsReady, KeystoneReady, HorizonReady, GlanceReady, PlacementReady, BarbicanReady, OVNReady, KORCReady, AdminCredentialReady, AdminPasswordReady, CatalogReady, ServiceAccountsReady, RegistrationTenantStoresReady
+NamespacesReady, InfrastructureReady, ESOTenantStoreReady, DBCredentialsReady, KeystoneReady, HorizonReady, GlanceReady, PlacementReady, BarbicanReady, OVNReady, NeutronReady, KORCReady, AdminCredentialReady, AdminPasswordReady, CatalogReady, ServiceAccountsReady, RegistrationTenantStoresReady
 ```
 
 The `Ready` condition carries `ObservedGeneration = cp.Generation` so clients can
@@ -617,7 +630,7 @@ fields that the schema declared but the reconciler previously never wrote:
 | Field | Value |
 | --- | --- |
 | `status.updatePhase` | Fixed at `Idle` — the release-update state machine is not implemented and the other `UpdatePhase` values are reserved, so "no update in progress" is the current state |
-| `status.services` | one entry per managed service, in a stable order: `keystone` (present when `spec.services.keystone` is set), then `horizon` (present when `spec.services.horizon` is set), then `glance` (present when `spec.services.glance` is set), then `placement` (present when `spec.services.placement` is set), then `barbican` (present when `spec.services.barbican` is set). Each entry's `ready` mirrors the matching `KeystoneReady` / `HorizonReady` / `GlanceReady` / `PlacementReady` / `BarbicanReady` sub-condition (via `conditions.AllTrue`) and `release` is `spec.openStackRelease`; an unmanaged service is omitted rather than reported |
+| `status.services` | one entry per managed service, in a stable order: `keystone` (present when `spec.services.keystone` is set), then `horizon` (present when `spec.services.horizon` is set), then `glance` (present when `spec.services.glance` is set), then `placement` (present when `spec.services.placement` is set), then `barbican` (present when `spec.services.barbican` is set), then `neutron` (present when `spec.services.neutron` is set). Each entry's `ready` mirrors the matching `KeystoneReady` / `HorizonReady` / `GlanceReady` / `PlacementReady` / `BarbicanReady` / `NeutronReady` sub-condition (via `conditions.AllTrue`) and `release` is `spec.openStackRelease`; an unmanaged service is omitted rather than reported |
 
 ---
 
@@ -1406,17 +1419,17 @@ an empty websso block, which would silently remove a working SSO button.
 
 ### Built-in service registrations
 
-Glance, Placement and Barbican each need a Keystone catalog row and a Keystone
-service user. None of the three registers either itself: every one of them
+Glance, Placement, Barbican and Neutron each need a Keystone catalog row and a
+Keystone service user. None of the four registers either itself: every one of them
 projects a [`KeystoneService`](./keystoneservice-crd.md) child and lets that CR's
-controller do the work. `builtin_registrations.go` is the leg all three share, so
-it is described once here rather than three times below, and a fourth built-in
+controller do the work. `builtin_registrations.go` is the leg all four share, so
+it is described once here rather than four times below, and a fifth built-in
 service adds the values it registers with rather than another copy of the leg.
 
 | Aspect | Value |
 | --- | --- |
 | File | `builtin_registrations.go` |
-| Conditions | `GlanceReady`, `PlacementReady`, `BarbicanReady` — the leg writes the caller's condition, never one of its own |
+| Conditions | `GlanceReady`, `PlacementReady`, `BarbicanReady`, `NeutronReady` — the leg writes the caller's condition, never one of its own |
 | Projects / Owns | one `KeystoneService` named `{controlplane.Name}-{service}` in the namespace that service is placed in, applied through the **local** client whatever cluster the service runs on |
 | Requeue | `korcRequeueAfter` = **10s** while the registration is not usable yet |
 
@@ -1426,14 +1439,16 @@ same plane wherever it is placed. `spec.catalog` carries the service's type and
 name with **two** endpoints, `internal` and `public`, from the start, so no later
 catalog migration is needed. `spec.account` carries the service's user with a
 project of its own and `create: true`, plus the single role `service`. Each
-service creates its own project (`service-placement`, `service-barbican`), because
-two registrations creating one project would each adopt the other's Keystone row.
+service creates its own project (`service-placement`, `service-barbican`,
+`service-neutron`), because two registrations creating one project would each
+adopt the other's Keystone row.
 
 **The URLs each row advertises.** The `internal` endpoint advertises the
 in-cluster API Service URL — `http://{controlplane.Name}-glance.<glance-namespace>.svc:9292`
 (`glanceEndpointURL`), `…-placement.<placement-namespace>.svc:8778`
 (`placementEndpointURL`), `…-barbican.<barbican-namespace>.svc:9311`
-(`barbicanEndpointURL`). None of the three carries a `/v3` path suffix; unlike
+(`barbicanEndpointURL`), `…-neutron.<neutron-namespace>.svc:9696`
+(`neutronEndpointURL`). None of the four carries a `/v3` path suffix; unlike
 identity, these APIs are served at the root. The `public` endpoint resolves
 through one preference order (`glanceCatalogURL` and its siblings): an explicit
 `services.<svc>.publicEndpoint`, advertised verbatim, then the externally routable
@@ -1483,7 +1498,7 @@ mirrors the registration's consumer credentials there
 (`ensureBuiltinRegistrationMirror`): it resolves that cluster, gates on the store
 being ready **on that cluster**, and writes an `ExternalSecret` drawing the same
 OpenBao path. A co-located service is a no-op. For the credentials' shape and the
-aggregate condition over all three registrations, see
+aggregate condition over all four registrations, see
 [reconcileServiceAccounts](#reconcileserviceaccounts).
 
 | Path | Status | Reason | Notes |
@@ -1727,12 +1742,13 @@ labels.
 | Projects / Owns | a trio in `cp.BarbicanNamespace()`: one `Barbican` child `{controlplane.Name}-barbican` (`barbicanNameSuffix`), one `BarbicanSecretStore` `{controlplane.Name}-barbican-store` (`barbicanSecretStoreNameSuffix`), and — on a dedicated secret store only — one `OpenBaoCluster` `{controlplane.Name}-barbican-bao` (`barbicanOpenBaoNameSuffix`) with the ensemble below. Plus, on a managed database only, the per-ControlPlane DB-credential objects in the same namespace: in **Dynamic** mode (the managed-shared default) a ServiceAccount `barbican-db-creds`, an mTLS client Certificate `{controlplane.Name}-barbican-db-openbao-client`, a `VaultDynamicSecret` generator reading `database/mariadb/creds/barbican-{barbican-namespace}` (auth role `barbican-db`), and a generator-backed `ExternalSecret` `{controlplane.Name}-barbican-db-credentials`; in the **Static** opt-out a KV-backed `ExternalSecret` of the same name reading `openstack/barbican/{barbican-namespace}/{controlplane.Name}/db` (properties `username`, `password`). Only when `spec.services.barbican` is set |
 | Requeue | `keystoneInfraGateRequeueAfter` = **5s** while gated on Keystone; `korcRequeueAfter` = **10s** while the `barbican` service account is not yet Ready; `dbCredentialsRequeueAfter` = **10s** while the Dynamic DB credential has not landed; `infraRequeueAfter` = **15s** while the dedicated ensemble's target cluster does not resolve, while the OpenBao instance is not Available, while the secret store is being recreated, and while the child is not Ready |
 
-`reconcileBarbican` runs last in the tail group, after `reconcileServiceAccounts`
-(and after `reconcileGlance` and `reconcilePlacement`), because it gates on the
-per-account readiness that stage computes into status in the same pass. It is
-optional: `spec.services.barbican` unset means this ControlPlane manages no key
-manager, and the sub-reconciler reports `BarbicanReady=True` /
-`BarbicanNotManaged` so the aggregate is not blocked (staged adoption).
+`reconcileBarbican` runs after `reconcileGlance` and `reconcilePlacement` in the
+tail group, with `reconcileOVN` and `reconcileNeutron` behind it. It gates on the
+`AccountReady` of the `KeystoneService` registration it projects for itself,
+which the same pass writes. It is optional: `spec.services.barbican` unset means
+this ControlPlane manages no key manager, and the sub-reconciler reports
+`BarbicanReady=True` / `BarbicanNotManaged` so the aggregate is not blocked
+(staged adoption).
 
 Unsetting the block deletes nothing on its own.
 `c5c3.io/allow-barbican-deletion: "true"` opts in to releasing the child, its
@@ -1992,6 +2008,142 @@ waits for the ovn-operator.
 | the central has not reported `Ready`, or reports it not True | False | `WaitingForOVNCentral` | requeue 15s; the central's own reason and message are relayed verbatim, because "not ready" alone says nothing an operator can act on |
 | the central reports `Ready` but has not published both addresses and `status.clientSecretName` | False | `OVNEndpointsPending` | requeue 15s; the message names each status field that is still empty, in the address form the placement selected |
 | the central is ready and complete | True | `OVNCentralReady` | the message carries the Northbound and Southbound addresses that were selected |
+
+### reconcileNeutron
+
+| Aspect | Value |
+| --- | --- |
+| File | `reconcile_neutron.go`, `reconcile_neutron_messaging.go`, `reconcile_neutron_dbcredentials.go` |
+| Condition | `NeutronReady` |
+| Gate | `KeystoneReady == True` (Neutron validates every token against the Keystone child), `OVNReady == True` (the ML2/OVN mechanism driver writes every network into the referenced central's Northbound database) **and** the `AccountReady` of the `KeystoneService` registration it projects (see [Built-in service registrations](#built-in-service-registrations)) |
+| Projects / Owns | one `Neutron` child named `{controlplane.Name}-neutron` (`neutronNameSuffix`) in `cp.NeutronNamespace()`; the bus delivery beside it, a `{controlplane.Name}-neutron-messaging` Secret (key `transport_url`) and, only while the shared bus declares `tls`, a `{controlplane.Name}-neutron-messaging-ca` Secret (key `ca.crt`), both written on the client that namespace resolves to and claimed by a controller owner reference at home or by the ownership labels in a service namespace or on a target cluster; and, on a managed database only, the per-ControlPlane DB-credential objects in the same namespace: in **Dynamic** mode (the managed-shared default) a ServiceAccount `neutron-db-creds`, an mTLS client Certificate `{controlplane.Name}-neutron-db-openbao-client`, a `VaultDynamicSecret` generator reading `database/mariadb/creds/neutron-{neutron-namespace}` (auth role `neutron-db`), and a generator-backed `ExternalSecret` `{controlplane.Name}-neutron-db-credentials`; in the **Static** opt-out a KV-backed `ExternalSecret` of the same name reading `openstack/neutron/{neutron-namespace}/{controlplane.Name}/db` (properties `username`, `password`). Only when `spec.services.neutron` is set |
+| Requeue | `keystoneInfraGateRequeueAfter` = **5s** while gated on `KeystoneReady` or `OVNReady`; `infraRequeueAfter` = **15s** while the bus material has not landed, while the namespace's cluster does not resolve, and while the child is not Ready; `korcRequeueAfter` = **10s** while the `neutron` service account is not yet Ready; `dbCredentialsRequeueAfter` = **10s** while the Dynamic DB credential has not landed |
+
+`reconcileNeutron` gates in order: `KeystoneReady`, `OVNReady`, the shared message
+bus delivered into the network service's namespace, the `KeystoneService`
+registration whose account Neutron authenticates as, and the DB credential the
+child references. The bus runs ahead of the registration because it reads nothing
+the registration produces and writes into the namespace on the cluster the child
+is applied to, so an unresolvable target cluster surfaces before the plane
+projects the registration that mints the Keystone user.
+The transport URL's digest is **not** projected onto the child: the neutron
+operator rolls its pods off the Secret it derives itself, so a second digest on
+the child would only add a redundant rollout trigger.
+
+It is optional: `spec.services.neutron` unset means this ControlPlane manages no
+network service, and the sub-reconciler reports `NeutronReady=True` /
+`NeutronNotManaged` so the aggregate is not blocked (staged adoption).
+
+When managed, the projection follows the same thin discipline as its Placement
+and Barbican siblings, reusing the ControlPlane's own specs so Neutron points at
+the same backing services:
+
+- **Image:** repository defaults to `ghcr.io/c5c3/neutron` with the tag derived
+  from `spec.openStackRelease`; `spec.services.neutron.image` overrides the whole
+  image reference when set.
+- **Database:** a DeepCopy of the **effective** database
+  (`effectiveNeutronDatabase`: Neutron's
+  [dedicated](./controlplane-crd.md#neutrondedicatedbackingservicesspec) database
+  when it opted into one, the shared `spec.infrastructure.database` otherwise)
+  with its logical database name forced to `neutron`. In managed mode
+  (`clusterRef` set) the `secretRef` is repointed at the operator-owned
+  `{controlplane.Name}-neutron-db-credentials` Secret (key `password`), and the
+  projected `credentialsMode` is the **effective** mode: `Dynamic` (engine-issued)
+  by default on the managed shared database, drawn from the engine role
+  `neutron-{neutron-ns}` that `setup-database-tenant.sh` provisions, flipped to
+  `Static` by the shared-block opt-out or the per-service
+  `services.neutron.databaseCredentialsMode` override, and always `Static` for a
+  dedicated neutron database. A brownfield database keeps the user-supplied
+  `secretRef` and `credentialsMode`.
+- **Cache:** a DeepCopy of the **effective** cache (`effectiveNeutronCache`).
+- **Messaging:** a **brownfield** `secretRef` naming the
+  `{controlplane.Name}-neutron-messaging` Secret the pass wrote beside the child,
+  under the key `transport_url`. `messaging.tls.caBundleSecretRef` is set only
+  while `spec.infrastructure.messaging.tls` is declared, and names the
+  `{controlplane.Name}-neutron-messaging-ca` mirror under `ca.crt`. Both resolve
+  in the Neutron's own namespace on the Neutron's own cluster, which is where the
+  neutron operator looks for them. Dropping the `tls` block reverts both halves in
+  order: the projection removes the child's pointer first, and only once the child
+  reports having converged on that spec — Ready, with a
+  `status.observedGeneration` that has caught up with the generation the apply
+  produced — does `pruneNeutronMessagingCA` reap the mirror. Both steps of the
+  order matter, because the pointer and the volume are removed on different
+  passes: the prune deliberately does not live on the messaging leg, which runs
+  ahead of every gate that can halt the pass — a service-account rotation, a DB
+  credential mid-rotation, a transient API error — and the neutron operator
+  re-renders the Deployment that mounts the mirror only after the pointer is gone
+  from the CR. Reaping ahead of either step leaves a live pod template naming a
+  volume source that no longer exists, wedging every restarting pod on
+  `CreateContainerConfigError`.
+- **OVN:** `spec.ovn.centralRef` carries the referenced central's name and its
+  namespace **resolved here** rather than passed through: an empty ref namespace
+  means the ControlPlane's own namespace, which is not the namespace the child
+  would default it to once it is placed elsewhere.
+- **Keystone endpoint:** `keystoneEndpoint` is derived top-down via
+  `neutronKeystoneEndpoint(cp)`, the cluster-local `{controlplane.Name}-keystone`
+  Service URL while Neutron and Keystone resolve to the same cluster, and the
+  public URL when they are placed apart (see
+  [Reaching a placed service](#reaching-a-placed-service)).
+  `keystonePublicEndpoint` is a pass-through of the Keystone service's own public
+  endpoint.
+- **Service user:** derived from the `neutron` account the projected
+  `KeystoneService` registration provisions, its `username`, the
+  `service-neutron` project, and both domains from the ControlPlane's effective
+  admin domain, with the password read from the consumer Secret that registration
+  delivers.
+- **ExtraConfig:** `spec.globalExtraConfig` merged with
+  `services.neutron.extraConfig` (the per-service value winning key by key),
+  assigned unconditionally so clearing the ControlPlane block reverts the child
+  instead of pinning the last projected value.
+- **Gateway / Replicas / SecretStoreRef / Region:** `gateway` is a DeepCopy of
+  `spec.services.neutron.gateway` (a nil source clears it, tearing the HTTPRoute
+  down); `deployment.replicas` and `workers.deployment.replicas` both default to
+  `commonv1.DefaultReplicas` and are overridden by `services.neutron.replicas`
+  and `services.neutron.workerReplicas`; the resolved store selection and
+  `spec.region` are projected through. `spec.apiServer`, `spec.ovnDBSync`,
+  `spec.networkPolicy`, `spec.autoscaling` and `spec.logging` are **not** set, so
+  the child-side defaults stay authoritative.
+
+Unsetting `spec.services.neutron` deletes nothing on its own. With
+`c5c3.io/allow-neutron-deletion: "true"`, `deleteOrphanedNeutron` releases, in
+order, the `Neutron` child, the DB-credential `ExternalSecret`, the Dynamic-mode
+`VaultDynamicSecret`, its client Certificate and the `neutron-db-creds`
+ServiceAccount, the two messaging Secrets, and finally the `KeystoneService`
+registration, whose finalizer is what tears the network catalog rows, the service
+user and its project down. Each object is only removed while this ControlPlane
+still owns it, so a foreign object colliding on a name is left alone. The
+referenced `OVNCentral` is **never** deleted: it is deployed outside the plane and
+only read.
+
+The credential minter comes down either way. On the preserve branch the
+`VaultDynamicSecret`, its client Certificate, and the `neutron-db-creds`
+ServiceAccount are torn down before the condition is written: a live generator
+keeps issuing a fresh MySQL user with all privileges on the `neutron` schema at
+every refresh interval, for a service this ControlPlane has been told it no longer
+manages, behind a `NeutronReady=True` condition that surfaces none of it.
+
+A child placed outside the ControlPlane's namespace
+(`services.neutron.namespace`) carries no owner reference: it is stamped with the
+ownership labels and applied unowned, and the finalizer sweeps it by those labels.
+
+| Path | Status | Reason | Notes |
+| --- | --- | --- | --- |
+| `spec.services.neutron` unset | True | `NeutronNotManaged` | staged adoption; a previously-projected child is preserved unless `c5c3.io/allow-neutron-deletion: "true"` is set, but its dynamic DB-credential generator, ServiceAccount, and client Certificate are torn down either way |
+| `KeystoneReady` not True | False | `WaitingForKeystone` | requeue 5s; no Neutron CR is projected while Keystone is unready |
+| `OVNReady` not True | False | `WaitingForOVN` | requeue 5s; a Neutron pointed at a central whose databases do not serve cannot program a single network |
+| the shared bus has not delivered its transport URL yet | False | `WaitingForMessagingCredentials` | requeue 15s; nothing is written, so the child never sees a partial URL |
+| the messaging CA bundle Secret is absent or carries no data under its key | False | `WaitingForMessagingCABundle` | requeue 15s; an empty key is the ordinary transient of a two-step create-then-populate flow, so it waits rather than mirroring an empty trust anchor |
+| resolving the URL, writing either messaging Secret, or reaping the stale CA mirror after the child stopped naming it fails | False | `NeutronMessagingError` | returns the error |
+| the cluster the Neutron namespace resolves to is unavailable | False | `TargetClusterUnavailable` | the resolver's own message; a wait, not a failed reconcile. Requeue 15s from the bus delivery, 10s from the DB credential |
+| the projected registration has not provisioned the account yet | False | `WaitingForServiceRegistration` | requeue 10s; no Neutron child is written until the Keystone user and its password exist. See [Built-in service registrations](#built-in-service-registrations) |
+| projecting, reading or mirroring the registration child fails | False | `ServiceRegistrationError` | returns the error |
+| the registration child carries foreign spec fields | False | `ServiceRegistrationFieldsReclaimed` | they are reset and the pass halts; requeue 10s |
+| DB-credential ensure fails (Dynamic generator objects or Static ExternalSecret) | False | `NeutronDBCredentialError` | returns the error (managed database only) |
+| Dynamic DB credential not yet materialised | False | `WaitingForNeutronDBCredential` | requeue 10s; the message names the `database/mariadb/creds/neutron-<namespace>` path, which only exists once `setup-database-tenant.sh` has onboarded the tenant, or the non-engine-issued username it found in the target Secret |
+| Neutron child not yet Ready | False | `WaitingForNeutron` | requeue 15s |
+| projected Neutron spec rejected (HTTP 422 Invalid) | False | `NeutronProjectionRejected` | returns the error; the projection violates a Neutron CRD/webhook rule, so reconcile the ControlPlane spec to a valid projection to recover |
+| Neutron create/update fails | False | `NeutronError` | returns the error |
+| Neutron child Ready and its registration Ready | True | `NeutronReady` | — |
 
 ### reconcileKORC
 
@@ -2457,15 +2609,17 @@ is owned by the imports.
 | Requeue | `korcRequeueAfter` = **10s** while a registration is not yet Ready |
 
 `reconcileServiceAccounts` **aggregates**: it reads the `KeystoneService`
-registration child each enabled built-in service leg projects — `services.glance`,
-`services.placement`, `services.barbican`, in that order — and folds their
-readiness into the one condition operators alert on. It projects no OpenStack
+registration child each enabled built-in service leg projects
+(`services.glance`, `services.placement`, `services.barbican`,
+`services.neutron`, in that order) and folds their readiness into the one
+condition operators alert on. It projects no OpenStack
 resource itself; the registration CR owns the Keystone user, its project, its role
 assignments, the generation-scoped password, and the OpenBao round-trip that
 delivers the credentials.
 
 The double reporting is intended. A failing registration already fails its own
-service condition (`GlanceReady`, `PlacementReady`, `BarbicanReady`); the
+service condition (`GlanceReady`, `PlacementReady`, `BarbicanReady`,
+`NeutronReady`); the
 aggregate names the same cause under the condition type that does not depend on
 knowing which service broke.
 
@@ -3075,6 +3229,31 @@ Deleting the **ControlPlane** takes the ensemble down either way, with no second
 opt-in: tearing down a whole control plane is already an explicit destructive
 act.
 
+#### Neutron teardown residue
+
+The network service leaves objects in three shapes, and both teardown paths name
+them. `deleteOrphanedNeutron` runs when `spec.services.neutron` is unset with
+`c5c3.io/allow-neutron-deletion: "true"`; the ControlPlane teardown reaches the
+same set through `sweepExternalNamespaceResidue` for a namespace it does not own,
+through `crossNamespaceServiceChildren` for the `Neutron` child in a dedicated
+namespace, and through `projectedRegistrationKeys` for the registration.
+
+- The four DB-credential shapes: the `{controlplane.Name}-neutron-db-credentials`
+  `ExternalSecret` and the `VaultDynamicSecret` generator of the same name, the
+  `{controlplane.Name}-neutron-db-openbao-client` `Certificate`, and the
+  `neutron-db-creds` `ServiceAccount`.
+- The bus delivery: the `{controlplane.Name}-neutron-messaging` Secret and the
+  `{controlplane.Name}-neutron-messaging-ca` mirror. Nothing else writes them, so
+  an unmanaged service leaves no broker credential behind in the namespace.
+- The `Neutron` child and the `{controlplane.Name}-neutron` `KeystoneService`
+  registration, whose finalizer removes the network catalog rows, the service
+  user, and its project.
+
+Each object is ownership-checked against its live state, so a same-named object
+belonging to somebody else in a shared namespace is left alone. The `OVNCentral`
+the child references appears in neither path and is deleted nowhere: it is
+deployed outside the plane and only read.
+
 #### External-mode deletion resource set
 
 `orcChildObjects(cp)` derives the swept CR names from the ControlPlane spec, so
@@ -3346,6 +3525,11 @@ operators/c5c3/
     │   ├── reconcile_barbican_dbcredentials.go Barbican DB-credential names, OpenBao paths, mode
     │   ├── reconcile_ovn.go                    reconcileOVN (mirror the referenced OVNCentral),
     │   │                                        ovnCentralToControlPlaneMapper
+    │   ├── reconcile_neutron.go                reconcileNeutron projection (Neutron child, orphan
+    │   │                                        teardown)
+    │   ├── reconcile_neutron_messaging.go      Shared-bus delivery into the Neutron namespace
+    │   │                                        (transport-URL Secret + CA mirror)
+    │   ├── reconcile_neutron_dbcredentials.go  Neutron DB-credential names, OpenBao paths, mode
     │   ├── reconcile_korc.go                   reconcileKORC (AC mint/re-mint, drift detection)
     │   ├── reconcile_admincredential.go        reconcileAdminCredential (assemble + push + re-push
     │   │                                        nudges, semantic clouds.yaml gate)
@@ -3355,7 +3539,7 @@ operators/c5c3/
     │   │                                        identity imports, opt-in entries, stall detection)
     │   ├── reconcile_serviceaccounts.go        reconcileServiceAccounts (folds the built-in
     │   │                                        registrations into ServiceAccountsReady)
-    │   ├── builtin_registrations.go            The registration leg Glance/Placement/Barbican share:
+    │   ├── builtin_registrations.go            The leg Glance/Placement/Barbican/Neutron share:
     │   │                                        project the KeystoneService child, gate, mirror, reclaim
     │   ├── registration_projection.go          K-ORC child + ESO builders shared with the
     │   │                                        KeystoneService controller
@@ -3385,6 +3569,9 @@ operators/c5c3/
     │   ├── reconcile_barbican_openbao_test.go  Dedicated OpenBao ensemble tests
     │   ├── reconcile_barbican_dbcredentials_test.go Barbican DB-credential tests
     │   ├── reconcile_ovn_test.go               OVNCentral mirroring tests
+    │   ├── reconcile_neutron_test.go           Neutron projection tests
+    │   ├── reconcile_neutron_messaging_test.go Bus-delivery tests
+    │   ├── reconcile_neutron_dbcredentials_test.go Neutron DB-credential tests
     │   ├── reconcile_korc_test.go              K-ORC mint/re-mint tests
     │   ├── reconcile_admincredential_test.go   AdminCredential tests
     │   ├── reconcile_catalog_test.go           Catalog (managed-mode) tests

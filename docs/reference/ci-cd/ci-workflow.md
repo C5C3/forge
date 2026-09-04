@@ -1051,14 +1051,19 @@ the prometheus suite scrapes live operator metrics.
 
 ### e2e-controlplane
 
-Runs the full c5c3 `ControlPlane` → Keystone chain on kind. It deploys
-`keystone-operator` + K-ORC + `c5c3-operator` as local dev images (rather than
-the GHCR-published Flux chart) and runs the
+Runs the full c5c3 `ControlPlane` → Keystone chain on kind. It deploys the
+`keystone`, `horizon`, `glance`, `placement`, `barbican`, `ovn`, and `neutron`
+operators plus K-ORC and `c5c3-operator` as local dev images (rather than the
+GHCR-published Flux chart) and runs the
 `tests/e2e/c5c3/full-controlplane-keystone/` Chainsaw suite, which asserts the
 whole orchestration link by link: managed MariaDB/Memcached provisioning, the
 projected Keystone CR, the minted restricted K-ORC application credential, the
 OpenBao → ESO credential round-trip, the identity catalog, and finally a live
-`openstack token issue` / `catalog list` against the Keystone `/v3` endpoint.
+`openstack token issue` / `catalog list` against the Keystone `/v3` endpoint. The
+suite applies a standalone `OVNCentral` of its own beside the ControlPlane, since
+the plane only references a central and never projects one, and asserts the
+network service on top: `OVNReady` mirroring that central and `NeutronReady` over
+the projected `Neutron` child.
 
 A second chainsaw step on the same cluster runs
 `tests/e2e/c5c3/keystone-service-foreign-namespace/`, the cross-namespace
@@ -1097,7 +1102,7 @@ The suite runs with `E2E_REQUIRE_CONTROLPLANE_STACK: "true"`, which flips its
 presence guard from a silent SKIP to a hard failure — so a broken operator/CRD
 deployment fails the build instead of going green. Like `e2e-prometheus`, the
 job runs with `continue-on-error: false`, and it uses a 195-minute timeout on the
-larger runner because a real MariaDB + Memcached + Keystone + three operators +
+larger runner because a real MariaDB + Memcached + Keystone + eight operators +
 OpenBao + ESO + K-ORC on one node is resource-heavy, and its three chainsaw
 suites run in sequence on that one node, so their budgets add up rather than
 overlap. A suite's ceiling is not its `exec` budget alone: chainsaw applies that
