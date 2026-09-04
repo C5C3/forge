@@ -1423,8 +1423,8 @@ FIXTURES: tuple[Fixture, ...] = (
             "CronJob names at 52. The webhook rejects the ControlPlane up front (a create-only\n"
             "rule, since metadata.name is immutable): admitted, it would fail to apply the\n"
             "child on every pass, with NeutronReady stuck False and no recovery short of\n"
-            "recreating the whole control plane. The step anchors on `the projected Neutron\n"
-            "child CR name would be 41 characters`."
+            "recreating the whole control plane. The step anchors on the sentence the\n"
+            "webhook renders: `the projected Neutron child CR name would be 41 characters`."
         ),
         name="cp-neutron-name-is-thirty-three-x",
         keystone="      mode: Managed\n",

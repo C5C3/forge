@@ -8,8 +8,8 @@
 # CronJob names at 52. The webhook rejects the ControlPlane up front (a create-only
 # rule, since metadata.name is immutable): admitted, it would fail to apply the
 # child on every pass, with NeutronReady stuck False and no recovery short of
-# recreating the whole control plane. The step anchors on `the projected Neutron
-# child CR name would be 41 characters`.
+# recreating the whole control plane. The step anchors on the sentence the
+# webhook renders: `the projected Neutron child CR name would be 41 characters`.
 apiVersion: c5c3.io/v1alpha1
 kind: ControlPlane
 metadata:
