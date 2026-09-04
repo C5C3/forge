@@ -184,6 +184,37 @@ type TransportURLSecretFlowParams struct {
 	RequeueAfter time.Duration
 }
 
+// ResolveTransportURL resolves the shared bus into the rabbit:// transport URL
+// and that URL's SHA-256 digest, in managed mode (clusterRef) as well as in
+// brownfield mode (secretRef). It writes nothing. Of the params it reads only
+// Client, Namespace and Messaging; the remaining fields may stay zero.
+//
+// A non-empty waitMessage means an upstream object is not there yet: the
+// RabbitmqCluster, its default-user Secret, one of the four keys that Secret
+// carries, or the brownfield Secret and its key. The caller then requeues, and
+// transportURL and digest are empty.
+//
+// It exists for a projector that hands a consumer in another namespace or on
+// another cluster a brownfield secretRef, such as reconcileNeutronMessaging in
+// the c5c3 operator: that caller reads the bus credentials here and writes the
+// consumer's Secret itself, on the consumer's own client.
+func ResolveTransportURL(ctx context.Context, p TransportURLSecretFlowParams) (transportURL, digest, waitMessage string, err error) {
+	if p.Messaging == nil {
+		return "", "", "", fmt.Errorf("messaging spec is nil")
+	}
+
+	switch {
+	case p.Messaging.ClusterRef != nil:
+		return resolveManaged(ctx, p)
+	case p.Messaging.SecretRef != nil:
+		return resolveBrownfield(ctx, p)
+	default:
+		// The CRD's XValidation rule enforces the XOR, so this is only reachable
+		// when admission was bypassed. Fail rather than hand back an empty URL.
+		return "", "", "", fmt.Errorf("messaging spec sets neither clusterRef nor secretRef")
+	}
+}
+
 // ReconcileTransportURLSecret derives the rabbit:// transport URL from the
 // referenced RabbitmqCluster (managed mode) or from the referenced brownfield
 // Secret, and writes it to the derived <instance>-transport-url Secret under
@@ -200,22 +231,7 @@ type TransportURLSecretFlowParams struct {
 // derived Secret was materialised. It never sets the condition True: the caller's
 // Secrets step reports readiness once all of its Secrets are in place.
 func ReconcileTransportURLSecret(ctx context.Context, p TransportURLSecretFlowParams) (ctrl.Result, string, string, error) {
-	if p.Messaging == nil {
-		return ctrl.Result{}, "", "", fmt.Errorf("messaging spec is nil")
-	}
-
-	var transportURL, digest, waitMsg string
-	var err error
-	switch {
-	case p.Messaging.ClusterRef != nil:
-		transportURL, digest, waitMsg, err = resolveManaged(ctx, p)
-	case p.Messaging.SecretRef != nil:
-		transportURL, digest, waitMsg, err = resolveBrownfield(ctx, p)
-	default:
-		// The CRD's XValidation rule enforces the XOR, so this is only reachable
-		// when admission was bypassed. Fail rather than materialise an empty URL.
-		return ctrl.Result{}, "", "", fmt.Errorf("messaging spec sets neither clusterRef nor secretRef")
-	}
+	transportURL, digest, waitMsg, err := ResolveTransportURL(ctx, p)
 	if err != nil {
 		return ctrl.Result{}, "", "", err
 	}

@@ -20,6 +20,7 @@
 // it. Every read and write goes through the caller's Client in the caller's
 // Namespace, which is the consumer's own client and namespace, so the package
 // has no notion of a second cluster: a consumer that runs on another cluster or
-// in another namespace than the bus is handed a brownfield secretRef by whoever
-// projects the bus credentials to it (issue #906).
+// in another namespace than the bus is handed a brownfield secretRef by its
+// projector, reconcileNeutronMessaging in operators/c5c3, which reads the bus
+// through ResolveTransportURL and writes that brownfield Secret itself.
 package messaging

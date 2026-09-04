@@ -730,3 +730,103 @@ func TestReconcileTransportURLSecret_brownfieldRejectsForeignScheme(t *testing.T
 		})
 	}
 }
+
+// --- read-only resolve ---
+
+// TestResolveTransportURL_ReadsWithoutWriting pins the projector entry point:
+// both modes hand back the URL and its digest, the waiting path reports the
+// missing upstream object, and no run leaves a derived Secret behind.
+func TestResolveTransportURL_ReadsWithoutWriting(t *testing.T) {
+	t.Run("managed", func(t *testing.T) {
+		g := NewWithT(t)
+		s := msgScheme()
+		owner := msgOwner()
+		var conds []metav1.Condition
+		c := fake.NewClientBuilder().WithScheme(s).
+			WithObjects(owner, rabbitmqCluster(msgUserSecret, msgNamespace), defaultUserSecret(fullDefaultUserData())).
+			Build()
+
+		wantURL, wantDigest := BuildTransportURL(
+			"default_user_abc", "s3cr3t", "openstack-rabbitmq.openstack.svc", 5672)
+		transportURL, digest, waitMsg, err := ResolveTransportURL(context.Background(),
+			msgParams(c, s, owner, managedSpec(), &conds))
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(waitMsg).To(BeEmpty())
+		g.Expect(transportURL).To(Equal(wantURL))
+		g.Expect(digest).To(Equal(wantDigest))
+		g.Expect(conds).To(BeEmpty(), "the resolve half reports on no condition")
+		expectNoDerivedSecret(g, c)
+	})
+
+	t.Run("brownfield", func(t *testing.T) {
+		const external = "rabbit://svc:pw@bus.example.com:5671/neutron?ssl=1"
+
+		g := NewWithT(t)
+		s := msgScheme()
+		owner := msgOwner()
+		var conds []metav1.Condition
+		c := fake.NewClientBuilder().WithScheme(s).
+			WithObjects(owner, brownfieldSecret(map[string][]byte{
+				commonv1.DefaultTransportURLSecretKey: []byte(external),
+			})).Build()
+
+		transportURL, digest, waitMsg, err := ResolveTransportURL(context.Background(),
+			msgParams(c, s, owner, brownfieldSpec(""), &conds))
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(waitMsg).To(BeEmpty())
+		g.Expect(transportURL).To(Equal(external))
+		g.Expect(digest).NotTo(BeEmpty())
+		expectNoDerivedSecret(g, c)
+	})
+
+	t.Run("nil spec", func(t *testing.T) {
+		g := NewWithT(t)
+		s := msgScheme()
+		owner := msgOwner()
+		var conds []metav1.Condition
+		c := fake.NewClientBuilder().WithScheme(s).WithObjects(owner).Build()
+
+		transportURL, digest, waitMsg, err := ResolveTransportURL(context.Background(),
+			msgParams(c, s, owner, nil, &conds))
+		g.Expect(err).To(MatchError("messaging spec is nil"))
+		g.Expect(transportURL).To(BeEmpty())
+		g.Expect(digest).To(BeEmpty())
+		g.Expect(waitMsg).To(BeEmpty())
+		expectNoDerivedSecret(g, c)
+	})
+
+	t.Run("neither mode", func(t *testing.T) {
+		g := NewWithT(t)
+		s := msgScheme()
+		owner := msgOwner()
+		var conds []metav1.Condition
+		c := fake.NewClientBuilder().WithScheme(s).WithObjects(owner).Build()
+
+		transportURL, digest, waitMsg, err := ResolveTransportURL(context.Background(),
+			msgParams(c, s, owner, &commonv1.MessagingSpec{}, &conds))
+		g.Expect(err).To(MatchError("messaging spec sets neither clusterRef nor secretRef"))
+		g.Expect(transportURL).To(BeEmpty())
+		g.Expect(digest).To(BeEmpty())
+		g.Expect(waitMsg).To(BeEmpty())
+		expectNoDerivedSecret(g, c)
+	})
+
+	t.Run("managed waits for the default-user Secret", func(t *testing.T) {
+		g := NewWithT(t)
+		s := msgScheme()
+		owner := msgOwner()
+		var conds []metav1.Condition
+		c := fake.NewClientBuilder().WithScheme(s).
+			WithObjects(owner, rabbitmqCluster(msgUserSecret, msgNamespace)).Build()
+
+		transportURL, digest, waitMsg, err := ResolveTransportURL(context.Background(),
+			msgParams(c, s, owner, managedSpec(), &conds))
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(waitMsg).To(Equal(
+			"default-user Secret openstack/openstack-rabbitmq-default-user not found"))
+		g.Expect(transportURL).To(BeEmpty())
+		g.Expect(digest).To(BeEmpty())
+		g.Expect(conds).To(BeEmpty())
+		expectNoDerivedSecret(g, c)
+	})
+}
