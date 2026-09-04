@@ -18,6 +18,7 @@ import (
 	glancev1alpha1 "github.com/c5c3/cobaltcore/operators/glance/api/v1alpha1"
 	horizonv1alpha1 "github.com/c5c3/cobaltcore/operators/horizon/api/v1alpha1"
 	keystonev1alpha1 "github.com/c5c3/cobaltcore/operators/keystone/api/v1alpha1"
+	neutronv1alpha1 "github.com/c5c3/cobaltcore/operators/neutron/api/v1alpha1"
 	placementv1alpha1 "github.com/c5c3/cobaltcore/operators/placement/api/v1alpha1"
 )
 
@@ -115,6 +116,7 @@ func validateExtraConfigOwnership(cp *ControlPlane) (admission.Warnings, field.E
 	glancePath := specPath.Child("services", "glance", "extraConfig")
 	placementPath := specPath.Child("services", "placement", "extraConfig")
 	barbicanPath := specPath.Child("services", "barbican", "extraConfig")
+	neutronPath := specPath.Child("services", "neutron", "extraConfig")
 	horizonPath := specPath.Child("services", "horizon", "extraConfig")
 
 	// --- Shape checks -----------------------------------------------------
@@ -130,6 +132,9 @@ func validateExtraConfigOwnership(cp *ControlPlane) (admission.Warnings, field.E
 	}
 	if bn := cp.Spec.Services.Barbican; bn != nil {
 		errs = append(errs, validateINIShape(barbicanPath, bn.ExtraConfig)...)
+	}
+	if nn := cp.Spec.Services.Neutron; nn != nil {
+		errs = append(errs, validateINIShape(neutronPath, nn.ExtraConfig)...)
 	}
 	if hz := cp.Spec.Services.Horizon; hz != nil {
 		for name := range hz.ExtraConfig {
@@ -235,6 +240,38 @@ func validateExtraConfigOwnership(cp *ControlPlane) (admission.Warnings, field.E
 			// gains nothing and copies credential material into the config Secret
 			// every API pod mounts. root_token_id additionally replaces the
 			// mount-scoped AppRole with an unscoped credential.
+			if owned.Rejected {
+				for _, p := range paths {
+					errs = append(errs, field.Forbidden(p, rejectedOwnedKeyMessage(owned)))
+				}
+				continue
+			}
+			warnings = append(warnings, ownedINIWarning(owned, paths))
+		}
+	}
+
+	// --- Neutron merged-result ownership ----------------------------------
+	if nn := cp.Spec.Services.Neutron; nn != nil {
+		blocks := []iniBlock{{cp.Spec.GlobalExtraConfig, globalPath}, {nn.ExtraConfig, neutronPath}}
+		merged := MergedExtraConfig(cp.Spec.GlobalExtraConfig, nn.ExtraConfig)
+		for _, owned := range config.FindOwnedOverrides(merged, neutronv1alpha1.OwnedConfigKeys) {
+			paths := contributingKeyPaths(owned.Section, owned.Key, blocks...)
+			// Every Rejected neutron key is always forbidden. The [ovn] Northbound
+			// and Southbound connection strings point the ML2/OVN mechanism driver
+			// at a logical network model the ControlPlane does not own, and the six
+			// TLS file paths beside them (the two client keypairs and the two CA
+			// bundles, per database) either name a file the pods do not carry or
+			// drop the client identity the OVNCentral issuer signed. [DEFAULT]
+			// transport_url, [database] connection and [keystone_authtoken] password
+			// arrive through env overrides at runtime, so rendering one is inert and
+			// only copies credential material into the config Secret every pod
+			// mounts. [DEFAULT] auth_strategy and api_paste_config select the WSGI
+			// pipeline, and anything but the keystone one serves the API without
+			// token validation, on an endpoint services.neutron.gateway can publish
+			// outside the cluster. [securitygroup] enable_security_group is what
+			// makes the mechanism driver write the ACLs a port's security groups
+			// describe, so disabling it leaves every instance port reachable from
+			// every other.
 			if owned.Rejected {
 				for _, p := range paths {
 					errs = append(errs, field.Forbidden(p, rejectedOwnedKeyMessage(owned)))
@@ -370,7 +407,8 @@ func ownedSettingWarning(owned config.OwnedKey, path *field.Path) string {
 }
 
 // validateExtraConfigCatalogs validates the MERGED INI config of each declared
-// INI service (Keystone unless External, Glance, Placement, Barbican) against
+// INI service (Keystone unless External, Glance, Placement, Barbican, Neutron)
+// against
 // the option catalog embedded for the resolved release (Family B). It fails
 // open — exactly one warning, no error — when no catalog resolves for a
 // non-empty merged config, so a digest pin, an unparseable tag, or a release the
@@ -475,6 +513,29 @@ func validateExtraConfigCatalogs(cp *ControlPlane) (admission.Warnings, field.Er
 			w, e := attributeCatalogFindings("barbican", catalog, merged, ex,
 				iniBlock{cp.Spec.GlobalExtraConfig, globalPath},
 				iniBlock{bn.ExtraConfig, specPath.Child("services", "barbican", "extraConfig")})
+			warnings = append(warnings, w...)
+			errs = append(errs, e...)
+		}
+	}
+
+	// --- Neutron ----------------------------------------------------------
+	if nn := cp.Spec.Services.Neutron; nn != nil {
+		merged := MergedExtraConfig(cp.Spec.GlobalExtraConfig, nn.ExtraConfig)
+		catalog, ok := neutronv1alpha1.OptionCatalogForRelease(cp.Spec.OpenStackRelease)
+		if !ok {
+			if w := failOpenCatalogWarning("neutron", "spec.openStackRelease", cp.Spec.OpenStackRelease, merged); w != "" {
+				warnings = append(warnings, w)
+			}
+		} else {
+			// No exempt sections: the neutron catalog is the flat union of the
+			// neutron.conf, ml2_conf.ini and neutron_ovn_metadata_agent.ini generator
+			// files, so it already enumerates every section the child configures,
+			// which is why the exemptions are keys-only, as they are for keystone and
+			// placement.
+			ex := config.CatalogExemptions{Keys: config.KeyExemptionsFromRegistry(neutronv1alpha1.OwnedConfigKeys)}
+			w, e := attributeCatalogFindings("neutron", catalog, merged, ex,
+				iniBlock{cp.Spec.GlobalExtraConfig, globalPath},
+				iniBlock{nn.ExtraConfig, specPath.Child("services", "neutron", "extraConfig")})
 			warnings = append(warnings, w...)
 			errs = append(errs, e...)
 		}
@@ -624,6 +685,16 @@ func controlPlaneExtraConfigCatalogInputsChanged(oldObj, newObj *ControlPlane) b
 	}
 	if oldBn != nil && newBn != nil {
 		if !reflect.DeepEqual(oldBn.ExtraConfig, newBn.ExtraConfig) {
+			return true
+		}
+	}
+
+	oldNn, newNn := oldObj.Spec.Services.Neutron, newObj.Spec.Services.Neutron
+	if (oldNn == nil) != (newNn == nil) {
+		return true
+	}
+	if oldNn != nil && newNn != nil {
+		if !reflect.DeepEqual(oldNn.ExtraConfig, newNn.ExtraConfig) {
 			return true
 		}
 	}

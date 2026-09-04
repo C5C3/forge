@@ -23,6 +23,7 @@ import (
 	commonv1 "github.com/c5c3/cobaltcore/internal/common/types"
 	barbicanv1alpha1 "github.com/c5c3/cobaltcore/operators/barbican/api/v1alpha1"
 	glancev1alpha1 "github.com/c5c3/cobaltcore/operators/glance/api/v1alpha1"
+	neutronv1alpha1 "github.com/c5c3/cobaltcore/operators/neutron/api/v1alpha1"
 )
 
 // validControlPlane returns a ControlPlane with all required fields set to
@@ -7278,4 +7279,839 @@ func TestValidateUpdate_AcceptsMessagingMutableLeaves(t *testing.T) {
 		_, err := w.ValidateUpdate(context.Background(), oldCP, newCP)
 		g.Expect(err).NotTo(HaveOccurred())
 	})
+}
+
+// --- services.neutron ---
+
+// neutronControlPlane returns a managed ControlPlane with a minimal neutron
+// block, so the tests below start from an admissible baseline and vary only the
+// field (or the INI content) under test. The bus is declared brownfield: the
+// network service is the one service the ControlPlane requires
+// spec.infrastructure.messaging for, because the Neutron CRD requires
+// spec.messaging on the child projected for it.
+func neutronControlPlane() *ControlPlane {
+	cp := managedControlPlane()
+	cp.Name = "cp"
+	cp.Spec.Infrastructure.Messaging = &commonv1.MessagingSpec{
+		SecretRef: &commonv1.SecretRefSpec{Name: "bus-url"},
+	}
+	cp.Spec.Services.Neutron = &ServiceNeutronSpec{
+		OVN: NeutronOVNSpec{CentralRef: NeutronOVNCentralRef{Name: "ovn"}},
+	}
+	return cp
+}
+
+// TestDefault_NeutronServiceNamespaceLifecycle verifies a declared neutron
+// namespace assignment takes the Managed lifecycle default, exactly as the
+// keystone/horizon/glance/placement/barbican ones do, and that no assignment is
+// invented for a service that declared none.
+func TestDefault_NeutronServiceNamespaceLifecycle(t *testing.T) {
+	g := NewGomegaWithT(t)
+	w := &ControlPlaneWebhook{}
+	cp := neutronControlPlane()
+	cp.Spec.Services.Neutron.Namespace = &ServiceNamespaceSpec{Name: "network"}
+
+	g.Expect(w.Default(context.Background(), cp)).To(Succeed())
+	g.Expect(cp.Spec.Services.Neutron.Namespace.Lifecycle).To(Equal(ServiceNamespaceLifecycleManaged))
+
+	bare := neutronControlPlane()
+	g.Expect(w.Default(context.Background(), bare)).To(Succeed())
+	g.Expect(bare.Spec.Services.Neutron.Namespace).To(BeNil(),
+		"an absent assignment means the service stays in the ControlPlane's namespace")
+}
+
+// TestDefault_NeutronDedicatedBackingServicesLeaves verifies a declared neutron
+// dedicated block takes the same leaf defaults as the shared one, with a managed
+// clusterRef name DERIVED from the ControlPlane and credentialsMode materialized
+// to Static (a dedicated managed database cannot draw engine-issued credentials).
+// A service that declares no dedicated block gets nothing.
+func TestDefault_NeutronDedicatedBackingServicesLeaves(t *testing.T) {
+	g := NewGomegaWithT(t)
+	w := &ControlPlaneWebhook{}
+	cp := neutronControlPlane()
+	cp.Name = "prod"
+	cp.Spec.Services.Neutron.DedicatedBackingServices = &NeutronDedicatedBackingServicesSpec{
+		Database: &commonv1.DatabaseSpec{},
+		Cache:    &commonv1.CacheSpec{},
+	}
+
+	g.Expect(w.Default(context.Background(), cp)).To(Succeed())
+
+	db := cp.Spec.Services.Neutron.DedicatedBackingServices.Database
+	g.Expect(db.ClusterRef).NotTo(BeNil())
+	g.Expect(db.ClusterRef.Name).To(Equal("prod" + DedicatedNeutronDatabaseClusterRefSuffix))
+	g.Expect(db.Database).To(Equal(DefaultDatabaseName))
+	g.Expect(db.SecretRef.Name).To(Equal(DefaultDatabaseSecretName))
+	g.Expect(db.CredentialsMode).To(Equal(commonv1.CredentialsModeStatic),
+		"a dedicated managed database is Static-only: no per-instance OpenBao engine role exists")
+
+	cache := cp.Spec.Services.Neutron.DedicatedBackingServices.Cache
+	g.Expect(cache.ClusterRef).NotTo(BeNil())
+	g.Expect(cache.ClusterRef.Name).To(Equal("prod" + DedicatedNeutronCacheClusterRefSuffix))
+	g.Expect(cache.Backend).To(Equal(DefaultCacheBackend))
+
+	// Idempotent on the dedicated leaves too.
+	before := cp.DeepCopy()
+	g.Expect(w.Default(context.Background(), cp)).To(Succeed())
+	g.Expect(cp.Spec.Services).To(Equal(before.Spec.Services))
+
+	shared := neutronControlPlane()
+	g.Expect(w.Default(context.Background(), shared)).To(Succeed())
+	g.Expect(shared.Spec.Services.Neutron.DedicatedBackingServices).To(BeNil(),
+		"an absent block means the service shares the ControlPlane-wide instances")
+}
+
+// TestDefault_NeutronOVNCentralRefNamespace pins the one default the OVN
+// reference takes: an empty namespace is materialized to the ControlPlane's own,
+// the value NeutronOVNCentralNamespace() resolves it to anyway, so a CR that
+// bypassed this webhook addresses the same central. An explicit namespace stays
+// untouched, and a ControlPlane without the network service gets no neutron
+// block invented for it.
+func TestDefault_NeutronOVNCentralRefNamespace(t *testing.T) {
+	w := &ControlPlaneWebhook{}
+
+	t.Run("an empty namespace takes the ControlPlane's own", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := neutronControlPlane()
+		cp.Namespace = "openstack"
+
+		g.Expect(w.Default(context.Background(), cp)).To(Succeed())
+		g.Expect(cp.Spec.Services.Neutron.OVN.CentralRef.Namespace).To(Equal("openstack"))
+		g.Expect(cp.NeutronOVNCentralNamespace()).To(Equal("openstack"))
+	})
+
+	t.Run("an explicit namespace is preserved", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := neutronControlPlane()
+		cp.Namespace = "openstack"
+		cp.Spec.Services.Neutron.OVN.CentralRef.Namespace = "ovn"
+
+		g.Expect(w.Default(context.Background(), cp)).To(Succeed())
+		g.Expect(cp.Spec.Services.Neutron.OVN.CentralRef.Namespace).To(Equal("ovn"))
+	})
+
+	t.Run("a ControlPlane without the network service", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := managedControlPlane()
+		cp.Namespace = "openstack"
+
+		g.Expect(w.Default(context.Background(), cp)).To(Succeed())
+		g.Expect(cp.Spec.Services.Neutron).To(BeNil())
+	})
+}
+
+// TestValidateCreate_AcceptsNeutronControlPlane pins the admissible baseline and
+// the longest ControlPlane name the projected Neutron child still fits into.
+func TestValidateCreate_AcceptsNeutronControlPlane(t *testing.T) {
+	w := &ControlPlaneWebhook{}
+
+	t.Run("the minimal block beside a brownfield bus", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		_, err := w.ValidateCreate(context.Background(), neutronControlPlane())
+		g.Expect(err).NotTo(HaveOccurred())
+	})
+
+	t.Run("a 32-character ControlPlane name", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := neutronControlPlane()
+		cp.Name = strings.Repeat("c", neutronv1alpha1.MaxNeutronNameLength-neutronChildNameOverhead)
+
+		_, err := w.ValidateCreate(context.Background(), cp)
+		g.Expect(err).NotTo(HaveOccurred())
+	})
+}
+
+// TestValidateCreate_RejectsNeutronInExternalMode verifies the webhook
+// cross-field forbid, mirroring services.placement: no Keystone workload is
+// deployed, so Neutron has no identity to validate its tokens against.
+func TestValidateCreate_RejectsNeutronInExternalMode(t *testing.T) {
+	g := NewGomegaWithT(t)
+	w := &ControlPlaneWebhook{}
+	cp := externalControlPlane()
+	cp.Spec.Services.Neutron = &ServiceNeutronSpec{
+		OVN: NeutronOVNSpec{CentralRef: NeutronOVNCentralRef{Name: "ovn"}},
+	}
+
+	_, err := w.ValidateCreate(context.Background(), cp)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("services.neutron"))
+	g.Expect(err.Error()).To(ContainSubstring("forbidden when services.keystone.mode is External"))
+}
+
+// TestValidateCreate_RejectsNeutronWithoutMessaging pins the one prerequisite no
+// other service has. The Neutron CRD requires spec.messaging, and the
+// ControlPlane derives the child's transport URL from the shared bus, so a
+// ControlPlane that declares the network service without one would project a
+// child its own admission rejects on every pass.
+func TestValidateCreate_RejectsNeutronWithoutMessaging(t *testing.T) {
+	g := NewGomegaWithT(t)
+	w := &ControlPlaneWebhook{}
+	cp := neutronControlPlane()
+	cp.Spec.Infrastructure.Messaging = nil
+
+	_, err := w.ValidateCreate(context.Background(), cp)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("spec.infrastructure.messaging"))
+	g.Expect(err.Error()).To(ContainSubstring("is required when services.neutron is set"))
+}
+
+// TestValidateCreate_RejectsNeutronOVNCentralRefNameEmpty pins the
+// defense-in-depth mirror of the MinLength marker on the ref: the ML2/OVN
+// mechanism driver writes every network, subnet and port into the named
+// central's Northbound database, so a ref naming nothing leaves the child with
+// no database to program.
+func TestValidateCreate_RejectsNeutronOVNCentralRefNameEmpty(t *testing.T) {
+	g := NewGomegaWithT(t)
+	w := &ControlPlaneWebhook{}
+	cp := neutronControlPlane()
+	cp.Spec.Services.Neutron.OVN.CentralRef.Name = ""
+
+	_, err := w.ValidateCreate(context.Background(), cp)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("spec.services.neutron.ovn.centralRef.name"))
+	g.Expect(err.Error()).To(ContainSubstring("must be set: it names the OVNCentral"))
+}
+
+// TestValidateCreate_RejectsNeutronOVNCentralRefNamespaceShape pins the
+// defense-in-depth mirror of the RFC-1123 Pattern marker: the value names a
+// Kubernetes namespace the reconciler reads the central from.
+func TestValidateCreate_RejectsNeutronOVNCentralRefNamespaceShape(t *testing.T) {
+	g := NewGomegaWithT(t)
+	w := &ControlPlaneWebhook{}
+	cp := neutronControlPlane()
+	cp.Spec.Services.Neutron.OVN.CentralRef.Namespace = "Not_Valid"
+
+	_, err := w.ValidateCreate(context.Background(), cp)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("spec.services.neutron.ovn.centralRef.namespace"))
+	g.Expect(err.Error()).To(ContainSubstring("must be a lowercase alphanumeric RFC-1123 label"))
+}
+
+// TestValidateCreate_NeutronOVNCentralRefNamespaceStaysInsideThePlane pins the
+// reach of the one ControlPlane field that addresses another namespace. Naming a
+// central the plane does not already reach is not a read-only act: the
+// neutron-operator mirrors that central's client Secret into the Neutron
+// namespace, so the reference alone would hand this plane a full mTLS identity
+// for a foreign plane's Northbound and Southbound databases.
+func TestValidateCreate_NeutronOVNCentralRefNamespaceStaysInsideThePlane(t *testing.T) {
+	w := &ControlPlaneWebhook{}
+	// A ControlPlane in namespace "openstack" that places the network service in a
+	// namespace of its own, so both the claimed and the unclaimed case are one
+	// field apart.
+	base := func(lifecycle ServiceNamespaceLifecycle) *ControlPlane {
+		cp := neutronControlPlane()
+		cp.Namespace = "openstack"
+		cp.Spec.Services.Neutron.Namespace = &ServiceNamespaceSpec{Name: "networking", Lifecycle: lifecycle}
+		return cp
+	}
+
+	t.Run("own namespace", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := neutronControlPlane()
+		cp.Namespace = "openstack"
+		cp.Spec.Services.Neutron.OVN.CentralRef.Namespace = "openstack"
+
+		_, err := w.ValidateCreate(context.Background(), cp)
+		g.Expect(err).NotTo(HaveOccurred(),
+			"the ControlPlane's own namespace is what the defaulting webhook writes into the ref")
+	})
+
+	t.Run("foreign namespace", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := base(ServiceNamespaceLifecycleExternal)
+		cp.Spec.Services.Neutron.OVN.CentralRef.Namespace = "other-tenant"
+
+		_, err := w.ValidateCreate(context.Background(), cp)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("spec.services.neutron.ovn.centralRef.namespace"))
+		g.Expect(err.Error()).To(ContainSubstring(
+			`namespace "other-tenant" is neither this ControlPlane's own nor one it claims`))
+		g.Expect(err.Error()).To(ContainSubstring("mirrors that central's client certificate"))
+	})
+
+	t.Run("claimed namespace with lifecycle External", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := base(ServiceNamespaceLifecycleExternal)
+		cp.Spec.Services.Neutron.OVN.CentralRef.Namespace = "networking"
+
+		_, err := w.ValidateCreate(context.Background(), cp)
+		g.Expect(err).NotTo(HaveOccurred(),
+			"an External namespace this plane claims is inside its trust boundary and outlives its teardown")
+	})
+
+	t.Run("claimed namespace with lifecycle Managed", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := base(ServiceNamespaceLifecycleManaged)
+		cp.Spec.Services.Neutron.OVN.CentralRef.Namespace = "networking"
+
+		_, err := w.ValidateCreate(context.Background(), cp)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("spec.services.neutron.ovn.centralRef.namespace"))
+		g.Expect(err.Error()).To(ContainSubstring(`namespace "networking" is claimed by this ControlPlane with ` +
+			"lifecycle Managed"))
+		g.Expect(err.Error()).To(ContainSubstring("the cascade would take the referenced OVNCentral"))
+	})
+
+	// The default an unset lifecycle carries is Managed, so a claim that never
+	// spelled it out must be refused for the same cascade reason.
+	t.Run("claimed namespace with an unset lifecycle", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := base("")
+		cp.Spec.Services.Neutron.OVN.CentralRef.Namespace = "networking"
+
+		_, err := w.ValidateCreate(context.Background(), cp)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("lifecycle Managed"))
+	})
+}
+
+// TestValidateCreate_NeutronPublicEndpointMustBeABareOrigin covers the shapes
+// the ^https?:// Pattern marker lets through and validateHTTPURL happily parses.
+// The Neutron API is served at the root and clients append the API path to the
+// catalog endpoint, so "https://neutron.example.com/network" yields
+// "https://neutron.example.com/network/v2.0/networks" and 404s every network
+// call. A single trailing slash is what OpenStack clients normalize away, so it
+// stays admitted.
+func TestValidateCreate_NeutronPublicEndpointMustBeABareOrigin(t *testing.T) {
+	w := &ControlPlaneWebhook{}
+
+	for name, endpoint := range map[string]string{
+		"query":        "https://neutron.example.com?utm=1",
+		"fragment":     "https://neutron.example.com#top",
+		"path":         "https://neutron.example.com/network",
+		"missing host": "https://",
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := NewGomegaWithT(t)
+			cp := neutronControlPlane()
+			cp.Spec.Services.Neutron.PublicEndpoint = endpoint
+
+			_, err := w.ValidateCreate(context.Background(), cp)
+			g.Expect(err).To(HaveOccurred())
+			g.Expect(err.Error()).To(ContainSubstring("services.neutron.publicEndpoint"))
+		})
+	}
+
+	t.Run("trailing slash", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := neutronControlPlane()
+		cp.Spec.Services.Neutron.PublicEndpoint = "https://neutron.example.com/"
+
+		_, err := w.ValidateCreate(context.Background(), cp)
+		g.Expect(err).NotTo(HaveOccurred(),
+			"clients normalize the catalog endpoint before appending the API path")
+	})
+}
+
+// TestValidateCreate_NeutronPublicEndpointMustAgreeWithGateway pins the two
+// cross-field rules. An http endpoint behind a TLS-terminating listener ships
+// the caller's scoped Keystone token in cleartext on every network call; a
+// divergent host advertises a catalog URL the Gateway listener never routes,
+// which fails client-side with nothing on the ControlPlane recording why.
+func TestValidateCreate_NeutronPublicEndpointMustAgreeWithGateway(t *testing.T) {
+	w := &ControlPlaneWebhook{}
+	gateway := func() *commonv1.GatewaySpec {
+		return &commonv1.GatewaySpec{
+			Hostname:  "neutron.example.com",
+			ParentRef: commonv1.GatewayParentRefSpec{Name: "openstack-gw"},
+		}
+	}
+
+	t.Run("divergent host", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := neutronControlPlane()
+		cp.Spec.Services.Neutron.Gateway = gateway()
+		cp.Spec.Services.Neutron.PublicEndpoint = "https://networks.example.com"
+
+		_, err := w.ValidateCreate(context.Background(), cp)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("services.neutron.publicEndpoint"))
+		g.Expect(err.Error()).To(ContainSubstring(
+			`must equal services.neutron.gateway.hostname "neutron.example.com"`,
+		))
+	})
+
+	t.Run("http scheme behind a TLS-terminating gateway", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := neutronControlPlane()
+		cp.Spec.Services.Neutron.Gateway = gateway()
+		cp.Spec.Services.Neutron.PublicEndpoint = "http://neutron.example.com"
+
+		_, err := w.ValidateCreate(context.Background(), cp)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("scheme must be https"))
+	})
+
+	t.Run("matching host with a non-default port", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := neutronControlPlane()
+		cp.Spec.Services.Neutron.Gateway = gateway()
+		cp.Spec.Services.Neutron.PublicEndpoint = "https://neutron.example.com:8443"
+
+		_, err := w.ValidateCreate(context.Background(), cp)
+		g.Expect(err).NotTo(HaveOccurred(),
+			"Gateway API hostnames carry no port, so the port is the reason the override exists")
+	})
+
+	t.Run("wildcard gateway hostname", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := neutronControlPlane()
+		cp.Spec.Services.Neutron.Gateway = gateway()
+		cp.Spec.Services.Neutron.Gateway.Hostname = "*.example.com"
+
+		_, err := w.ValidateCreate(context.Background(), cp)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("services.neutron.gateway.hostname"))
+	})
+
+	// The other arm of the same pair, mirroring the MinLength=1 marker on
+	// GatewaySpec.Hostname: a gateway without one derives a hostless public
+	// endpoint the catalog would register as "https://".
+	t.Run("gateway without a hostname", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := neutronControlPlane()
+		cp.Spec.Services.Neutron.Gateway = &commonv1.GatewaySpec{
+			ParentRef: commonv1.GatewayParentRefSpec{Name: "openstack-gw"},
+		}
+
+		_, err := w.ValidateCreate(context.Background(), cp)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("services.neutron.gateway.hostname"))
+		g.Expect(err.Error()).To(ContainSubstring("must be set when a gateway is configured"))
+	})
+}
+
+// TestValidateCreate_WarnsOnCleartextNeutronPublicEndpoint covers the
+// gateway-less network service, where an http endpoint is a legal (if unwise)
+// development setup the CRD Pattern deliberately allows. Every network call
+// sends a scoped Keystone token to that URL, so the downgrade must at least be
+// surfaced.
+func TestValidateCreate_WarnsOnCleartextNeutronPublicEndpoint(t *testing.T) {
+	w := &ControlPlaneWebhook{}
+
+	t.Run("http warns", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := neutronControlPlane()
+		cp.Spec.Services.Neutron.PublicEndpoint = "http://neutron.example.com"
+
+		warnings, err := w.ValidateCreate(context.Background(), cp)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(warnings).To(HaveLen(1))
+		g.Expect(warnings[0]).To(ContainSubstring("scoped Keystone token"))
+	})
+
+	t.Run("https is silent", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := neutronControlPlane()
+		cp.Spec.Services.Neutron.PublicEndpoint = "https://neutron.example.com"
+
+		warnings, err := w.ValidateCreate(context.Background(), cp)
+		g.Expect(err).NotTo(HaveOccurred())
+		g.Expect(warnings).To(BeEmpty())
+	})
+}
+
+// TestValidateCreate_RejectsNeutronImageTagDigestXOR pins the defense-in-depth
+// mirror of the commonv1.ImageSpec XValidation rule for callers that bypass CRD
+// schema admission.
+func TestValidateCreate_RejectsNeutronImageTagDigestXOR(t *testing.T) {
+	w := &ControlPlaneWebhook{}
+
+	for name, img := range map[string]*commonv1.ImageSpec{
+		"neither tag nor digest": {Repository: "ghcr.io/c5c3/neutron"},
+		"both tag and digest": {
+			Repository: "ghcr.io/c5c3/neutron",
+			Tag:        "2025.2",
+			Digest:     "sha256:" + strings.Repeat("a", 64),
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := NewGomegaWithT(t)
+			cp := neutronControlPlane()
+			cp.Spec.Services.Neutron.Image = img
+
+			_, err := w.ValidateCreate(context.Background(), cp)
+			g.Expect(err).To(HaveOccurred())
+			g.Expect(err.Error()).To(ContainSubstring("services.neutron.image"))
+			g.Expect(err.Error()).To(ContainSubstring("exactly one of image.tag or image.digest must be set"))
+		})
+	}
+}
+
+// TestValidateCreate_RejectsNeutronCredentialsModeOverrideDynamicOnDedicated is
+// the neutron mirror of the keystone dedicated-database rejection: the override
+// retargets the shared database the service does not use, and a dedicated
+// database is Static-only.
+func TestValidateCreate_RejectsNeutronCredentialsModeOverrideDynamicOnDedicated(t *testing.T) {
+	g := NewGomegaWithT(t)
+	w := &ControlPlaneWebhook{}
+	cp := neutronControlPlane()
+	cp.Spec.Services.Neutron.DatabaseCredentialsMode = commonv1.CredentialsModeDynamic
+	cp.Spec.Services.Neutron.DedicatedBackingServices = &NeutronDedicatedBackingServicesSpec{
+		Database: &commonv1.DatabaseSpec{
+			ClusterRef:      &corev1.LocalObjectReference{Name: "cp-neutron-db"},
+			CredentialsMode: commonv1.CredentialsModeStatic,
+			Database:        "neutron",
+			SecretRef:       commonv1.SecretRefSpec{Name: "neutron-db"},
+		},
+	}
+
+	_, err := w.ValidateCreate(context.Background(), cp)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("services.neutron.databaseCredentialsMode"))
+	g.Expect(err.Error()).To(ContainSubstring(
+		"not supported as an override on a service with a dedicated database",
+	))
+}
+
+// TestValidateCreate_RejectsNeutronCredentialsModeOverrideDynamicOnBrownfieldShared
+// pins the other half of the override rule: the dynamic engine issues per-tenant
+// DB users only against a cluster the operator provisions, so a Dynamic override
+// on a brownfield shared database is rejected.
+func TestValidateCreate_RejectsNeutronCredentialsModeOverrideDynamicOnBrownfieldShared(t *testing.T) {
+	g := NewGomegaWithT(t)
+	w := &ControlPlaneWebhook{}
+	cp := neutronControlPlane()
+	cp.Spec.Infrastructure.Database = commonv1.DatabaseSpec{
+		Host:      "db.example.com",
+		Port:      3306,
+		Database:  "openstack",
+		SecretRef: commonv1.SecretRefSpec{Name: "db-creds"},
+	}
+	cp.Spec.Services.Neutron.DatabaseCredentialsMode = commonv1.CredentialsModeDynamic
+
+	_, err := w.ValidateCreate(context.Background(), cp)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("services.neutron.databaseCredentialsMode"))
+	g.Expect(err.Error()).To(ContainSubstring(
+		"Dynamic requires the shared database to be managed (clusterRef)",
+	))
+}
+
+// placedNeutronControlPlane returns a ControlPlane whose network service is
+// placed on the "edge" cluster in a namespace of its own, advertising nothing.
+// Keystone is published because a service placed away from it validates its
+// tokens over that URL.
+func placedNeutronControlPlane() *ControlPlane {
+	cp := neutronControlPlane()
+	cp.Namespace = "openstack"
+	cp.Spec.Services.Neutron.Namespace = &ServiceNamespaceSpec{
+		Name: "network", Lifecycle: ServiceNamespaceLifecycleManaged,
+	}
+	cp.Spec.Services.Neutron.TargetClusterRef = &commonv1.TargetClusterRefSpec{Name: "edge"}
+	publishKeystone(cp)
+	return cp
+}
+
+// TestValidateCreate_RejectsPlacedNeutronWithoutNamespace pins the
+// dedicated-namespace rule for the network service: a namespace maps to exactly
+// one cluster, and the ControlPlane's own stays on the local one, so a Neutron
+// placed elsewhere without a namespace of its own would have its database, its
+// tenant store, and its credential material provisioned on a cluster its
+// workload does not run on.
+func TestValidateCreate_RejectsPlacedNeutronWithoutNamespace(t *testing.T) {
+	g := NewGomegaWithT(t)
+	w := &ControlPlaneWebhook{}
+	cp := placedNeutronControlPlane()
+	cp.Spec.Services.Neutron.PublicEndpoint = "https://neutron.example.com"
+	cp.Spec.Services.Neutron.Namespace = nil
+
+	_, err := w.ValidateCreate(context.Background(), cp)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("spec.services.neutron.namespace"))
+	g.Expect(err.Error()).To(ContainSubstring("a placed service needs a namespace of its own"))
+}
+
+// TestValidateCreate_RejectsPlacedNeutronUnpublished pins the reachability rule
+// for the network catalog entry: what the ControlPlane registers for an
+// unpublished service is its in-cluster Service DNS name, which resolves nowhere
+// outside the cluster the service runs on. Either publication satisfies it.
+func TestValidateCreate_RejectsPlacedNeutronUnpublished(t *testing.T) {
+	w := &ControlPlaneWebhook{}
+
+	t.Run("neither publicEndpoint nor gateway", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		_, err := w.ValidateCreate(context.Background(), placedNeutronControlPlane())
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("spec.services.neutron.publicEndpoint"))
+		g.Expect(err.Error()).To(ContainSubstring(
+			"one of publicEndpoint or gateway is required when targetClusterRef is set"))
+	})
+
+	t.Run("a publicEndpoint satisfies it", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := placedNeutronControlPlane()
+		cp.Spec.Services.Neutron.PublicEndpoint = "https://neutron.example.com"
+
+		_, err := w.ValidateCreate(context.Background(), cp)
+		g.Expect(err).NotTo(HaveOccurred())
+	})
+
+	t.Run("a gateway satisfies it", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := placedNeutronControlPlane()
+		cp.Spec.Services.Neutron.Gateway = placedGateway("neutron.example.com")
+
+		_, err := w.ValidateCreate(context.Background(), cp)
+		g.Expect(err).NotTo(HaveOccurred())
+	})
+}
+
+// The projected Neutron child is bounded far below the 253-byte object-name cap:
+// the Neutron CRD caps metadata.name at 40 characters, because the neutron
+// operator appends a suffix for the ovn-db-sync CronJob and Kubernetes caps
+// CronJob names at 52. Without this guard the ControlPlane admits and the
+// projection then fails to apply the child on every pass, with metadata.name
+// immutable, so recovery means recreating the whole control plane.
+func TestValidateCreate_RejectsOverlongProjectedNeutronChildName(t *testing.T) {
+	g := NewGomegaWithT(t)
+	w := &ControlPlaneWebhook{}
+	maxCPName := neutronv1alpha1.MaxNeutronNameLength - neutronChildNameOverhead
+
+	atLimit := neutronControlPlane()
+	atLimit.Name = strings.Repeat("c", maxCPName)
+	_, err := w.ValidateCreate(context.Background(), atLimit)
+	g.Expect(err).NotTo(HaveOccurred(),
+		"a name whose projected Neutron child still fits must be accepted")
+
+	tooLong := neutronControlPlane()
+	tooLong.Name = strings.Repeat("c", maxCPName+1)
+	_, err = w.ValidateCreate(context.Background(), tooLong)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("projected Neutron child CR name would be 41 characters"))
+	g.Expect(err.Error()).To(ContainSubstring("must be at most 32 characters"))
+
+	// Without services.neutron no Neutron child is projected, so the bound does
+	// not apply and the ControlPlane keeps the full 253-byte budget.
+	noNeutron := neutronControlPlane()
+	noNeutron.Name = strings.Repeat("c", maxCPName+1)
+	noNeutron.Spec.Services.Neutron = nil
+	_, err = w.ValidateCreate(context.Background(), noNeutron)
+	g.Expect(err).NotTo(HaveOccurred())
+}
+
+// Enabling Neutron on an existing over-long ControlPlane is the one update that
+// can newly violate the bound, so it is rejected; every other update on a CR
+// that already carried Neutron — including the finalizer removal that completes
+// its deletion — must still pass, because metadata.name is immutable and a
+// rejection would wedge it in Terminating.
+func TestValidateUpdate_ProjectedNeutronChildNameBoundIsNewlyEnabledOnly(t *testing.T) {
+	g := NewGomegaWithT(t)
+	w := &ControlPlaneWebhook{}
+	overlong := strings.Repeat("c", neutronv1alpha1.MaxNeutronNameLength-neutronChildNameOverhead+1)
+
+	withoutNeutron := neutronControlPlane()
+	withoutNeutron.Name = overlong
+	withoutNeutron.Spec.Services.Neutron = nil
+	enabling := neutronControlPlane()
+	enabling.Name = overlong
+
+	_, err := w.ValidateUpdate(context.Background(), withoutNeutron, enabling)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("projected Neutron child CR name would be"))
+
+	grandfathered := neutronControlPlane()
+	grandfathered.Name = overlong
+	grandfathered.Finalizers = []string{"c5c3.io/finalizer"}
+	deleting := grandfathered.DeepCopy()
+	deleting.Finalizers = nil
+
+	_, err = w.ValidateUpdate(context.Background(), grandfathered, deleting)
+	g.Expect(err).NotTo(HaveOccurred(),
+		"an over-long grandfathered ControlPlane must stay updatable, or its deletion never completes")
+}
+
+// The OVNCentral reach check is a newly-enabled-or-moved rule for the same reason
+// the child-name bound above is: it can reject a CR a previous operator build
+// admitted, and the finalizer-removal update that completes a deletion is an
+// update like any other. A grandfathered plane that stays rejectable can never be
+// deleted — the webhook is registered for UPDATE with failurePolicy: Fail, so the
+// operator's own finalizer removal is refused and the CR hangs in Terminating.
+func TestValidateUpdate_NeutronOVNCentralReachCheckIsNewlyEnabledOrMovedOnly(t *testing.T) {
+	w := &ControlPlaneWebhook{}
+	// A ControlPlane admitted before the reach rule existed, carrying a central in
+	// a namespace it neither owns nor claims.
+	grandfathered := func() *ControlPlane {
+		cp := neutronControlPlane()
+		cp.Namespace = "openstack"
+		cp.Spec.Services.Neutron.OVN.CentralRef.Namespace = "other-tenant"
+		cp.Finalizers = []string{"c5c3.io/finalizer"}
+		return cp
+	}
+
+	t.Run("routine update on a grandfathered plane", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		oldCP := grandfathered()
+		newCP := oldCP.DeepCopy()
+		newCP.Annotations = map[string]string{"c5c3.io/allow-neutron-deletion": "false"}
+
+		_, err := w.ValidateUpdate(context.Background(), oldCP, newCP)
+		g.Expect(err).NotTo(HaveOccurred(),
+			"an unrelated update must not be rejected by a rule the CR already violated")
+	})
+
+	t.Run("finalizer removal on a grandfathered plane", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		oldCP := grandfathered()
+		deleting := oldCP.DeepCopy()
+		deleting.Finalizers = nil
+
+		_, err := w.ValidateUpdate(context.Background(), oldCP, deleting)
+		g.Expect(err).NotTo(HaveOccurred(),
+			"rejecting the finalizer removal would wedge the ControlPlane in Terminating")
+	})
+
+	t.Run("the update that enables the network service", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		enabling := grandfathered()
+		withoutNeutron := enabling.DeepCopy()
+		withoutNeutron.Spec.Services.Neutron = nil
+
+		_, err := w.ValidateUpdate(context.Background(), withoutNeutron, enabling)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("spec.services.neutron.ovn.centralRef.namespace"))
+		g.Expect(err.Error()).To(ContainSubstring(
+			`namespace "other-tenant" is neither this ControlPlane's own nor one it claims`))
+	})
+
+	t.Run("the update that moves the ref", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		oldCP := neutronControlPlane()
+		oldCP.Namespace = "openstack"
+		oldCP.Spec.Services.Neutron.OVN.CentralRef.Namespace = "openstack"
+		newCP := oldCP.DeepCopy()
+		newCP.Spec.Services.Neutron.OVN.CentralRef.Namespace = "other-tenant"
+
+		_, err := w.ValidateUpdate(context.Background(), oldCP, newCP)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("spec.services.neutron.ovn.centralRef.namespace"))
+	})
+}
+
+// TestValidateUpdate_RejectsNeutronNamespaceChange pins the create-only freeze on
+// the neutron namespace assignment.
+func TestValidateUpdate_RejectsNeutronNamespaceChange(t *testing.T) {
+	g := NewGomegaWithT(t)
+	w := &ControlPlaneWebhook{}
+	oldCP := neutronControlPlane()
+	oldCP.Namespace = "openstack"
+	oldCP.Spec.Services.Neutron.Namespace = &ServiceNamespaceSpec{
+		Name: "network", Lifecycle: ServiceNamespaceLifecycleManaged,
+	}
+	newCP := oldCP.DeepCopy()
+	newCP.Spec.Services.Neutron.Namespace.Name = "network-2"
+
+	_, err := w.ValidateUpdate(context.Background(), oldCP, newCP)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("spec.services.neutron.namespace.name"))
+	g.Expect(err.Error()).To(ContainSubstring("the namespace a service is placed in is immutable"))
+}
+
+// TestValidateUpdate_RejectsDroppingANeutronNamespaceAssignment pins that the
+// declared-before carve-out does not weaken the move freeze: a live Neutron
+// still cannot shed its namespace assignment, since everything scoped to that
+// namespace stays where it is.
+func TestValidateUpdate_RejectsDroppingANeutronNamespaceAssignment(t *testing.T) {
+	g := NewGomegaWithT(t)
+	w := &ControlPlaneWebhook{}
+	oldCP := neutronControlPlane()
+	oldCP.Namespace = "openstack"
+	oldCP.Spec.Services.Neutron.Namespace = &ServiceNamespaceSpec{
+		Name: "network", Lifecycle: ServiceNamespaceLifecycleManaged,
+	}
+	newCP := oldCP.DeepCopy()
+	newCP.Spec.Services.Neutron.Namespace = nil
+
+	_, err := w.ValidateUpdate(context.Background(), oldCP, newCP)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("the namespace a service is placed in is immutable"))
+}
+
+// TestValidateUpdate_RejectsNeutronDedicatedPresenceFlip pins the transition
+// freeze on the neutron dedicated block: a live service cannot be moved between
+// shared and dedicated backing services.
+func TestValidateUpdate_RejectsNeutronDedicatedPresenceFlip(t *testing.T) {
+	g := NewGomegaWithT(t)
+	w := &ControlPlaneWebhook{}
+	oldCP := neutronControlPlane()
+	newCP := neutronControlPlane()
+	newCP.Spec.Services.Neutron.DedicatedBackingServices = &NeutronDedicatedBackingServicesSpec{
+		Cache: &commonv1.CacheSpec{
+			ClusterRef: &corev1.LocalObjectReference{Name: "cp-neutron-cache"},
+			Backend:    commonv1.DefaultCacheBackend,
+		},
+	}
+
+	_, err := w.ValidateUpdate(context.Background(), oldCP, newCP)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("switching a service between shared and dedicated backing services"))
+	g.Expect(err.Error()).To(ContainSubstring("neutron.dedicatedBackingServices"))
+}
+
+// TestValidateUpdate_RejectsNeutronTargetClusterChange pins the create-only
+// freeze on the neutron placement: re-pointing a live service strands its
+// workload, its database, and the material in its tenant store on the cluster it
+// came from.
+func TestValidateUpdate_RejectsNeutronTargetClusterChange(t *testing.T) {
+	g := NewGomegaWithT(t)
+	w := &ControlPlaneWebhook{}
+	oldCP := placedNeutronControlPlane()
+	oldCP.Spec.Services.Neutron.PublicEndpoint = "https://neutron.example.com"
+	newCP := oldCP.DeepCopy()
+	newCP.Spec.Services.Neutron.TargetClusterRef.Name = "core"
+
+	_, err := w.ValidateUpdate(context.Background(), oldCP, newCP)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("spec.services.neutron.targetClusterRef.name"))
+	g.Expect(err.Error()).To(ContainSubstring("targetClusterRef is immutable"))
+}
+
+// TestValidateUpdate_AcceptsAddingNeutronInADedicatedNamespace pins the
+// declared-before carve-out for the network service: assigning a namespace to a
+// service the ControlPlane did not declare before is that service's create, so
+// there is no live workload and no credential material stranded in an old
+// namespace for the move freeze to protect.
+func TestValidateUpdate_AcceptsAddingNeutronInADedicatedNamespace(t *testing.T) {
+	g := NewGomegaWithT(t)
+	w := &ControlPlaneWebhook{}
+	oldCP := neutronControlPlane()
+	oldCP.Namespace = "openstack"
+	oldCP.Spec.Services.Neutron = nil
+
+	newCP := oldCP.DeepCopy()
+	newCP.Spec.Services.Neutron = neutronControlPlane().Spec.Services.Neutron
+	newCP.Spec.Services.Neutron.Namespace = &ServiceNamespaceSpec{
+		Name: "network", Lifecycle: ServiceNamespaceLifecycleManaged,
+	}
+
+	_, err := w.ValidateUpdate(context.Background(), oldCP, newCP)
+	g.Expect(err).NotTo(HaveOccurred())
+}
+
+// TestValidateUpdate_NeutronDeclaredInStatusFreezesTheNamespace pins that the
+// carve-out keys on status.services too, not on the old spec alone: a Neutron
+// dropped from spec keeps its projected child until the operator observes the
+// drop, so re-adding it in a namespace of its own inside that window is the move
+// the freeze forbids.
+func TestValidateUpdate_NeutronDeclaredInStatusFreezesTheNamespace(t *testing.T) {
+	g := NewGomegaWithT(t)
+	w := &ControlPlaneWebhook{}
+	oldCP := neutronControlPlane()
+	oldCP.Namespace = "openstack"
+	oldCP.Spec.Services.Neutron = nil
+	oldCP.Status.Services = []ServiceStatus{
+		{Name: "keystone", Ready: true},
+		{Name: "neutron", Ready: true},
+	}
+
+	newCP := oldCP.DeepCopy()
+	newCP.Spec.Services.Neutron = neutronControlPlane().Spec.Services.Neutron
+	newCP.Spec.Services.Neutron.Namespace = &ServiceNamespaceSpec{
+		Name: "network", Lifecycle: ServiceNamespaceLifecycleManaged,
+	}
+
+	_, err := w.ValidateUpdate(context.Background(), oldCP, newCP)
+	g.Expect(err).To(HaveOccurred())
+	g.Expect(err.Error()).To(ContainSubstring("spec.services.neutron.namespace"))
+	g.Expect(err.Error()).To(ContainSubstring("the namespace a service is placed in is immutable"))
 }

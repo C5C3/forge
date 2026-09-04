@@ -29,6 +29,7 @@ import (
 	commonwebhook "github.com/c5c3/cobaltcore/internal/common/webhook"
 	barbicanv1alpha1 "github.com/c5c3/cobaltcore/operators/barbican/api/v1alpha1"
 	glancev1alpha1 "github.com/c5c3/cobaltcore/operators/glance/api/v1alpha1"
+	neutronv1alpha1 "github.com/c5c3/cobaltcore/operators/neutron/api/v1alpha1"
 )
 
 // ControlPlane defaulting constants. These are the single source of
@@ -102,6 +103,12 @@ const (
 	// DedicatedBarbicanCacheClusterRefSuffix names the Memcached CR of a
 	// dedicated Barbican cache.
 	DedicatedBarbicanCacheClusterRefSuffix = "-barbican-cache"
+	// DedicatedNeutronDatabaseClusterRefSuffix names the MariaDB CR of a
+	// dedicated Neutron database.
+	DedicatedNeutronDatabaseClusterRefSuffix = "-neutron-db" //nolint:gosec // G101 false positive: CR name suffix, not a credential
+	// DedicatedNeutronCacheClusterRefSuffix names the Memcached CR of a
+	// dedicated Neutron cache.
+	DedicatedNeutronCacheClusterRefSuffix = "-neutron-cache"
 	// DefaultDatabaseStorageSize is the effective per-replica MariaDB volume size
 	// when spec.infrastructure.database.storageSize is empty. It aliases
 	// commonv1.DatabaseStorageSizeDefault (also the CRD +kubebuilder:default and
@@ -487,6 +494,26 @@ const BarbicanServiceProjectName = "service-barbican"
 // and Kubernetes caps CronJob names at 52 characters.
 const barbicanChildNameOverhead = len("-barbican")
 
+// NeutronServiceAccountName is the OpenStack user name of the Keystone account
+// Neutron authenticates as, carried as spec.account.userName on the
+// KeystoneService child projected for Neutron, following the per-service
+// convention GlanceServiceAccountName describes.
+const NeutronServiceAccountName = "neutron"
+
+// NeutronServiceProjectName is the Keystone project the KeystoneService child
+// projected for Neutron creates and owns its service user in, following the
+// per-service convention GlanceServiceProjectName describes.
+const NeutronServiceProjectName = "service-neutron"
+
+// neutronChildNameOverhead is the fixed part of the projected Neutron child CR
+// name, "{cp}-neutron". Like its Glance and Barbican siblings the budget it eats
+// into is not the apiserver's 253-byte cap but the tighter one the Neutron CRD's
+// own admission applies to metadata.name (neutronv1alpha1.MaxNeutronNameLength,
+// 40): the neutron operator appends "-ovn-db-sync" for the OVN
+// database-synchronisation CronJob, and Kubernetes caps CronJob names at 52
+// characters.
+const neutronChildNameOverhead = len("-neutron")
+
 // validateGlanceChildName enforces that the Glance child this ControlPlane would
 // project carries a name the Glance CRD's own validating webhook admits.
 // Without it a longer ControlPlane admits cleanly and reconcileGlance then fails
@@ -579,6 +606,35 @@ func validateBarbicanChildName(cp *ControlPlane) field.ErrorList {
 			"ControlPlane name must be at most %d characters when spec.services.barbican is set",
 		n, barbicanv1alpha1.MaxBarbicanNameLength, barbicanv1alpha1.MaxCronJobNameLength,
 		barbicanv1alpha1.MaxBarbicanNameLength-barbicanChildNameOverhead,
+	))}
+}
+
+// validateNeutronChildName enforces that the Neutron child this ControlPlane
+// would project carries a name the Neutron CRD's own validating webhook admits.
+// Without it a longer ControlPlane admits cleanly and the Neutron projection
+// then fails to apply the child on every pass: NeutronReady never goes True,
+// the ControlPlane never reaches Ready, and metadata.name is immutable, so the
+// only recovery is deleting and recreating the whole control plane.
+//
+// It is a create-and-newly-enabled rule rather than part of validateNeutron,
+// which every update re-runs, for the same reason as its Glance, Placement and
+// Barbican siblings: the ControlPlane name is immutable, so on a routine update
+// the rule could only ever fire against a CR a pre-upgrade operator already
+// admitted, including the finalizer-removal update that completes its deletion.
+func validateNeutronChildName(cp *ControlPlane) field.ErrorList {
+	if cp.Spec.Services.Neutron == nil {
+		return nil
+	}
+	n := len(cp.Name) + neutronChildNameOverhead
+	if n <= neutronv1alpha1.MaxNeutronNameLength {
+		return nil
+	}
+	return field.ErrorList{field.Invalid(field.NewPath("metadata", "name"), cp.Name, fmt.Sprintf(
+		"the projected Neutron child CR name would be %d characters; the Neutron CRD caps metadata.name at %d "+
+			"(its ovn-db-sync CronJob appends a suffix, and Kubernetes caps CronJob names at %d characters), so the "+
+			"ControlPlane name must be at most %d characters when spec.services.neutron is set",
+		n, neutronv1alpha1.MaxNeutronNameLength, neutronv1alpha1.MaxCronJobNameLength,
+		neutronv1alpha1.MaxNeutronNameLength-neutronChildNameOverhead,
 	))}
 }
 
@@ -762,7 +818,8 @@ func insecurePublicEndpointWarnings(cp *ControlPlane) admission.Warnings {
 	warnings := warnInsecureHorizonPublicEndpoint(cp)
 	warnings = append(warnings, warnInsecureGlancePublicEndpoint(cp)...)
 	warnings = append(warnings, warnInsecurePlacementPublicEndpoint(cp)...)
-	return append(warnings, warnInsecureBarbicanPublicEndpoint(cp)...)
+	warnings = append(warnings, warnInsecureBarbicanPublicEndpoint(cp)...)
+	return append(warnings, warnInsecureNeutronPublicEndpoint(cp)...)
 }
 
 // glanceImportFilteringWarnings surfaces the two admissible-but-misleading
@@ -1179,6 +1236,251 @@ func warnDevelopmentBarbicanSecretStore(cp *ControlPlane) admission.Warnings {
 	}
 }
 
+// validateNeutron enforces the rules on the services.neutron block. It mirrors
+// the declarative constraints as defense-in-depth for callers that bypass CRD
+// schema admission (the gateway hostname shape, the image tag/digest XOR, and
+// the name of the OVNCentral reference) and adds the rules the CRD schema cannot
+// express: the public endpoint's origin shape and its agreement with the gateway
+// (validateNeutronPublicEndpoint) and the shared message bus the projected child
+// cannot come up without.
+//
+// The projected-child-name bound lives in validateNeutronChildName and the
+// OVNCentral reach check in ValidateNeutronOVNCentralNamespace, neither of which
+// runs on every update.
+//
+// The cross-field rule that services.neutron is forbidden in External mode lives
+// in validateKeystoneMode with the rest of the External-mode matrix; the
+// extraConfig rules live in the two extraConfig admission families, which walk
+// every declared service block at once.
+func validateNeutron(cp *ControlPlane) field.ErrorList {
+	nn := cp.Spec.Services.Neutron
+	if nn == nil {
+		return nil
+	}
+	var allErrs field.ErrorList
+	nnPath := field.NewPath("spec", "services", "neutron")
+
+	// When a gateway is configured, its hostname must be set and usable as the
+	// host of the derived public endpoint. Mirrors the MinLength=1 marker on
+	// commonv1.GatewaySpec.Hostname.
+	if g := nn.Gateway; g != nil {
+		hostnamePath := nnPath.Child("gateway", "hostname")
+		if g.Hostname == "" {
+			allErrs = append(allErrs, field.Required(hostnamePath,
+				"must be set when a gateway is configured"))
+		} else if err := validateGatewayHostname(hostnamePath, g.Hostname); err != nil {
+			allErrs = append(allErrs, err)
+		}
+	}
+
+	// When the Neutron image is overridden, mirror the ImageSpec tag/digest XOR
+	// (the +kubebuilder:validation:XValidation rule on commonv1.ImageSpec).
+	if img := nn.Image; img != nil && (img.Tag != "") == (img.Digest != "") {
+		allErrs = append(allErrs, field.Invalid(nnPath.Child("image"), img,
+			"exactly one of image.tag or image.digest must be set"))
+	}
+
+	allErrs = append(allErrs, validateNeutronPublicEndpoint(nnPath, nn)...)
+
+	// The OVNCentral reference, mirroring the MinLength marker on its name and the
+	// RFC-1123 Pattern marker on its namespace as defense-in-depth. The ML2/OVN
+	// mechanism driver writes every network, subnet and port into that central's
+	// Northbound database, so a reference naming nothing leaves the child with no
+	// database to program.
+	if nn.OVN.CentralRef.Name == "" {
+		allErrs = append(allErrs, field.Required(nnPath.Child("ovn", "centralRef", "name"),
+			"must be set: it names the OVNCentral the projected Neutron programs"))
+	}
+
+	// The bus is not optional for this service. The Neutron CRD requires
+	// spec.messaging, and the ControlPlane derives the child's transport URL from
+	// spec.infrastructure.messaging, so a ControlPlane declaring the network
+	// service without one would project a child its own admission rejects on every
+	// pass. A nil infrastructure block is reported by validateKeystoneMode already
+	// (it is required outside External mode, and External mode forbids
+	// services.neutron outright), so this arm stays silent there rather than
+	// naming the same missing block twice.
+	if cp.Spec.Infrastructure != nil && cp.Spec.Infrastructure.Messaging == nil {
+		allErrs = append(allErrs, field.Required(field.NewPath("spec", "infrastructure", "messaging"),
+			"is required when services.neutron is set: the Neutron CRD requires spec.messaging, and the "+
+				"ControlPlane derives the child's transport URL from the shared bus"))
+	}
+
+	return allErrs
+}
+
+// claimedServiceNamespace returns the namespace assignment cp claims under the
+// given name, or nil when this ControlPlane claims no namespace of that name.
+// The ControlPlane's own namespace is not a claim: DedicatedServiceNamespaces
+// enumerates the namespaces OUTSIDE it.
+func claimedServiceNamespace(cp *ControlPlane, name string) *ServiceNamespaceSpec {
+	claims := cp.DedicatedServiceNamespaces()
+	for i := range claims {
+		if claims[i].Name == name {
+			return &claims[i]
+		}
+	}
+	return nil
+}
+
+// ValidateNeutronOVNCentralNamespace enforces which namespaces
+// services.neutron.ovn.centralRef may reach. It is the ONE pointer on the
+// ControlPlane that addresses material in another namespace — the infrastructure
+// clusterRefs and every secretRef are namespace-less and resolve in the
+// ControlPlane's own — so this field alone decides whose OVN control plane a
+// plane can attach itself to.
+//
+//   - The RFC-1123 label shape, as defense-in-depth alongside the Pattern marker.
+//   - The namespace must be one this ControlPlane already reaches: its own, or
+//     one it claims through a services.<service>.namespace assignment. Naming a
+//     foreign central is not a read-only act. The neutron-operator mirrors that
+//     central's client Secret out of its namespace into the Neutron's, which
+//     hands this plane a full mTLS identity for another plane's Northbound and
+//     Southbound databases — its networks, ports and security groups, readable
+//     and writable — and OVNReady relays the central's database addresses and
+//     status message on the way. It is the same isolation validateNamespaceClaims
+//     enforces for service namespaces, one field over.
+//   - A claimed namespace whose lifecycle is Managed is refused from the other
+//     direction: the teardown deletes such a namespace together with the plane,
+//     and the cascade would take the referenced central, and the logical network
+//     model its databases hold, with it. An External claim is the one this
+//     ControlPlane never deletes.
+//
+// It runs on CREATE and on the two UPDATEs that can newly violate it — the one
+// that enables the network service and the one that moves the ref — and NOT on
+// every update, for the reason validateNeutronChildName gives one rule over: an
+// unconditional rule can only ever reject a CR a previous operator build already
+// admitted, and one of those rejections lands on the finalizer-removal update
+// that completes a deletion, wedging the ControlPlane in Terminating with no
+// recovery but stripping the finalizer by hand.
+//
+// Admission is not the only enforcement point. A CR can reach etcd without ever
+// passing through here — an unregistered webhook during install, a GitOps or
+// etcd restore replaying stored objects — so reconcileOVN re-runs this same
+// check before it reads the central, the backstop keystoneServiceNamespaceAllowed
+// is for the sibling cross-namespace trust decision.
+//
+// It is exported for that controller-side caller. Its path is fixed rather than
+// passed in, so both callers report the same field.
+func ValidateNeutronOVNCentralNamespace(cp *ControlPlane) field.ErrorList {
+	if cp.Spec.Services.Neutron == nil {
+		return nil
+	}
+	// An empty namespace is the ControlPlane's own: the defaulting webhook fills
+	// it in, and NeutronOVNCentralNamespace resolves an unset value the same way.
+	ns := cp.Spec.Services.Neutron.OVN.CentralRef.Namespace
+	if ns == "" || ns == cp.Namespace {
+		return nil
+	}
+	nsPath := field.NewPath("spec", "services", "neutron", "ovn", "centralRef", "namespace")
+	if !namespaceNamePattern.MatchString(ns) {
+		return field.ErrorList{field.Invalid(nsPath, ns,
+			"must be a lowercase alphanumeric RFC-1123 label (it names a Kubernetes namespace)")}
+	}
+	switch claim := claimedServiceNamespace(cp, ns); {
+	case claim == nil:
+		return field.ErrorList{field.Forbidden(nsPath, fmt.Sprintf(
+			"namespace %q is neither this ControlPlane's own nor one it claims through a "+
+				"services.<service>.namespace assignment: consuming an OVNCentral from a foreign namespace "+
+				"mirrors that central's client certificate into this ControlPlane's, which is a full mTLS "+
+				"identity for its Northbound and Southbound databases", ns))}
+	case claim.Lifecycle != ServiceNamespaceLifecycleExternal:
+		return field.ErrorList{field.Forbidden(nsPath, fmt.Sprintf(
+			"namespace %q is claimed by this ControlPlane with lifecycle Managed, so the teardown deletes it "+
+				"together with the plane and the cascade would take the referenced OVNCentral, and the logical "+
+				"network model in its databases, with it: give that assignment lifecycle External, or put the "+
+				"central in the ControlPlane's own namespace", ns))}
+	}
+	return nil
+}
+
+// validateNeutronPublicEndpoint enforces the rules on
+// services.neutron.publicEndpoint that the CRD markers cannot express. The value
+// is advertised VERBATIM as the K-ORC public network catalog Endpoint: the URL
+// every client resolves to create its networks, subnets and ports, and sends its
+// scoped Keystone token (X-Auth-Token) to. Unlike the keystone override it is
+// projected into no child CR, so no downstream webhook re-checks it: whatever
+// admission accepts here is what lands in the Keystone catalog.
+//
+//   - Shape, as defense-in-depth alongside the ^https?:// Pattern marker:
+//     "https://" alone matches the pattern and stays under the 512-byte cap, yet
+//     registers a hostless URL no client can resolve.
+//   - A bare origin, with no path, query or fragment. The Pattern marker anchors
+//     only the prefix, so "https://neutron.example.com?utm=1" is schema-legal;
+//     the Neutron API is served at the root and clients append the API path to
+//     the catalog URL, yielding "https://neutron.example.com?utm=1/v2.0/networks"
+//     and a 404 on every network call. A single trailing slash is tolerated:
+//     OpenStack clients normalize the catalog endpoint before appending.
+//   - With a gateway configured the listener terminates TLS, so the externally
+//     observed scheme is https, the same rule the Glance public endpoint applies.
+//     An http endpoint is also a token leak: the scoped Keystone token rides
+//     every network call, and a compute service creates a port for every instance
+//     it boots.
+//   - With a gateway configured the host must equal gateway.hostname. The
+//     Gateway listener is what routes that hostname to the Neutron Service, so a
+//     divergent host advertises an endpoint that never reaches the API, failing
+//     client-side with no status condition and no admission error naming the
+//     cause. The port may still differ: Gateway API hostnames carry none, so an
+//     API published off 443 has to spell the port out here.
+func validateNeutronPublicEndpoint(nnPath *field.Path, nn *ServiceNeutronSpec) field.ErrorList {
+	if nn.PublicEndpoint == "" {
+		return nil
+	}
+	pePath := nnPath.Child("publicEndpoint")
+	u, err := validateHTTPURL(pePath, nn.PublicEndpoint)
+	if err != nil {
+		return field.ErrorList{err}
+	}
+
+	var errs field.ErrorList
+	if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
+		errs = append(errs, field.Invalid(pePath, nn.PublicEndpoint,
+			"must be a bare origin (scheme://host[:port]) with no path, query, or fragment: the Neutron API is "+
+				"served at the root and clients append the API path to the catalog endpoint"))
+	}
+
+	g := nn.Gateway
+	if g == nil || g.Hostname == "" {
+		return errs
+	}
+
+	if u.Scheme != "https" {
+		errs = append(errs, field.Invalid(pePath, nn.PublicEndpoint,
+			"scheme must be https when services.neutron.gateway is configured (the Gateway listener terminates "+
+				"TLS): every network call sends the caller's scoped Keystone token to this endpoint"))
+	}
+	if u.Hostname() != g.Hostname {
+		errs = append(errs, field.Invalid(pePath, nn.PublicEndpoint,
+			fmt.Sprintf("host %q must equal services.neutron.gateway.hostname %q: the Gateway listener routes that "+
+				"hostname to the Neutron API, so the catalog would direct clients to a host that never reaches it",
+				u.Hostname(), g.Hostname)))
+	}
+	return errs
+}
+
+// warnInsecureNeutronPublicEndpoint surfaces a cleartext network endpoint that
+// validateNeutronPublicEndpoint cannot reject: without a gateway Neutron is
+// published by some other means, and a plain-http endpoint is a legal, if
+// unwise, development setup that the ^https?:// CRD Pattern deliberately allows.
+// The downgrade must never be silent, though: every network call carries the
+// caller's scoped Keystone token to this URL, and that bearer token grants the
+// caller's full API privileges, not just network access.
+func warnInsecureNeutronPublicEndpoint(cp *ControlPlane) admission.Warnings {
+	nn := cp.Spec.Services.Neutron
+	if nn == nil || nn.PublicEndpoint == "" {
+		return nil
+	}
+	if u, err := url.Parse(nn.PublicEndpoint); err != nil || u.Scheme != "http" {
+		return nil
+	}
+	return admission.Warnings{fmt.Sprintf(
+		"spec.services.neutron.publicEndpoint %q uses http://: it is advertised as the public network catalog "+
+			"endpoint, so every network call would deliver the caller's scoped Keystone token in cleartext. "+
+			"Use https://.",
+		nn.PublicEndpoint,
+	)}
+}
+
 // externalAuthURLIsPlaintext reports whether raw is an http:// (non-TLS) endpoint.
 // A parse failure reads as false: validateHTTPURL already rejects those on the same
 // field, and a second error on it would only add noise.
@@ -1306,7 +1608,7 @@ func (w *ControlPlaneWebhook) Default(_ context.Context, obj *ControlPlane) erro
 	// +kubebuilder:default=Managed marker on ServiceNamespaceSpec.Lifecycle.
 	for _, ns := range []*ServiceNamespaceSpec{
 		keystoneNamespaceBlock(obj), horizonNamespaceBlock(obj), glanceNamespaceBlock(obj),
-		placementNamespaceBlock(obj), barbicanNamespaceBlock(obj),
+		placementNamespaceBlock(obj), barbicanNamespaceBlock(obj), neutronNamespaceBlock(obj),
 	} {
 		if ns != nil && ns.Lifecycle == "" {
 			ns.Lifecycle = ServiceNamespaceLifecycleManaged
@@ -1440,6 +1742,31 @@ func (w *ControlPlaneWebhook) Default(_ context.Context, obj *ControlPlane) erro
 				defaultCacheLeaves(cache, obj.Name+DedicatedBarbicanCacheClusterRefSuffix)
 			}
 		}
+		if nn := neutronDedicatedBlock(obj); nn != nil {
+			if db := nn.Database; db != nil {
+				defaultDatabaseLeaves(db, obj.Name+DedicatedNeutronDatabaseClusterRefSuffix)
+				// A dedicated MANAGED Neutron database is Static-only for the same
+				// reason the Keystone one is (see above): no per-instance OpenBao
+				// engine role exists. Materialize the mode; validate() rejects Dynamic.
+				if db.ClusterRef != nil && db.CredentialsMode == "" {
+					db.CredentialsMode = commonv1.CredentialsModeStatic
+				}
+			}
+			if cache := nn.Cache; cache != nil {
+				defaultCacheLeaves(cache, obj.Name+DedicatedNeutronCacheClusterRefSuffix)
+			}
+		}
+
+		// The OVNCentral the network service programs defaults to the
+		// ControlPlane's own namespace, so a CR that names a central without
+		// spelling its namespace out states the namespace the reconciler resolves
+		// anyway: NeutronOVNCentralNamespace() reads an empty value as the
+		// ControlPlane's namespace too, which keeps a CR that bypassed this webhook
+		// on the same central as one that did not. A nil neutron block is left
+		// untouched, like every other opt-in above.
+		if nn := obj.Spec.Services.Neutron; nn != nil && nn.OVN.CentralRef.Namespace == "" {
+			nn.OVN.CentralRef.Namespace = obj.Namespace
+		}
 	}
 
 	// K-ORC admin-credential defaults. cloudCredentialsRef.secretName defaults to
@@ -1523,6 +1850,8 @@ func (w *ControlPlaneWebhook) ValidateCreate(ctx context.Context, obj *ControlPl
 	allErrs = append(allErrs, validateGlanceChildName(obj)...)
 	allErrs = append(allErrs, validatePlacementChildName(obj)...)
 	allErrs = append(allErrs, validateBarbicanChildName(obj)...)
+	allErrs = append(allErrs, validateNeutronChildName(obj)...)
+	allErrs = append(allErrs, ValidateNeutronOVNCentralNamespace(obj)...)
 	if err := newInvalidIfErrs(obj, allErrs); err != nil {
 		return warnings, err
 	}
@@ -1588,6 +1917,25 @@ func (w *ControlPlaneWebhook) ValidateUpdate(ctx context.Context, oldObj, newObj
 	}
 	if oldObj.Spec.Services.Barbican == nil {
 		allErrs = append(allErrs, validateBarbicanChildName(newObj)...)
+	}
+	if oldObj.Spec.Services.Neutron == nil {
+		allErrs = append(allErrs, validateNeutronChildName(newObj)...)
+	}
+
+	// The OVNCentral reach check re-runs only when this update is what enables the
+	// network service or moves the ref, the two updates that can newly violate it.
+	// The claim set the reach is measured against cannot shrink — dropping a
+	// service's namespace assignment, block and all, is refused by
+	// validateServiceNamespacesImmutable — so on any other update the check could
+	// only reject a CR a previous operator build already admitted, including the
+	// finalizer-removal update that completes a deletion. failurePolicy: Fail would
+	// then reject that removal on every attempt and leave the CR in Terminating
+	// with no recovery but stripping the finalizer by hand. The CRs this gate
+	// deliberately lets through are covered by the controller-side backstop in
+	// reconcileOVN (see ValidateNeutronOVNCentralNamespace).
+	if oldObj.Spec.Services.Neutron == nil ||
+		oldObj.NeutronOVNCentralNamespace() != newObj.NeutronOVNCentralNamespace() {
+		allErrs = append(allErrs, ValidateNeutronOVNCentralNamespace(newObj)...)
 	}
 
 	if err := newInvalidIfErrs(newObj, allErrs); err != nil {
@@ -1807,6 +2155,7 @@ func (w *ControlPlaneWebhook) validate(cp *ControlPlane) field.ErrorList {
 	allErrs = append(allErrs, validateGlance(cp)...)
 	allErrs = append(allErrs, validatePlacement(cp)...)
 	allErrs = append(allErrs, validateBarbican(cp)...)
+	allErrs = append(allErrs, validateNeutron(cp)...)
 	allErrs = append(allErrs, validateKeystoneMode(cp)...)
 	allErrs = append(allErrs, validateServiceRegistrations(cp)...)
 	allErrs = append(allErrs, validateDedicatedBackingServices(cp)...)
@@ -1849,6 +2198,9 @@ func declaredServiceNamespaces(cp *ControlPlane) []serviceNamespaceAssignment {
 	}
 	if ns := barbicanNamespaceBlock(cp); ns != nil {
 		out = append(out, serviceNamespaceAssignment{path: svcPath.Child("barbican", "namespace"), ns: ns})
+	}
+	if ns := neutronNamespaceBlock(cp); ns != nil {
+		out = append(out, serviceNamespaceAssignment{path: svcPath.Child("neutron", "namespace"), ns: ns})
 	}
 	return out
 }
@@ -1976,6 +2328,12 @@ func declaredServiceTargetClusters(cp *ControlPlane) []serviceTargetClusterAssig
 		out = append(out, serviceTargetClusterAssignment{
 			path: svcPath.Child("barbican"), ref: bn.TargetClusterRef, ns: bn.Namespace,
 			catalog: true, published: bn.PublicEndpoint != "" || bn.Gateway != nil,
+		})
+	}
+	if nn := cp.Spec.Services.Neutron; nn != nil {
+		out = append(out, serviceTargetClusterAssignment{
+			path: svcPath.Child("neutron"), ref: nn.TargetClusterRef, ns: nn.Namespace,
+			catalog: true, published: nn.PublicEndpoint != "" || nn.Gateway != nil,
 		})
 	}
 	return out
@@ -2314,6 +2672,13 @@ func declaredDedicatedBackingServices(cp *ControlPlane) []dedicatedBackingServic
 			cache: bn.Cache,
 		})
 	}
+	if nn := neutronDedicatedBlock(cp); nn != nil {
+		out = append(out, dedicatedBackingServices{
+			path:  svcPath.Child("neutron", "dedicatedBackingServices"),
+			db:    nn.Database,
+			cache: nn.Cache,
+		})
+	}
 	return out
 }
 
@@ -2422,16 +2787,16 @@ func validateDedicatedBackingServices(cp *ControlPlane) field.ErrorList {
 // A Static override is always admitted, and an empty override (inherit) is a no-op.
 // The External-mode forbid on services.keystone.databaseCredentialsMode lives in
 // validateKeystoneMode with the rest of the External-mode matrix (glance,
-// placement, and barbican are forbidden entirely in External mode, so they need
-// no such rule).
+// placement, barbican, and neutron are forbidden entirely in External mode, so
+// they need no such rule).
 func validateServiceCredentialsModeOverrides(cp *ControlPlane) field.ErrorList {
 	var allErrs field.ErrorList
 	svcPath := field.NewPath("spec", "services")
 
 	// The shared database is managed exactly when it names a clusterRef. A nil
 	// infrastructure block (only reachable in External mode, which forbids the
-	// keystone override via CEL and forbids glance, placement, and barbican
-	// entirely) counts as not managed.
+	// keystone override via CEL and forbids glance, placement, barbican, and
+	// neutron entirely) counts as not managed.
 	sharedManaged := cp.Spec.Infrastructure != nil && cp.Spec.Infrastructure.Database.ClusterRef != nil
 
 	check := func(svc string, mode string, dedicatedDB *commonv1.DatabaseSpec) {
@@ -2464,6 +2829,9 @@ func validateServiceCredentialsModeOverrides(cp *ControlPlane) field.ErrorList {
 	}
 	if bn := cp.Spec.Services.Barbican; bn != nil {
 		check("barbican", bn.DatabaseCredentialsMode, cp.DedicatedBarbicanDatabase())
+	}
+	if nn := cp.Spec.Services.Neutron; nn != nil {
+		check("neutron", nn.DatabaseCredentialsMode, cp.DedicatedNeutronDatabase())
 	}
 
 	return allErrs
@@ -2627,6 +2995,10 @@ func validateKeystoneMode(cp *ControlPlane) field.ErrorList {
 		if cp.Spec.Services.Barbican != nil {
 			allErrs = append(allErrs, field.Forbidden(specPath.Child("services", "barbican"),
 				"forbidden when services.keystone.mode is External (Barbican needs its own External-mode design)"))
+		}
+		if cp.Spec.Services.Neutron != nil {
+			allErrs = append(allErrs, field.Forbidden(specPath.Child("services", "neutron"),
+				"forbidden when services.keystone.mode is External (Neutron needs its own External-mode design)"))
 		}
 
 		return allErrs
@@ -3155,6 +3527,18 @@ func validateDedicatedBackingServicesImmutable(oldObj, newObj *ControlPlane) fie
 		}
 	}
 
+	if serviceDeclaredBefore(oldObj, oldObj.Spec.Services.Neutron != nil, "neutron") {
+		nnPath := svcPath.Child("neutron", "dedicatedBackingServices")
+		oldNN := neutronDedicatedBlock(oldObj)
+		newNN := neutronDedicatedBlock(newObj)
+		if (oldNN == nil) != (newNN == nil) {
+			allErrs = append(allErrs, field.Invalid(nnPath, newNN, dedicatedTransitionMessage))
+		} else if oldNN != nil && newNN != nil {
+			allErrs = append(allErrs, validateDedicatedDatabase(nnPath.Child("database"), oldNN.Database, newNN.Database)...)
+			allErrs = append(allErrs, validateDedicatedCache(nnPath.Child("cache"), oldNN.Cache, newNN.Cache)...)
+		}
+	}
+
 	return allErrs
 }
 
@@ -3261,6 +3645,9 @@ func validateServiceNamespacesImmutable(oldObj, newObj *ControlPlane) field.Erro
 	freeze(svcPath.Child("barbican", "namespace"),
 		serviceDeclaredBefore(oldObj, oldObj.Spec.Services.Barbican != nil, "barbican"),
 		barbicanNamespaceBlock(oldObj), barbicanNamespaceBlock(newObj))
+	freeze(svcPath.Child("neutron", "namespace"),
+		serviceDeclaredBefore(oldObj, oldObj.Spec.Services.Neutron != nil, "neutron"),
+		neutronNamespaceBlock(oldObj), neutronNamespaceBlock(newObj))
 
 	return allErrs
 }
@@ -3313,6 +3700,9 @@ func validateServiceTargetClustersImmutable(oldObj, newObj *ControlPlane) field.
 	freeze(svcPath.Child("barbican", "targetClusterRef"),
 		serviceDeclaredBefore(oldObj, oldObj.Spec.Services.Barbican != nil, "barbican"),
 		oldObj.BarbicanTargetClusterRef(), newObj.BarbicanTargetClusterRef())
+	freeze(svcPath.Child("neutron", "targetClusterRef"),
+		serviceDeclaredBefore(oldObj, oldObj.Spec.Services.Neutron != nil, "neutron"),
+		oldObj.NeutronTargetClusterRef(), newObj.NeutronTargetClusterRef())
 
 	return allErrs
 }

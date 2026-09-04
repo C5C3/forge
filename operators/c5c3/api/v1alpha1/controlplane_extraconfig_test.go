@@ -5,6 +5,7 @@
 package v1alpha1
 
 import (
+	"context"
 	"testing"
 
 	. "github.com/onsi/gomega"
@@ -277,6 +278,157 @@ func TestControlPlaneExtraConfigCatalogInputsChanged_Barbican(t *testing.T) {
 			newCP: func() *ControlPlane {
 				cp := barbicanControlPlane()
 				cp.Spec.Services.Barbican.Replicas = ptr.To(int32(5))
+				return cp
+			}(),
+			expected: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := NewGomegaWithT(t)
+			g.Expect(controlPlaneExtraConfigCatalogInputsChanged(tc.oldCP, tc.newCP)).To(Equal(tc.expected))
+		})
+	}
+}
+
+// TestValidateCreate_RejectsUnknownNeutronExtraConfigOption pins the neutron
+// catalog leg from both sides: a per-service override the catalog does not
+// accept, and the cross-service reach of globalExtraConfig, which is validated
+// against the catalog of every declared service.
+func TestValidateCreate_RejectsUnknownNeutronExtraConfigOption(t *testing.T) {
+	w := &ControlPlaneWebhook{}
+
+	t.Run("in neutron extraConfig", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := neutronControlPlane()
+		cp.Spec.Services.Neutron.ExtraConfig = map[string]map[string]string{
+			"ovn": {"ovn_l3_schedulerz": "leastloaded"},
+		}
+
+		_, err := w.ValidateCreate(context.Background(), cp)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("spec.services.neutron.extraConfig[ovn][ovn_l3_schedulerz]"))
+		g.Expect(err.Error()).To(ContainSubstring("no such option in the neutron 2025.2 option catalog"))
+	})
+
+	t.Run("in globalExtraConfig", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := neutronControlPlane()
+		cp.Spec.GlobalExtraConfig = map[string]map[string]string{
+			"ml2": {"mechanism_driverz": "ovn"},
+		}
+
+		_, err := w.ValidateCreate(context.Background(), cp)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("spec.globalExtraConfig[ml2][mechanism_driverz]"))
+		g.Expect(err.Error()).To(ContainSubstring("no such option in the neutron 2025.2 option catalog"))
+	})
+}
+
+// TestValidateCreate_ForbidsNeutronRejectedOwnedKey pins a Rejected neutron
+// owned key from whichever block carries it. [ovn] ovn_nb_connection is the one
+// to guard: the merged block has the last word, so honoring it points the
+// ML2/OVN mechanism driver at a Northbound database the ControlPlane does not
+// own, and every network, subnet and port lands in a logical model belonging to
+// another deployment.
+func TestValidateCreate_ForbidsNeutronRejectedOwnedKey(t *testing.T) {
+	w := &ControlPlaneWebhook{}
+
+	t.Run("in neutron extraConfig", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := neutronControlPlane()
+		cp.Spec.Services.Neutron.ExtraConfig = map[string]map[string]string{
+			"ovn": {"ovn_nb_connection": "tcp:10.0.0.1:6641"},
+		}
+
+		_, err := w.ValidateCreate(context.Background(), cp)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("spec.services.neutron.extraConfig[ovn][ovn_nb_connection]"))
+		g.Expect(err.Error()).To(ContainSubstring(
+			"ovn_nb_connection is managed via spec.ovn.centralRef and must not be set in extraConfig"))
+	})
+
+	t.Run("in globalExtraConfig", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+		cp := neutronControlPlane()
+		cp.Spec.GlobalExtraConfig = map[string]map[string]string{
+			"ovn": {"ovn_nb_connection": "tcp:10.0.0.1:6641"},
+		}
+
+		_, err := w.ValidateCreate(context.Background(), cp)
+		g.Expect(err).To(HaveOccurred())
+		g.Expect(err.Error()).To(ContainSubstring("spec.globalExtraConfig[ovn][ovn_nb_connection]"))
+		g.Expect(err.Error()).To(ContainSubstring("must not be set in extraConfig"))
+	})
+}
+
+// TestValidateCreate_AcceptsEmptyNeutronExtraConfig pins that a declared but
+// empty block is admitted and raises nothing: the merge normalizes it to nil, so
+// there is no config to scan and no catalog to fail open on.
+func TestValidateCreate_AcceptsEmptyNeutronExtraConfig(t *testing.T) {
+	w := &ControlPlaneWebhook{}
+
+	for name, cfg := range map[string]map[string]map[string]string{
+		"an empty map": {},
+		"nil":          nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := NewGomegaWithT(t)
+			cp := neutronControlPlane()
+			cp.Spec.Services.Neutron.ExtraConfig = cfg
+
+			warnings, err := w.ValidateCreate(context.Background(), cp)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(warnings).To(BeEmpty())
+		})
+	}
+}
+
+// TestControlPlaneExtraConfigCatalogInputsChanged_Neutron pins the update gate
+// for the neutron leg: the catalog family re-runs when the neutron block is
+// added, dropped, or edited, and stays gated off for an update that leaves it
+// alone.
+func TestControlPlaneExtraConfigCatalogInputsChanged_Neutron(t *testing.T) {
+	withoutNeutron := func() *ControlPlane {
+		cp := neutronControlPlane()
+		cp.Spec.Services.Neutron = nil
+		return cp
+	}
+	withExtraConfig := func(cfg map[string]map[string]string) *ControlPlane {
+		cp := neutronControlPlane()
+		cp.Spec.Services.Neutron.ExtraConfig = cfg
+		return cp
+	}
+
+	for _, tc := range []struct {
+		name     string
+		oldCP    *ControlPlane
+		newCP    *ControlPlane
+		expected bool
+	}{
+		{
+			name:     "the neutron block is newly declared",
+			oldCP:    withoutNeutron(),
+			newCP:    neutronControlPlane(),
+			expected: true,
+		},
+		{
+			name:     "the neutron block is dropped",
+			oldCP:    neutronControlPlane(),
+			newCP:    withoutNeutron(),
+			expected: true,
+		},
+		{
+			name:     "the neutron extraConfig changes",
+			oldCP:    withExtraConfig(map[string]map[string]string{"DEFAULT": {"debug": "false"}}),
+			newCP:    withExtraConfig(map[string]map[string]string{"DEFAULT": {"debug": "true"}}),
+			expected: true,
+		},
+		{
+			name:  "an unrelated neutron edit leaves the gate closed",
+			oldCP: neutronControlPlane(),
+			newCP: func() *ControlPlane {
+				cp := neutronControlPlane()
+				cp.Spec.Services.Neutron.Replicas = ptr.To(int32(5))
 				return cp
 			}(),
 			expected: false,
