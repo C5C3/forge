@@ -87,7 +87,12 @@ const (
 	// services.neutron.ovn.centralRef. The ControlPlane owns nothing of the OVN
 	// layer: the central is deployed outside the plane and only referenced, so
 	// this condition reports what the plane observes, never what it drives.
-	conditionTypeOVNReady             = "OVNReady"
+	conditionTypeOVNReady = "OVNReady"
+	// conditionTypeNeutronReady covers the network service the ControlPlane does
+	// drive: the projected Neutron child and the material it consumes, the shared
+	// bus delivered into the Neutron namespace among it. It is separate from
+	// conditionTypeOVNReady, which reports a central this plane only reads.
+	conditionTypeNeutronReady         = "NeutronReady"
 	conditionTypeKORCReady            = "KORCReady"
 	conditionTypeAdminCredentialReady = "AdminCredentialReady" //nolint:gosec // G101 false positive: condition type name, not a credential.
 	conditionTypeAdminPasswordReady   = "AdminPasswordReady"   //nolint:gosec // G101 false positive: condition type name, not a credential.
@@ -125,6 +130,7 @@ var subConditionTypes = []string{
 	conditionTypePlacementReady,
 	conditionTypeBarbicanReady,
 	conditionTypeOVNReady,
+	conditionTypeNeutronReady,
 	conditionTypeKORCReady,
 	conditionTypeAdminCredentialReady,
 	conditionTypeAdminPasswordReady,
