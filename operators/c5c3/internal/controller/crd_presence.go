@@ -14,6 +14,8 @@ import (
 	glancev1alpha1 "github.com/c5c3/cobaltcore/operators/glance/api/v1alpha1"
 	horizonv1alpha1 "github.com/c5c3/cobaltcore/operators/horizon/api/v1alpha1"
 	keystonev1alpha1 "github.com/c5c3/cobaltcore/operators/keystone/api/v1alpha1"
+	neutronv1alpha1 "github.com/c5c3/cobaltcore/operators/neutron/api/v1alpha1"
+	ovnv1alpha1 "github.com/c5c3/cobaltcore/operators/ovn/api/v1alpha1"
 	placementv1alpha1 "github.com/c5c3/cobaltcore/operators/placement/api/v1alpha1"
 	openbaov1alpha1 "github.com/dc-tec/openbao-operator/api/v1alpha1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -28,12 +30,12 @@ import (
 )
 
 // The ControlPlane reconciler watches kinds owned by sibling service operators —
-// Keystone, Horizon, Glance, Placement and Barbican — plus the two openbao.org
-// kinds a dedicated Barbican secret store is built from and the rabbitmq.com
-// RabbitmqCluster kind. controller-runtime installs a shared informer for each
-// watched kind and blocks manager start until every informer has synced; on a
-// cluster missing one of those CRDs the informer never syncs, the manager fails
-// start after CacheSyncTimeout, and the leader crash-loops.
+// Keystone, Horizon, Glance, Placement, Barbican, Neutron and OVNCentral — plus
+// the two openbao.org kinds a dedicated Barbican secret store is built from and
+// the rabbitmq.com RabbitmqCluster kind. controller-runtime installs a shared
+// informer for each watched kind and blocks manager start until every informer
+// has synced; on a cluster missing one of those CRDs the informer never syncs,
+// the manager fails start after CacheSyncTimeout, and the leader crash-loops.
 // The helpers here let SetupWithManager register the fragile watches only when their
 // CRD is actually served, so a slimmed-down install (Keystone-only, no Glance) starts
 // clean. The infrastructure hard dependencies — MariaDB, Memcached, the ESO kinds
@@ -83,6 +85,11 @@ type serverResourcesLister interface {
 // only on that path (ensureBarbicanOpenBao), so a ControlPlane without one runs
 // perfectly well on a cluster that never served them.
 //
+// The Neutron and OVNCentral kinds are listed for the sibling reason too: the
+// neutron-operator and the ovn-operator are installed only for a ControlPlane that
+// runs a network service, so a plane without one runs on a cluster that never
+// served them.
+//
 // The RabbitmqCluster kind is listed for a reason of its own: messaging is opt-in,
 // so spec.infrastructure.messaging is never materialized by defaulting and a
 // Keystone-only install on a cluster without the rabbitmq-cluster-operator has no
@@ -108,6 +115,8 @@ func optionalWatchObjects() []client.Object {
 		&openbaov1alpha1.OpenBaoCluster{},
 		&openbaov1alpha1.OpenBaoTenant{},
 		rabbitmq,
+		&neutronv1alpha1.Neutron{},
+		&ovnv1alpha1.OVNCentral{},
 	}
 }
 

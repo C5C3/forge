@@ -15,6 +15,7 @@ import (
 	glancev1alpha1 "github.com/c5c3/cobaltcore/operators/glance/api/v1alpha1"
 	horizonv1alpha1 "github.com/c5c3/cobaltcore/operators/horizon/api/v1alpha1"
 	keystonev1alpha1 "github.com/c5c3/cobaltcore/operators/keystone/api/v1alpha1"
+	ovnv1alpha1 "github.com/c5c3/cobaltcore/operators/ovn/api/v1alpha1"
 	placementv1alpha1 "github.com/c5c3/cobaltcore/operators/placement/api/v1alpha1"
 	openbaov1alpha1 "github.com/dc-tec/openbao-operator/api/v1alpha1"
 	esov1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
@@ -73,15 +74,20 @@ const ControlPlaneSecretNameIndexKey = "spec.korc.adminCredential.passwordSecret
 // rather than inline string literals so a rename is caught by the compiler and
 // the no-inline-literals drift guard.
 const (
-	conditionTypeNamespacesReady      = "NamespacesReady"
-	conditionTypeInfrastructureReady  = "InfrastructureReady"
-	conditionTypeESOTenantStoreReady  = "ESOTenantStoreReady" //nolint:gosec // G101 false positive: condition type name, not a credential.
-	conditionTypeDBCredentialsReady   = "DBCredentialsReady"  //nolint:gosec // G101 false positive: condition type name, not a credential.
-	conditionTypeKeystoneReady        = "KeystoneReady"
-	conditionTypeHorizonReady         = "HorizonReady"
-	conditionTypeGlanceReady          = "GlanceReady"
-	conditionTypePlacementReady       = "PlacementReady"
-	conditionTypeBarbicanReady        = "BarbicanReady"
+	conditionTypeNamespacesReady     = "NamespacesReady"
+	conditionTypeInfrastructureReady = "InfrastructureReady"
+	conditionTypeESOTenantStoreReady = "ESOTenantStoreReady" //nolint:gosec // G101 false positive: condition type name, not a credential.
+	conditionTypeDBCredentialsReady  = "DBCredentialsReady"  //nolint:gosec // G101 false positive: condition type name, not a credential.
+	conditionTypeKeystoneReady       = "KeystoneReady"
+	conditionTypeHorizonReady        = "HorizonReady"
+	conditionTypeGlanceReady         = "GlanceReady"
+	conditionTypePlacementReady      = "PlacementReady"
+	conditionTypeBarbicanReady       = "BarbicanReady"
+	// conditionTypeOVNReady mirrors the readiness of the OVNCentral named by
+	// services.neutron.ovn.centralRef. The ControlPlane owns nothing of the OVN
+	// layer: the central is deployed outside the plane and only referenced, so
+	// this condition reports what the plane observes, never what it drives.
+	conditionTypeOVNReady             = "OVNReady"
 	conditionTypeKORCReady            = "KORCReady"
 	conditionTypeAdminCredentialReady = "AdminCredentialReady" //nolint:gosec // G101 false positive: condition type name, not a credential.
 	conditionTypeAdminPasswordReady   = "AdminPasswordReady"   //nolint:gosec // G101 false positive: condition type name, not a credential.
@@ -118,6 +124,7 @@ var subConditionTypes = []string{
 	conditionTypeGlanceReady,
 	conditionTypePlacementReady,
 	conditionTypeBarbicanReady,
+	conditionTypeOVNReady,
 	conditionTypeKORCReady,
 	conditionTypeAdminCredentialReady,
 	conditionTypeAdminPasswordReady,
@@ -288,6 +295,13 @@ var controlPlaneRemoteChildKinds = []schema.GroupVersionKind{
 // operator-written children, so both get full verbs.
 // +kubebuilder:rbac:groups=barbican.openstack.c5c3.io,resources=barbicans,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=barbican.openstack.c5c3.io,resources=barbicansecretstores,verbs=get;list;watch;create;update;patch;delete
+// The ControlPlane reconciler projects and Owns a Neutron child, the network
+// service the OVN control plane below carries the logical model for.
+// +kubebuilder:rbac:groups=neutron.openstack.c5c3.io,resources=neutrons,verbs=get;list;watch;create;update;patch;delete
+// The OVNCentral is deployed outside the plane and only REFERENCED by
+// services.neutron.ovn.centralRef, so the reconciler reads and watches it but
+// never writes it: read-only verbs.
+// +kubebuilder:rbac:groups=ovn.openstack.c5c3.io,resources=ovncentrals,verbs=get;list;watch
 // A managed Barbican secret store gets a dedicated OpenBao instance: the
 // OpenBaoCluster the store reads and writes through, and the OpenBaoTenant that
 // admits the Barbican service namespace to it.
@@ -600,6 +614,14 @@ func (r *ControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.Request
 				// until the OpenBao instance it provisions serves requests.
 				{Name: "Barbican", Fn: func(ctx context.Context) (ctrl.Result, error) {
 					return r.reconcileBarbican(ctx, &cp)
+				}},
+				// OVN carries no condition gate: it reads the OVNCentral named
+				// by services.neutron.ovn.centralRef and mirrors its readiness
+				// into OVNReady, which is what the Neutron projection that
+				// follows consumes. The central is deployed outside the plane,
+				// so nothing this chain produces can make it ready.
+				{Name: "OVN", Fn: func(ctx context.Context) (ctrl.Result, error) {
+					return r.reconcileOVN(ctx, &cp)
 				}},
 				// ServiceAccounts aggregates the readiness of the
 				// KeystoneService children the Glance/Placement/Barbican legs
@@ -1352,6 +1374,11 @@ func (r *ControlPlaneReconciler) buildControlPlaneController(mgr mcmanager.Manag
 	// RabbitmqCluster kind joins them because messaging is opt-in: a Keystone-only
 	// install on a cluster without the RabbitMQ CRD starts clean, and crdWatchGate
 	// restarts the operator once that CRD appears.
+	//
+	// The OVNCentral kind is guarded too, but not from this loop: it is referenced
+	// rather than projected, so it carries neither an Owns leg nor a
+	// cross-namespace child leg and takes a mapper-based Watches leg of its own
+	// below.
 	for _, obj := range []client.Object{
 		&keystonev1alpha1.Keystone{},
 		&horizonv1alpha1.Horizon{},
@@ -1378,6 +1405,15 @@ func (r *ControlPlaneReconciler) buildControlPlaneController(mgr mcmanager.Manag
 	if isServed(&keystonev1alpha1.KeystoneIdentityBackend{}) {
 		b = b.Watches(&keystonev1alpha1.KeystoneIdentityBackend{}, commonmulticluster.LocalRequests(
 			r.identityBackendToControlPlaneMapper,
+		), engageLocal, engageNoProviders)
+	}
+	// OVNCentral CRs are deployed infra-style and only referenced by
+	// services.neutron.ovn.centralRef, so they carry no owner reference an Owns()
+	// could match. Watch them through the mapper so a change to the central's
+	// status re-runs reconcileOVN instead of waiting for a periodic resync.
+	if isServed(&ovnv1alpha1.OVNCentral{}) {
+		b = b.Watches(&ovnv1alpha1.OVNCentral{}, commonmulticluster.LocalRequests(
+			r.ovnCentralToControlPlaneMapper,
 		), engageLocal, engageNoProviders)
 	}
 

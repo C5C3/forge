@@ -29,6 +29,8 @@ import (
 	glancev1alpha1 "github.com/c5c3/cobaltcore/operators/glance/api/v1alpha1"
 	horizonv1alpha1 "github.com/c5c3/cobaltcore/operators/horizon/api/v1alpha1"
 	keystonev1alpha1 "github.com/c5c3/cobaltcore/operators/keystone/api/v1alpha1"
+	neutronv1alpha1 "github.com/c5c3/cobaltcore/operators/neutron/api/v1alpha1"
+	ovnv1alpha1 "github.com/c5c3/cobaltcore/operators/ovn/api/v1alpha1"
 	placementv1alpha1 "github.com/c5c3/cobaltcore/operators/placement/api/v1alpha1"
 
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -70,6 +72,11 @@ var scheme = bootstrap.NewScheme(
 	// Barbican CR (and BarbicanSecretStore) — the ControlPlane reconciler
 	// projects and Owns a Barbican child plus the secret store attached to it.
 	barbicanv1alpha1.AddToScheme,
+	// Neutron CR — projected and Owned by the ControlPlane reconciler.
+	neutronv1alpha1.AddToScheme,
+	// OVNCentral — read and watched by reconcileOVN, never projected: the OVN
+	// control plane is deployed outside the plane and only referenced.
+	ovnv1alpha1.AddToScheme,
 	// OpenBaoCluster and OpenBaoTenant — projected and Owned by the dedicated
 	// Barbican secret store.
 	openbaov1alpha1.AddToScheme,

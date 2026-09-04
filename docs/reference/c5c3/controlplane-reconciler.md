@@ -136,6 +136,7 @@ kinds (`ClusterSecretStore` and `SecretStore`):
 | `BarbicanSecretStore` | `Owns()` | Re-reconciles when the projected BarbicanSecretStore status changes |
 | `OpenBaoCluster`, `OpenBaoTenant` | `Owns()` | Re-reconciles when the OpenBao instance provisioned for a dedicated Barbican secret store, or the tenant admitting its namespace, changes. The openbao-operator is installed only for that mode, so a ControlPlane without one runs on a cluster that never serves these kinds; both legs sit behind the discovery probe with the other sibling-operator kinds (`probeOptionalWatches`, which skips the leg and registers a leader-gated re-check that restarts the operator once the CRD appears) |
 | `RabbitmqCluster` (unstructured `rabbitmqClusterGVK`) | `Owns()` + cross-namespace `Watches()` | Re-reconciles when the managed message-bus child status changes, so `InfrastructureReady` follows `AllReplicasReady` instead of waiting for the periodic requeue. Watched as `*unstructured.Unstructured`, since the c5c3 operator takes no dependency on the RabbitMQ Cluster Operator's Go module. Messaging is opt-in, so both legs sit behind the discovery probe with the openbao kinds: a cluster that does not serve `rabbitmqclusters.rabbitmq.com` starts without them, and `crdWatchGate` restarts the operator once the CRD appears |
+| `OVNCentral` | `Watches()` | Per-CR fan-out via `ovnCentralToControlPlaneMapper`. The central is deployed outside the plane and only named by `spec.services.neutron.ovn.centralRef`, so it carries no owner reference an `Owns()` could match; the leg re-runs `reconcileOVN` when the central's status moves instead of waiting for the periodic requeue. The ovn-operator is installed only for a plane that runs a network service, so the leg sits behind the discovery probe with the other sibling-operator kinds |
 | K-ORC `ApplicationCredential` | `Owns()` | Re-reconciles when the minted admin credential's `Available` condition or `status.id` changes |
 | K-ORC `Service` | `Owns()` | Re-reconciles when the identity catalog Service changes |
 | K-ORC `Endpoint` | `Owns()` | Re-reconciles when the public identity Endpoint changes |
@@ -269,6 +270,8 @@ RBAC markers on the two reconcilers generate the required ClusterRole. The
 | `keystone.openstack.c5c3.io` | `keystones` | get, list, watch, create, update, patch, delete |
 | `placement.openstack.c5c3.io` | `placements` | get, list, watch, create, update, patch, delete |
 | `barbican.openstack.c5c3.io` | `barbicans`, `barbicansecretstores` | get, list, watch, create, update, patch, delete |
+| `neutron.openstack.c5c3.io` | `neutrons` | get, list, watch, create, update, patch, delete |
+| `ovn.openstack.c5c3.io` | `ovncentrals` | get, list, watch |
 | `openbao.org` | `openbaoclusters`, `openbaotenants` | get, list, watch, create, update, patch, delete |
 | `rbac.authorization.k8s.io` | `roles`, `rolebindings`, `clusterrolebindings` | get, create, patch, delete |
 | `rbac.authorization.k8s.io` | `clusterroles` (`resourceNames: system:auth-delegator`) | bind |
@@ -427,6 +430,12 @@ grants. The markers therefore add `core/namespaces` with
 │  ║  │ (gate: KS + its registr.)│  and a dedicated OpenBao instance                ║ │
 │  ║  └────────┬─────────────────┘  Sets: BarbicanReady (not-managed when unset)    ║ │
 │  ║           │                    Requeue: 5s gated / 15s instance or child       ║ │
+│  ║           ▼                                                                    ║ │
+│  ║  ┌──────────────────────────┐                                                  ║ │
+│  ║  │ reconcileOVN             │  Mirror the referenced OVNCentral's readiness    ║ │
+│  ║  │  (gate: none)            │  Sets: OVNReady (not-managed when unset)         ║ │
+│  ║  └────────┬─────────────────┘  Requeue: 15s while the central is not usable    ║ │
+│  ║           │                                                                    ║ │
 │  ║           ▼                                                                    ║ │
 │  ║  ┌──────────────────────────┐                                                  ║ │
 │  ║  │ reconcileServiceAccounts │  Fold the three registration children's          ║ │
@@ -589,7 +598,7 @@ The aggregated sub-condition types (the source-of-truth `subConditionTypes`
 slice in `controlplane_controller.go`) are:
 
 ```text
-NamespacesReady, InfrastructureReady, ESOTenantStoreReady, DBCredentialsReady, KeystoneReady, HorizonReady, GlanceReady, PlacementReady, BarbicanReady, KORCReady, AdminCredentialReady, AdminPasswordReady, CatalogReady, ServiceAccountsReady, RegistrationTenantStoresReady
+NamespacesReady, InfrastructureReady, ESOTenantStoreReady, DBCredentialsReady, KeystoneReady, HorizonReady, GlanceReady, PlacementReady, BarbicanReady, OVNReady, KORCReady, AdminCredentialReady, AdminPasswordReady, CatalogReady, ServiceAccountsReady, RegistrationTenantStoresReady
 ```
 
 The `Ready` condition carries `ObservedGeneration = cp.Generation` so clients can
@@ -1922,6 +1931,67 @@ finalizer sweeps it by those labels.
 | projected Barbican spec rejected (HTTP 422 Invalid) | False | `BarbicanProjectionRejected` | returns the error; the projection violates a Barbican CRD/webhook rule, so reconcile the ControlPlane spec to a valid projection to recover |
 | Barbican create/update fails | False | `BarbicanError` | returns the error |
 | Barbican child Ready | True | `BarbicanReady` | — |
+
+### reconcileOVN
+
+| Aspect | Value |
+| --- | --- |
+| File | `reconcile_ovn.go` |
+| Condition | `OVNReady` |
+| Gate | none. The OVNCentral is deployed outside the plane, so nothing this chain produces can make it ready |
+| Projects / Owns | nothing. The sub-reconciler only READS the `OVNCentral` named by `spec.services.neutron.ovn.centralRef`, in `cp.NeutronOVNCentralNamespace()` (the ref's namespace, or the ControlPlane's own when it is empty) |
+| Requeue | `infraRequeueAfter` = **15s** on every not-yet arm |
+
+`reconcileOVN` is the one sub-reconciler that writes nothing. The OVN control
+plane is referenced the way the infrastructure clusters in `spec.infrastructure`
+are: the ControlPlane never projects the central, never updates it, never deletes
+it. What it takes from the central is what the Neutron projection consumes, the
+two database addresses the ML2/OVN mechanism driver dials and the client Secret
+it presents there. The pass reads the central, decides whether those are usable,
+and records the verdict in `OVNReady`.
+
+The read goes through the **local** client whatever cluster the network service
+is placed on: the `OVNCentral` CR lives on the management cluster, where the
+ovn-operator reconciles it, and only the children it projects land on the target
+cluster its own `spec.targetClusterRef` selects.
+
+Which address form is mirrored depends on placement. A network service sharing a
+cluster with the central reads `status.northbound.internalDbAddress` /
+`status.southbound.internalDbAddress`; one on another cluster leaves its own
+cluster network and reads `status.northbound.dbAddress` /
+`status.southbound.dbAddress`, which exist only while the central publishes both
+databases on the node network. A cross-cluster placement therefore also requires
+`spec.northbound.externallyReachable` and `spec.southbound.externallyReachable`
+on the central.
+
+Before the read, the pass re-runs the reach rule the validating webhook enforces
+on `centralRef.namespace` (`ValidateNeutronOVNCentralNamespace`, exported for this
+caller). It is the controller-side backstop `keystoneServiceNamespaceAllowed` is
+for the sibling cross-namespace trust decision: a ControlPlane can reach etcd
+without ever passing through admission — an unregistered webhook during install, a
+GitOps or etcd restore replaying stored objects — and naming a foreign plane's
+central is not a read-only act. The arms below would relay that central's database
+addresses and status, and the Neutron projection gated on `OVNReady` would hand
+the child a pointer whose operator mirrors the central's client `Secret`, a full
+mTLS identity for its Northbound and Southbound databases, into this plane's
+namespace. So the read does not happen at all, and the condition carries the
+webhook's own message.
+
+No arm returns an error except the read failure: nothing the ControlPlane does
+can converge a central it does not own, so every other arm requeues after 15s and
+waits for the ovn-operator.
+
+| Path | Status | Reason | Notes |
+| --- | --- | --- | --- |
+| `spec.services.neutron` unset | True | `OVNNotManaged` | staged adoption; no OVN control plane is consumed, so the aggregate is not blocked |
+| the resolved `centralRef` namespace is outside the plane's reach | False | `OVNCentralNamespaceForbidden` | requeue 15s; the central is NOT read, so none of its addresses or status reaches this plane. The message is the webhook's own, naming the field and the direction of the refusal |
+| the referenced `OVNCentral` does not exist | False | `OVNCentralNotFound` | requeue 15s; the message carries the full `<namespace>/<name>` the ref resolved to |
+| the `OVNCentral` CRD is not served | False | `OVNCentralReadError` | requeue 15s; the message says to install the ovn-operator. A no-match is a deployment gap, not a fault manager backoff can retry out of |
+| reading the `OVNCentral` fails otherwise | False | `OVNCentralReadError` | returns the error wrapped as `reading OVNCentral <namespace>/<name>` |
+| the network service runs on another cluster and the central does not publish both databases | False | `OVNCentralNotExternallyReachable` | requeue 15s; the message names `spec.northbound.externallyReachable` and `spec.southbound.externallyReachable` |
+| the central has not reported `Ready`, or reports it not True | False | `WaitingForOVNCentral` | requeue 15s; the central's own reason and message are relayed verbatim, because "not ready" alone says nothing an operator can act on |
+| the central reports `Ready` but has not published both addresses and `status.clientSecretName` | False | `OVNEndpointsPending` | requeue 15s; the message names each status field that is still empty, in the address form the placement selected |
+| the central is ready and complete | True | `OVNCentralReady` | the message carries the Northbound and Southbound addresses that were selected |
 
 ### reconcileKORC
 
@@ -3274,6 +3344,8 @@ operators/c5c3/
     │   │                                        BarbicanSecretStore children, orphan teardown)
     │   ├── reconcile_barbican_openbao.go       Dedicated OpenBao instance and its ensemble
     │   ├── reconcile_barbican_dbcredentials.go Barbican DB-credential names, OpenBao paths, mode
+    │   ├── reconcile_ovn.go                    reconcileOVN (mirror the referenced OVNCentral),
+    │   │                                        ovnCentralToControlPlaneMapper
     │   ├── reconcile_korc.go                   reconcileKORC (AC mint/re-mint, drift detection)
     │   ├── reconcile_admincredential.go        reconcileAdminCredential (assemble + push + re-push
     │   │                                        nudges, semantic clouds.yaml gate)
@@ -3312,6 +3384,7 @@ operators/c5c3/
     │   ├── reconcile_barbican_test.go          Barbican projection tests
     │   ├── reconcile_barbican_openbao_test.go  Dedicated OpenBao ensemble tests
     │   ├── reconcile_barbican_dbcredentials_test.go Barbican DB-credential tests
+    │   ├── reconcile_ovn_test.go               OVNCentral mirroring tests
     │   ├── reconcile_korc_test.go              K-ORC mint/re-mint tests
     │   ├── reconcile_admincredential_test.go   AdminCredential tests
     │   ├── reconcile_catalog_test.go           Catalog (managed-mode) tests

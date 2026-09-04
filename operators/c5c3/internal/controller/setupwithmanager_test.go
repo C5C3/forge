@@ -23,6 +23,7 @@ import (
 
 	commonv1 "github.com/c5c3/cobaltcore/internal/common/types"
 	c5c3v1alpha1 "github.com/c5c3/cobaltcore/operators/c5c3/api/v1alpha1"
+	ovnv1alpha1 "github.com/c5c3/cobaltcore/operators/ovn/api/v1alpha1"
 )
 
 // newControlPlaneMapperClient returns a fake client pre-registered with the
@@ -580,4 +581,95 @@ func TestNamespacedStoreToControlPlaneMapper_IgnoresUnrelatedRegistrationStores(
 			g.Expect(mapper(ctx, store)).To(BeEmpty())
 		})
 	}
+}
+
+// --- ovnCentralToControlPlaneMapper ---
+
+// ovnMapperControlPlane returns a mapper fixture whose network service references
+// the named OVNCentral. An empty refNamespace leaves the ref blank, which
+// NeutronOVNCentralNamespace resolves to the ControlPlane's own namespace.
+func ovnMapperControlPlane(name, namespace, centralName, refNamespace string) *c5c3v1alpha1.ControlPlane {
+	cp := mapperControlPlane(name, namespace, "admin-secret")
+	cp.Spec.Services.Neutron = &c5c3v1alpha1.ServiceNeutronSpec{
+		OVN: c5c3v1alpha1.NeutronOVNSpec{
+			CentralRef: c5c3v1alpha1.NeutronOVNCentralRef{Name: centralName, Namespace: refNamespace},
+		},
+	}
+	return cp
+}
+
+// TestOVNCentralToControlPlaneMapper covers the watch leg that replaces the Owns()
+// a referenced central can never have: which ControlPlanes an OVNCentral event
+// wakes, and which it must leave asleep. The match is on the RESOLVED ref
+// namespace and the name together, so a same-named central beside an unrelated
+// plane triggers nothing.
+func TestOVNCentralToControlPlaneMapper(t *testing.T) {
+	ctx := context.Background()
+	central := func(name, namespace string) *ovnv1alpha1.OVNCentral {
+		return &ovnv1alpha1.OVNCentral{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: namespace}}
+	}
+
+	for name, tc := range map[string]struct {
+		cp       *c5c3v1alpha1.ControlPlane
+		obj      client.Object
+		wantWake bool
+	}{
+		"the referenced central in the referenced namespace": {
+			cp:       ovnMapperControlPlane("cp", "openstack", "ovn-central", "ovn-system"),
+			obj:      central("ovn-central", "ovn-system"),
+			wantWake: true,
+		},
+		"an empty ref namespace resolves to the ControlPlane's own": {
+			cp:       ovnMapperControlPlane("cp", "openstack", "ovn-central", ""),
+			obj:      central("ovn-central", "openstack"),
+			wantWake: true,
+		},
+		"the same name in another namespace": {
+			cp:  ovnMapperControlPlane("cp", "openstack", "ovn-central", "ovn-system"),
+			obj: central("ovn-central", "somewhere-else"),
+		},
+		"a ControlPlane without a network service": {
+			cp:  mapperControlPlane("cp", "openstack", "admin-secret"),
+			obj: central("ovn-central", "openstack"),
+		},
+		"an object of another kind": {
+			cp:  ovnMapperControlPlane("cp", "openstack", "ovn-central", "ovn-system"),
+			obj: &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "ovn-central", Namespace: "ovn-system"}},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			g := NewGomegaWithT(t)
+			r := &ControlPlaneReconciler{Client: newControlPlaneMapperClient(t, tc.cp)}
+
+			reqs := r.ovnCentralToControlPlaneMapper(ctx, tc.obj)
+
+			if !tc.wantWake {
+				g.Expect(reqs).To(BeEmpty())
+				return
+			}
+			g.Expect(reqs).To(ConsistOf(reconcile.Request{
+				NamespacedName: types.NamespacedName{Namespace: tc.cp.Namespace, Name: tc.cp.Name},
+			}))
+		})
+	}
+}
+
+// TestOVNCentralToControlPlaneMapper_WakesEveryReferencingControlPlane proves the
+// List is cluster-wide rather than scoped to the central's namespace: several
+// planes may share one OVN control plane, and each of them mirrors its readiness.
+func TestOVNCentralToControlPlaneMapper_WakesEveryReferencingControlPlane(t *testing.T) {
+	g := NewGomegaWithT(t)
+
+	first := ovnMapperControlPlane("first", "openstack", "ovn-central", "ovn-system")
+	second := ovnMapperControlPlane("second", "tenant-a", "ovn-central", "ovn-system")
+	unrelated := ovnMapperControlPlane("third", "tenant-b", "other-central", "ovn-system")
+	r := &ControlPlaneReconciler{Client: newControlPlaneMapperClient(t, first, second, unrelated)}
+
+	reqs := r.ovnCentralToControlPlaneMapper(context.Background(),
+		&ovnv1alpha1.OVNCentral{ObjectMeta: metav1.ObjectMeta{Name: "ovn-central", Namespace: "ovn-system"}})
+
+	g.Expect(reqs).To(ConsistOf(
+		reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "openstack", Name: "first"}},
+		reconcile.Request{NamespacedName: types.NamespacedName{Namespace: "tenant-a", Name: "second"}},
+	))
 }

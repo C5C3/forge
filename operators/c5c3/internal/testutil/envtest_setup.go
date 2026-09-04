@@ -27,6 +27,8 @@ import (
 	glancev1alpha1 "github.com/c5c3/cobaltcore/operators/glance/api/v1alpha1"
 	horizonv1alpha1 "github.com/c5c3/cobaltcore/operators/horizon/api/v1alpha1"
 	keystonev1alpha1 "github.com/c5c3/cobaltcore/operators/keystone/api/v1alpha1"
+	neutronv1alpha1 "github.com/c5c3/cobaltcore/operators/neutron/api/v1alpha1"
+	ovnv1alpha1 "github.com/c5c3/cobaltcore/operators/ovn/api/v1alpha1"
 	placementv1alpha1 "github.com/c5c3/cobaltcore/operators/placement/api/v1alpha1"
 )
 
@@ -103,8 +105,10 @@ func SetupC5c3EnvTestWithControllerAndCRDs(
 // ControlPlane integration test, resolved relative to this
 // source file via runtime.Caller(0):
 //   - the sibling service-operator CRDs (Keystone, Horizon, Glance, Placement,
-//     Barbican — and with them GlanceBackend, KeystoneIdentityBackend and
-//     BarbicanSecretStore) the reconciler Owns as children.
+//     Barbican, Neutron — and with them GlanceBackend, KeystoneIdentityBackend
+//     and BarbicanSecretStore) the reconciler Owns as children.
+//   - the OVNCentral CRD, which the reconciler only reads and watches: it
+//     mirrors the referenced central's readiness into OVNReady.
 //   - BaselineCRDDirectoryPaths(): the c5c3 CRDs plus every shared fake CRD dir
 //     (mariadb-operator, memcached-operator, external-secrets, cert-manager,
 //     k-orc, openbao-operator, ...) so the external operator kinds the reconciler
@@ -116,8 +120,13 @@ func CRDDirectoryPaths() []string {
 	glanceCRDDir := filepath.Join(base, "..", "..", "..", "glance", "config", "crd", "bases")
 	placementCRDDir := filepath.Join(base, "..", "..", "..", "placement", "config", "crd", "bases")
 	barbicanCRDDir := filepath.Join(base, "..", "..", "..", "barbican", "config", "crd", "bases")
+	neutronCRDDir := filepath.Join(base, "..", "..", "..", "neutron", "config", "crd", "bases")
+	ovnCRDDir := filepath.Join(base, "..", "..", "..", "ovn", "config", "crd", "bases")
 
-	dirs := []string{keystoneCRDDir, horizonCRDDir, glanceCRDDir, placementCRDDir, barbicanCRDDir}
+	dirs := []string{
+		keystoneCRDDir, horizonCRDDir, glanceCRDDir, placementCRDDir, barbicanCRDDir,
+		neutronCRDDir, ovnCRDDir,
+	}
 	return append(dirs, BaselineCRDDirectoryPaths()...)
 }
 
@@ -128,13 +137,13 @@ func CRDDirectoryPaths() []string {
 //   - c5c3 CRDs (controlplanes, credentialrotations, secretaggregates).
 //   - every shared fake CRD dir under internal/common/testutil/fake_crds/*.
 //
-// The sibling service-operator CRDs (Keystone, Horizon, Glance, Placement, Barbican
-// — and with them GlanceBackend, KeystoneIdentityBackend and BarbicanSecretStore)
-// are DELIBERATELY absent, so tests can prove the ControlPlane controller starts
-// when those kinds are unserved. K-ORC IS served — its fake CRDs are part of the
-// common fake dirs — because the K-ORC kinds are Owned unconditionally as hard
-// dependencies (see optionalWatchObjects in crd_presence.go): the manager would fail
-// to start without them. The two openbao.org kinds ARE served too, since their fake
+// The sibling service-operator CRDs (Keystone, Horizon, Glance, Placement, Barbican,
+// Neutron — and with them GlanceBackend, KeystoneIdentityBackend and
+// BarbicanSecretStore) plus the OVNCentral CRD are DELIBERATELY absent, so tests can
+// prove the ControlPlane controller starts when those kinds are unserved. K-ORC IS
+// served — its fake CRDs are part of the common fake dirs — because the K-ORC kinds
+// are Owned unconditionally as hard dependencies (see optionalWatchObjects in
+// crd_presence.go): the manager would fail to start without them. The two openbao.org kinds ARE served too, since their fake
 // CRDs ship in those same common dirs, so the baseline also covers the mixed case a
 // guarded leg has to survive: some optional CRDs installed, others not. Tests
 // therefore exercise the intended partial state — the guarded service-operator legs
@@ -197,6 +206,8 @@ func BuildControllerScheme(addToScheme func(*k8sruntime.Scheme) error) *k8srunti
 		glancev1alpha1.AddToScheme,
 		placementv1alpha1.AddToScheme,
 		barbicanv1alpha1.AddToScheme,
+		neutronv1alpha1.AddToScheme,
+		ovnv1alpha1.AddToScheme,
 		openbaov1alpha1.AddToScheme,
 		esov1.AddToScheme,
 		esov1alpha1.AddToScheme,

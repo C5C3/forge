@@ -73,6 +73,53 @@ tests:
               - update
               - watch
 
+  # The Neutron child is projected and Owned, so it takes full CRUD; the
+  # OVNCentral is deployed outside the plane and only referenced, so the operator
+  # reads and watches it and must never be able to write it.
+  - it: should grant full CRUD on neutrons and read-only access on ovncentrals
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - neutron.openstack.c5c3.io
+            resources:
+              - neutrons
+            verbs:
+              - create
+              - delete
+              - get
+              - list
+              - patch
+              - update
+              - watch
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - ovn.openstack.c5c3.io
+            resources:
+              - ovncentrals
+            verbs:
+              - get
+              - list
+              - watch
+      - notContains:
+          path: rules
+          content:
+            apiGroups:
+              - ovn.openstack.c5c3.io
+            resources:
+              - ovncentrals
+            verbs:
+              - create
+              - delete
+              - get
+              - list
+              - patch
+              - update
+              - watch
+
   # The dedicated OpenBao instance needs a Role/RoleBinding pair for the
   # barbican-operator's TokenRequest and a ClusterRoleBinding for the instance
   # pods' TokenReview, so the operator authors all three kinds. Both rules carry

@@ -215,6 +215,18 @@ Run 'make verify-helm-rbac' to check for drift, or 'make sync-helm-rbac' to upda
   - update
   - watch
 - apiGroups:
+  - neutron.openstack.c5c3.io
+  resources:
+  - neutrons
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
   - openbao.org
   resources:
   - openbaoclusters
@@ -245,6 +257,14 @@ Run 'make verify-helm-rbac' to check for drift, or 'make sync-helm-rbac' to upda
   - list
   - patch
   - update
+  - watch
+- apiGroups:
+  - ovn.openstack.c5c3.io
+  resources:
+  - ovncentrals
+  verbs:
+  - get
+  - list
   - watch
 - apiGroups:
   - placement.openstack.c5c3.io
