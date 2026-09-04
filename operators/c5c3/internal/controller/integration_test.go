@@ -54,6 +54,8 @@ import (
 	glancev1alpha1 "github.com/c5c3/cobaltcore/operators/glance/api/v1alpha1"
 	horizonv1alpha1 "github.com/c5c3/cobaltcore/operators/horizon/api/v1alpha1"
 	keystonev1alpha1 "github.com/c5c3/cobaltcore/operators/keystone/api/v1alpha1"
+	neutronv1alpha1 "github.com/c5c3/cobaltcore/operators/neutron/api/v1alpha1"
+	ovnv1alpha1 "github.com/c5c3/cobaltcore/operators/ovn/api/v1alpha1"
 	placementv1alpha1 "github.com/c5c3/cobaltcore/operators/placement/api/v1alpha1"
 )
 
@@ -338,6 +340,27 @@ func integrationBarbicanService() *c5c3v1alpha1.ServiceBarbicanSpec {
 	}
 }
 
+// integrationNeutronService returns a valid services.neutron block: the required
+// OVN control plane reference and a single RPC worker. The block cannot be empty
+// the way its Placement sibling can, because the ML2/OVN mechanism driver has no
+// logical network model to write to without a central. workerReplicas is pinned
+// so the full-chain test can prove the override reaches the child's
+// spec.workers.deployment.replicas, while replicas is left unset so the same test
+// proves the API pods fall back to the shared operator default.
+//
+// The centralRef spells no namespace on purpose: the defaulting webhook fills an
+// empty one with the ControlPlane's own namespace, and NeutronOVNCentralNamespace()
+// resolves it the same way for a CR that bypassed admission. That is where the
+// tests create the OVNCentral.
+func integrationNeutronService() *c5c3v1alpha1.ServiceNeutronSpec {
+	return &c5c3v1alpha1.ServiceNeutronSpec{
+		WorkerReplicas: ptr.To(int32(1)),
+		OVN: c5c3v1alpha1.NeutronOVNSpec{
+			CentralRef: c5c3v1alpha1.NeutronOVNCentralRef{Name: "cp-ovn"},
+		},
+	}
+}
+
 // ensureReadyClusterSecretStore creates the cluster-scoped OpenBao-backed
 // ClusterSecretStore the DB-credential, admin-password and admin-credential
 // sub-reconcilers gate on (#476) and marks it Ready. It is idempotent across the
@@ -549,6 +572,60 @@ func simulateBarbicanReadyWhenPresent(t testing.TB, ctx context.Context, c clien
 		Message: "simulated ready",
 	})
 	g.Expect(c.Status().Update(ctx, bn)).To(Succeed(), "set Barbican Ready=True")
+}
+
+// simulateNeutronReadyWhenPresent waits for the projected Neutron child, then
+// sets its aggregate Ready condition True so reconcileNeutron's mirror flips
+// NeutronReady (there is no neutron-operator running in envtest). Mirrors
+// simulateBarbicanReadyWhenPresent.
+func simulateNeutronReadyWhenPresent(t testing.TB, ctx context.Context, c client.Client, key client.ObjectKey) {
+	t.Helper()
+	g := NewGomegaWithT(t)
+
+	nn := &neutronv1alpha1.Neutron{}
+	g.Eventually(func() error {
+		return c.Get(ctx, key, nn)
+	}, itEventuallyTimeout, itPollInterval).Should(Succeed(), "Neutron child should be created")
+
+	meta.SetStatusCondition(&nn.Status.Conditions, metav1.Condition{
+		Type:    "Ready",
+		Status:  metav1.ConditionTrue,
+		Reason:  "AllReady",
+		Message: "simulated ready",
+	})
+	g.Expect(c.Status().Update(ctx, nn)).To(Succeed(), "set Neutron Ready=True")
+}
+
+// simulateOVNCentralReadyWhenPresent waits for the OVNCentral
+// services.neutron.ovn.centralRef names, then reports what the ovn-operator
+// publishes on a serving control plane: Ready=True plus the three status values
+// reconcileOVN reads, the two in-cluster database addresses and the client Secret
+// every OVN client authenticates with.
+//
+// The central is an INPUT rather than a projected child: the ControlPlane never
+// creates it, only reads it, so the test creates it and this helper drives it the
+// way the external operator would. The condition carries an ObservedGeneration
+// because that is what a real operator stamps.
+func simulateOVNCentralReadyWhenPresent(t testing.TB, ctx context.Context, c client.Client, key client.ObjectKey) {
+	t.Helper()
+	g := NewGomegaWithT(t)
+
+	central := &ovnv1alpha1.OVNCentral{}
+	g.Eventually(func() error {
+		return c.Get(ctx, key, central)
+	}, itEventuallyTimeout, itPollInterval).Should(Succeed(), "the referenced OVNCentral should exist")
+
+	central.Status.Northbound.InternalDbAddress = "ssl:10.0.0.1:6641"
+	central.Status.Southbound.InternalDbAddress = "ssl:10.0.0.1:6642"
+	central.Status.ClientSecretName = key.Name + "-client"
+	meta.SetStatusCondition(&central.Status.Conditions, metav1.Condition{
+		Type:               "Ready",
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: central.Generation,
+		Reason:             "AllReady",
+		Message:            "simulated ready",
+	})
+	g.Expect(c.Status().Update(ctx, central)).To(Succeed(), "set OVNCentral Ready=True")
 }
 
 // simulateOpenBaoClusterAvailableWhenPresent waits for the dedicated OpenBao
@@ -1149,14 +1226,46 @@ func simulateBarbicanDBCredentialSyncWhenPresent(
 		To(Succeed(), "simulate per-CP Barbican DB credential ExternalSecret sync")
 }
 
+// simulateNeutronDBCredentialSyncWhenPresent is the Neutron twin of
+// simulateBarbicanDBCredentialSyncWhenPresent: it waits for the operator-created
+// Neutron DB-credential ExternalSecret, simulates the ESO sync, and materialises
+// the Secret behind it with an ENGINE-ISSUED username. reconcileNeutron gates the
+// Dynamic projection on both halves for the reason its peers do: a Static->Dynamic
+// flip updates the ExternalSecret in place, so its Ready can still be the retired
+// Static sync's. The engine-issued username here is deliberately not the static
+// seed's "neutron".
+func simulateNeutronDBCredentialSyncWhenPresent(
+	t testing.TB, ctx context.Context, c client.Client, cp *c5c3v1alpha1.ControlPlane,
+) {
+	t.Helper()
+	g := NewGomegaWithT(t)
+
+	neutronNS, name := cp.NeutronNamespace(), neutronDBCredentialSecretName(cp)
+	g.Eventually(func() error {
+		return c.Get(ctx, client.ObjectKey{Namespace: neutronNS, Name: name}, &esov1.ExternalSecret{})
+	}, itEventuallyTimeout, itPollInterval).Should(Succeed(),
+		"operator must create the per-CP Neutron DB-credential ExternalSecret")
+
+	g.Expect(c.Create(ctx, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: neutronNS},
+		Data: map[string][]byte{
+			"username": []byte(engineIssuedUsernamePrefix + "kubernetes-neutron-abc123-1750000000"),
+			"password": []byte("engine-issued-password"),
+		},
+	})).To(Succeed(), "materialise the engine-issued Neutron DB credential ESO would have written")
+
+	g.Expect(simulators.SimulateExternalSecretSync(ctx, c, client.ObjectKey{Namespace: neutronNS, Name: name})).
+		To(Succeed(), "simulate per-CP Neutron DB credential ExternalSecret sync")
+}
+
 // TestIntegration_FullReconcile_ManagedToReady drives a managed-mode ControlPlane
 // through every sub-reconciler to the aggregate Ready=True, simulating each
 // external dependency's readiness in dependency order. It is the single primary
 // end-to-end test for the ControlPlane reconciler.
 //
-// The KeystoneService controller runs beside it, because the three built-in
-// services register through the KeystoneService children they project: nothing
-// else provisions the Keystone accounts and catalog rows they gate on.
+// The KeystoneService controller runs beside it, because the built-in services
+// register through the KeystoneService children they project: nothing else
+// provisions the Keystone accounts and catalog rows they gate on.
 func TestIntegration_FullReconcile_ManagedToReady(t *testing.T) {
 	testutil.SkipIfEnvTestUnavailable(t)
 	g := NewGomegaWithT(t)
@@ -1176,18 +1285,28 @@ func TestIntegration_FullReconcile_ManagedToReady(t *testing.T) {
 	ensureReadySecretStore(t, ctx, c, esoTenantStoreName, ns.Name)
 
 	// Create the ControlPlane CR (the defaulting webhook fills region etc.).
-	// Horizon, Glance, Placement and Barbican are enabled HERE (not in the shared
-	// fixture) so only this full-chain test — which simulates the Horizon child in
-	// Phase 2.5, the three built-in registrations in Phase 5.6, the Glance child
-	// (plus its GlanceBackend) in Phase 6, the Placement child in Phase 7, and the
+	// Horizon, Glance, Placement, Barbican and Neutron are enabled HERE (not in the
+	// shared fixture) so only this full-chain test — which simulates the Horizon
+	// child in Phase 2.5, the four built-in registrations in Phase 5.6, the Glance
+	// child (plus its GlanceBackend) in Phase 6, the Placement child in Phase 7, the
 	// Barbican child (plus the dedicated OpenBao ensemble behind its secret store)
-	// in Phase 8 — carries the extra services; the gate-focused tests reusing the
-	// fixture would otherwise wedge at the unsimulated steps.
+	// in Phase 8, and the Neutron child (plus the OVN gate and the bus delivery
+	// ahead of it) in Phase 9 — carries the extra services; the gate-focused tests
+	// reusing the fixture would otherwise wedge at the unsimulated steps.
 	cp := integrationManagedControlPlane("cp", ns.Name)
 	cp.Spec.Services.Horizon = &c5c3v1alpha1.ServiceHorizonSpec{}
 	cp.Spec.Services.Glance = integrationGlanceService()
 	cp.Spec.Services.Placement = integrationPlacementService()
 	cp.Spec.Services.Barbican = integrationBarbicanService()
+	cp.Spec.Services.Neutron = integrationNeutronService()
+
+	// The shared message bus. The network service is what needs it: the Neutron
+	// projection derives the child's transport URL from this block, and the
+	// validating webhook requires the block beside services.neutron.
+	cp.Spec.Infrastructure.Messaging = &commonv1.MessagingSpec{
+		ClusterRef: &corev1.LocalObjectReference{Name: "cp-rabbitmq"},
+		Replicas:   1,
+	}
 
 	// Both halves of the extraConfig merge, so Phase 7 can assert the projected
 	// Placement child carries the union: a global-only section plus a
@@ -1212,12 +1331,44 @@ func TestIntegration_FullReconcile_ManagedToReady(t *testing.T) {
 	}
 	g.Expect(c.Create(ctx, adminSecret)).To(Succeed(), "create admin password Secret")
 
+	// The broker's default user. The RabbitMQ Cluster Operator materialises it and
+	// points the cluster's status at the Secret; no such operator runs in envtest,
+	// so the four keys reconcileNeutronMessaging assembles the transport URL from
+	// are seeded here, under the name simulateRabbitmqClusterReadyWhenPresent
+	// publishes in status.defaultUser.secretReference.
+	g.Expect(c.Create(ctx, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "cp-rabbitmq-default-user", Namespace: ns.Name},
+		Data: map[string][]byte{
+			"username": []byte("default-user"),
+			"password": []byte("broker-password"),
+			"host":     []byte("cp-rabbitmq." + ns.Name + ".svc"),
+			"port":     []byte("5672"),
+		},
+	})).To(Succeed(), "create the broker default-user Secret")
+
+	// The OVNCentral services.neutron.ovn.centralRef names. It is deployed OUTSIDE
+	// the ControlPlane: the plane reads it and mirrors its readiness, and never
+	// creates, updates or deletes it, so the test creates it here with the one field
+	// the CRD requires. It goes in the ControlPlane's own namespace, which is what
+	// the ref's empty namespace resolves to.
+	g.Expect(c.Create(ctx, &ovnv1alpha1.OVNCentral{
+		ObjectMeta: metav1.ObjectMeta{Name: "cp-ovn", Namespace: ns.Name},
+		Spec: ovnv1alpha1.OVNCentralSpec{
+			TLS: ovnv1alpha1.OVNTLSSpec{IssuerRef: ovnv1alpha1.OVNIssuerRef{Name: "test-issuer"}},
+		},
+	})).To(Succeed(), "create the referenced OVNCentral")
+
 	g.Expect(c.Create(ctx, cp)).To(Succeed(), "create ControlPlane CR")
 	cpKey := types.NamespacedName{Name: cp.Name, Namespace: ns.Name}
 
-	// --- Phase 1: Infrastructure (MariaDB + Memcached). ---
+	// --- Phase 1: Infrastructure (MariaDB + Memcached + the shared bus). ---
 	simulateMariaDBReadyWhenPresent(t, ctx, c, client.ObjectKey{Name: "openstack-db", Namespace: ns.Name})
 	simulateMemcachedReadyWhenPresent(t, ctx, c, client.ObjectKey{Name: "openstack-memcached", Namespace: ns.Name})
+	simulateRabbitmqClusterReadyWhenPresent(t, ctx, c, client.ObjectKey{Name: "cp-rabbitmq", Namespace: ns.Name})
+	// The OVN step carries no condition gate and owns nothing, so the central's
+	// readiness is reported here rather than in Phase 9: the Neutron registration
+	// Phase 5.6 drives is not projected until OVNReady is True.
+	simulateOVNCentralReadyWhenPresent(t, ctx, c, client.ObjectKey{Name: "cp-ovn", Namespace: ns.Name})
 	waitForControlPlaneCondition(t, ctx, c, cpKey, conditionTypeInfrastructureReady, metav1.ConditionTrue, itEventuallyTimeout)
 
 	// gate Keystone on the per-CP DB credential ExternalSecret. DECISION:
@@ -1328,20 +1479,23 @@ func TestIntegration_FullReconcile_ManagedToReady(t *testing.T) {
 	simulateCatalogServiceEndpointAvailableWhenPresent(t, ctx, c, cp)
 	waitForControlPlaneCondition(t, ctx, c, cpKey, conditionTypeCatalogReady, metav1.ConditionTrue, itEventuallyTimeout)
 
-	// --- Phase 5.6: the built-in registrations. Glance, Placement and Barbican each
-	// project one KeystoneService child carrying that service's catalog row and its
-	// Keystone account. The registration controller running beside the ControlPlane
-	// reconciles them, so the same K-ORC and ESO round-trip is replayed once per
-	// child — and until each reports AccountReady, no service child is projected at
-	// all. ---
+	// --- Phase 5.6: the built-in registrations. Glance, Placement, Barbican and
+	// Neutron each project one KeystoneService child carrying that service's catalog
+	// row and its Keystone account. The registration controller running beside the
+	// ControlPlane reconciles them, so the same K-ORC and ESO round-trip is replayed
+	// once per child — and until each reports AccountReady, no service child is
+	// projected at all. The Neutron one appears only because OVNReady is already
+	// True and the bus was delivered: both gates sit ahead of the registration. ---
 	glanceReg := simulateBuiltinRegistrationConvergedWhenPresent(t, ctx, c, cp,
 		client.ObjectKey{Name: glanceName(cp), Namespace: cp.GlanceNamespace()})
 	placementReg := simulateBuiltinRegistrationConvergedWhenPresent(t, ctx, c, cp,
 		client.ObjectKey{Name: placementName(cp), Namespace: cp.PlacementNamespace()})
 	barbicanReg := simulateBuiltinRegistrationConvergedWhenPresent(t, ctx, c, cp,
 		client.ObjectKey{Name: barbicanName(cp), Namespace: cp.BarbicanNamespace()})
+	neutronReg := simulateBuiltinRegistrationConvergedWhenPresent(t, ctx, c, cp,
+		client.ObjectKey{Name: neutronName(cp), Namespace: cp.NeutronNamespace()})
 
-	// The ServiceAccounts member aggregates those three children into
+	// The ServiceAccounts member aggregates those four children into
 	// ServiceAccountsReady, which is the condition operators alert on: with every
 	// registration Ready it reports how many were counted.
 	serviceAccountsReady := waitForControlPlaneCondition(t, ctx, c, cpKey,
@@ -1358,6 +1512,7 @@ func TestIntegration_FullReconcile_ManagedToReady(t *testing.T) {
 		{glanceReg, "glance", "service-glance"},
 		{placementReg, "placement", "service-placement"},
 		{barbicanReg, "barbican", "service-barbican"},
+		{neutronReg, "neutron", "service-neutron"},
 	} {
 		account := registration.child.Spec.Account
 		g.Expect(account).NotTo(BeNil(), "the %q registration must declare a service account", registration.user)
@@ -1883,6 +2038,140 @@ func TestIntegration_FullReconcile_ManagedToReady(t *testing.T) {
 	simulateBarbicanReadyWhenPresent(t, ctx, c, barbicanKey)
 	waitForControlPlaneCondition(t, ctx, c, cpKey, conditionTypeBarbicanReady, metav1.ConditionTrue, itEventuallyTimeout)
 
+	// --- Phase 9: Neutron child (the network service, behind Barbican). It carries
+	// two gates none of its peers have: the OVNCentral its ML2/OVN mechanism driver
+	// programs, whose readiness a step that owns nothing mirrors into OVNReady, and
+	// the shared bus, which the ControlPlane resolves itself and delivers into the
+	// network service's namespace as a Secret the child references brownfield. Both
+	// were opened in Phase 1, so what is left is the Dynamic-default credential and
+	// the child. ---
+	ovnReady := waitForControlPlaneCondition(t, ctx, c, cpKey,
+		conditionTypeOVNReady, metav1.ConditionTrue, itEventuallyTimeout)
+	g.Expect(ovnReady.Reason).To(Equal("OVNCentralReady"),
+		"the referenced central serves both databases and has published its client Secret")
+
+	simulateNeutronDBCredentialSyncWhenPresent(t, ctx, c, cp)
+
+	// The bus delivery: one Secret beside the Neutron child carrying the transport
+	// URL assembled from the broker's default-user credentials, on the root vhost.
+	// The neutron operator resolves spec.messaging in the Neutron's own namespace,
+	// which is where this lands.
+	busSecret := &corev1.Secret{}
+	g.Eventually(func() error {
+		return c.Get(ctx, client.ObjectKey{Name: neutronMessagingSecretName(cp), Namespace: ns.Name}, busSecret)
+	}, itEventuallyTimeout, itPollInterval).Should(Succeed(),
+		"the ControlPlane must deliver the shared bus into the network service's namespace")
+	g.Expect(string(busSecret.Data[commonv1.DefaultTransportURLSecretKey])).To(
+		Equal(fmt.Sprintf("rabbit://default-user:broker-password@cp-rabbitmq.%s.svc:5672/", ns.Name)),
+		"the transport URL is assembled from the four keys of the broker's default-user Secret")
+	// A plaintext bus declares no TLS, so no CA mirror is written beside it: a trust
+	// anchor nothing reads would be residue the teardown has to sweep.
+	g.Expect(apierrors.IsNotFound(c.Get(ctx, client.ObjectKey{
+		Name: neutronMessagingCASecretName(cp), Namespace: ns.Name,
+	}, &corev1.Secret{}))).To(BeTrue(), "a bus without tls leaves no CA mirror in the Neutron namespace")
+
+	neutronKey := client.ObjectKey{Name: neutronName(cp), Namespace: ns.Name}
+	projectedNeutron := &neutronv1alpha1.Neutron{}
+	g.Eventually(func() error {
+		return c.Get(ctx, neutronKey, projectedNeutron)
+	}, itEventuallyTimeout, itPollInterval).Should(Succeed(),
+		"Neutron child should be projected once KeystoneReady, OVNReady and the Neutron registration are ready")
+
+	// Release and image: the canonical repository with the release-derived tag.
+	g.Expect(projectedNeutron.Spec.OpenStackRelease).To(Equal("2025.2"))
+	g.Expect(projectedNeutron.Spec.Image.Repository).To(Equal(defaultNeutronRepository))
+	g.Expect(projectedNeutron.Spec.Image.Tag).To(Equal("2025.2"), "Neutron image tag must derive from openStackRelease")
+
+	// extraConfig: this fixture declares no services.neutron.extraConfig, so the
+	// merge is the global section alone.
+	g.Expect(projectedNeutron.Spec.ExtraConfig).To(Equal(map[string]map[string]string{
+		"cors": {"allowed_origin": "https://dashboard.example.com"},
+	}), "globalExtraConfig reaches the network service too")
+
+	// Database: the shared managed cluster, the fixed "neutron" logical schema, and
+	// the operator-owned engine-issued DB credential (Dynamic is the default on the
+	// managed shared database, as it is for every peer).
+	g.Expect(projectedNeutron.Spec.Database.ClusterRef).NotTo(BeNil(), "Neutron database clusterRef must be wired")
+	g.Expect(projectedNeutron.Spec.Database.ClusterRef.Name).To(Equal("openstack-db"))
+	g.Expect(projectedNeutron.Spec.Database.Database).To(Equal("neutron"))
+	g.Expect(projectedNeutron.Spec.Database.SecretRef.Name).To(Equal(neutronDBCredentialSecretName(cp)),
+		"managed Neutron DB secretRef must point at the operator-owned per-CP Neutron DB-credential Secret")
+	g.Expect(projectedNeutron.Spec.Database.SecretRef.Key).To(Equal("password"))
+	g.Expect(projectedNeutron.Spec.Database.CredentialsMode).To(Equal(commonv1.CredentialsModeDynamic),
+		"the projected Neutron DB credential defaults to Dynamic (engine-issued)")
+
+	// Cache: the shared managed Memcached.
+	g.Expect(projectedNeutron.Spec.Cache.ClusterRef).NotTo(BeNil(), "Neutron cache clusterRef must be wired")
+	g.Expect(projectedNeutron.Spec.Cache.ClusterRef.Name).To(Equal("openstack-memcached"))
+
+	// Keystone endpoint: derived TOP-DOWN from the naming convention, because
+	// Neutron validates every token against it from inside the cluster.
+	g.Expect(projectedNeutron.Spec.KeystoneEndpoint).To(
+		Equal(fmt.Sprintf("http://%s.%s.svc:5000/v3", keystoneName(cp), ns.Name)),
+		"keystoneEndpoint must be the cluster-local Keystone Service URL",
+	)
+	g.Expect(projectedNeutron.Spec.KeystonePublicEndpoint).To(BeEmpty(),
+		"this fixture exposes Keystone nowhere externally, so the child falls back to the internal endpoint")
+
+	// Service user: the identity the Neutron registration provisions (its own
+	// service-neutron project) and the consumer Secret it delivers, in the admin
+	// domain the registration resolves the account in.
+	g.Expect(projectedNeutron.Spec.ServiceUser.Username).To(Equal("neutron"))
+	g.Expect(projectedNeutron.Spec.ServiceUser.ProjectName).To(Equal("service-neutron"))
+	g.Expect(projectedNeutron.Spec.ServiceUser.UserDomainName).To(Equal(adminDomainName(cp)))
+	g.Expect(projectedNeutron.Spec.ServiceUser.ProjectDomainName).To(Equal(adminDomainName(cp)))
+	g.Expect(projectedNeutron.Spec.ServiceUser.SecretRef.Name).
+		To(Equal(keystoneServiceCredentialsSecretName(neutronReg)),
+			"Neutron service-user password must read the registration's consumer Secret")
+	g.Expect(projectedNeutron.Spec.ServiceUser.SecretRef.Key).To(Equal("password"))
+
+	// The ControlPlane's RESOLVED store selection, so the child never falls back to
+	// its own shared-cluster-store default.
+	g.Expect(projectedNeutron.Spec.SecretStoreRef).NotTo(BeNil(), "the resolved store ref must be projected")
+	g.Expect(projectedNeutron.Spec.SecretStoreRef.Kind).To(Equal(commonv1.SecretStoreKindNamespaced))
+	g.Expect(projectedNeutron.Spec.SecretStoreRef.Name).To(Equal(esoTenantStoreName))
+
+	// Two replica counts, one overridden and one not: the RPC workers take the
+	// declared count, the API pods the shared operator default.
+	g.Expect(projectedNeutron.Spec.Deployment.Replicas).To(Equal(commonv1.DefaultReplicas),
+		"replicas fall back to the shared operator default when services.neutron sets none")
+	g.Expect(projectedNeutron.Spec.Workers.Deployment.Replicas).To(Equal(int32(1)),
+		"services.neutron.workerReplicas sizes both RPC worker Deployments")
+
+	// The bus reaches the child as a brownfield secretRef naming the Secret asserted
+	// above, never as the managed clusterRef the ControlPlane resolved it from: the
+	// neutron operator would look for that RabbitmqCluster in the Neutron's own
+	// namespace on the Neutron's own cluster.
+	g.Expect(projectedNeutron.Spec.Messaging.ClusterRef).To(BeNil())
+	g.Expect(projectedNeutron.Spec.Messaging.SecretRef).NotTo(BeNil())
+	g.Expect(projectedNeutron.Spec.Messaging.SecretRef.Name).To(Equal(neutronMessagingSecretName(cp)))
+	g.Expect(projectedNeutron.Spec.Messaging.SecretRef.Key).To(Equal(commonv1.DefaultTransportURLSecretKey))
+	g.Expect(projectedNeutron.Spec.Messaging.TLS).To(BeNil(),
+		"the bus declares no tls, so the child names no CA mirror")
+
+	// The OVN control plane, with the namespace RESOLVED by the ControlPlane rather
+	// than left for the child to default.
+	g.Expect(projectedNeutron.Spec.OVN.CentralRef.Name).To(Equal("cp-ovn"))
+	g.Expect(projectedNeutron.Spec.OVN.CentralRef.Namespace).To(Equal(ns.Name),
+		"an empty ref namespace resolves to the ControlPlane's own namespace")
+
+	g.Expect(projectedNeutron.Spec.APIServer).To(BeNil(),
+		"spec.apiServer is deliberately unset: the child-side uWSGI defaults stay authoritative")
+	g.Expect(projectedNeutron.Spec.OVNDBSync).To(BeNil(),
+		"spec.ovnDBSync is deliberately unset: the child-side schedule stays authoritative")
+
+	// The child is co-located with the ControlPlane, so ownership is a controller
+	// owner reference rather than the labels a cross-namespace child carries.
+	neutronOwner := metav1.GetControllerOf(projectedNeutron)
+	g.Expect(neutronOwner).NotTo(BeNil(), "Neutron child must be controller-owned by the ControlPlane")
+	g.Expect(neutronOwner.Kind).To(Equal("ControlPlane"))
+	g.Expect(neutronOwner.Name).To(Equal(cp.Name))
+
+	simulateNeutronReadyWhenPresent(t, ctx, c, neutronKey)
+	neutronReady := waitForControlPlaneCondition(t, ctx, c, cpKey,
+		conditionTypeNeutronReady, metav1.ConditionTrue, itEventuallyTimeout)
+	g.Expect(neutronReady.Reason).To(Equal("NeutronReady"))
+
 	// --- Aggregate: Ready=True. ---
 	waitForControlPlaneCondition(t, ctx, c, cpKey, conditionTypeReady, metav1.ConditionTrue, itEventuallyTimeout)
 
@@ -1902,6 +2191,8 @@ func TestIntegration_FullReconcile_ManagedToReady(t *testing.T) {
 		conditionTypeGlanceReady,
 		conditionTypePlacementReady,
 		conditionTypeBarbicanReady,
+		conditionTypeOVNReady,
+		conditionTypeNeutronReady,
 		conditionTypeReady,
 	} {
 		cond := meta.FindStatusCondition(final.Status.Conditions, condType)
@@ -1919,9 +2210,9 @@ func TestIntegration_FullReconcile_ManagedToReady(t *testing.T) {
 
 	// status.services reports one entry per configured service, all ready, in the
 	// stable order setServicesStatus produces (keystone, horizon, glance, placement,
-	// barbican).
-	g.Expect(final.Status.Services).To(HaveLen(5),
-		"five services are configured (keystone, horizon, glance, placement, barbican)")
+	// barbican, neutron).
+	g.Expect(final.Status.Services).To(HaveLen(6),
+		"six services are configured (keystone, horizon, glance, placement, barbican, neutron)")
 	g.Expect(final.Status.Services[0].Name).To(Equal("keystone"))
 	g.Expect(final.Status.Services[0].Ready).To(BeTrue())
 	g.Expect(final.Status.Services[1].Name).To(Equal("horizon"))
@@ -1934,6 +2225,9 @@ func TestIntegration_FullReconcile_ManagedToReady(t *testing.T) {
 	g.Expect(final.Status.Services[4].Name).To(Equal("barbican"))
 	g.Expect(final.Status.Services[4].Ready).To(BeTrue())
 	g.Expect(final.Status.Services[4].Release).To(Equal("2025.2"))
+	g.Expect(final.Status.Services[5].Name).To(Equal("neutron"))
+	g.Expect(final.Status.Services[5].Ready).To(BeTrue())
+	g.Expect(final.Status.Services[5].Release).To(Equal("2025.2"))
 
 	// Every condition records the generation it was observed against.
 	for _, cond := range final.Status.Conditions {

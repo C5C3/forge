@@ -58,6 +58,7 @@ import (
 	c5c3v1alpha1 "github.com/c5c3/cobaltcore/operators/c5c3/api/v1alpha1"
 	"github.com/c5c3/cobaltcore/operators/c5c3/internal/testutil"
 	keystonev1alpha1 "github.com/c5c3/cobaltcore/operators/keystone/api/v1alpha1"
+	ovnv1alpha1 "github.com/c5c3/cobaltcore/operators/ovn/api/v1alpha1"
 )
 
 // TestIntegration_Multicluster_ControlPlanePlacement runs the ControlPlane
@@ -66,8 +67,9 @@ import (
 // registration, a ControlPlane that places its Keystone service on the target,
 // the admin password it has to read back off that cluster, a placed built-in
 // service whose registration stays home while its credentials are mirrored onto
-// the target, a ControlPlane naming an unregistered cluster, and the deletion
-// that sweeps the placed namespaces off the target again.
+// the target, a placed network service that takes the shared bus and its OVN gate
+// with it, a ControlPlane naming an unregistered cluster, and the deletion that
+// sweeps the placed namespaces off the target again.
 func TestIntegration_Multicluster_ControlPlanePlacement(t *testing.T) {
 	testutil.SkipIfEnvTestUnavailable(t)
 
@@ -84,7 +86,21 @@ func TestIntegration_Multicluster_ControlPlanePlacement(t *testing.T) {
 		mcNamespace         = "mc-cp"
 		mcKeystoneNamespace = "mc-cp-identity"
 		mcGlanceNamespace   = "mc-cp-image"
+		mcNetworkNamespace  = "mc-cp-network"
 		mcControlPlane      = "cp"
+
+		// The OVN control plane the network service programs. It is deployed
+		// outside the ControlPlane and only referenced, so this test creates it
+		// and drives its status the way the ovn-operator would.
+		mcOVNCentral = "mc-ovn"
+
+		// The shared message bus, declared brownfield: this plane has no broker to
+		// simulate, and a URL in a Secret is what a brownfield block resolves to.
+		// mcBusSecret lives in the ControlPlane's own namespace, which is where the
+		// bus is declared and read; mcBusTransportURL is what a placed service must
+		// receive on the cluster it runs on.
+		mcBusSecret       = "mc-bus-url"
+		mcBusTransportURL = "rabbit://u:p@bus.mc-cp.svc:5672/"
 
 		mcUnknownNamespace  = "mc-unknown"
 		mcUnknownKeystoneNS = "mc-unknown-identity"
@@ -194,6 +210,14 @@ func TestIntegration_Multicluster_ControlPlanePlacement(t *testing.T) {
 	mcEnsureNamespace(t, ctx, mgmtClient, mcClustersNamespace)
 
 	cp := integrationManagedControlPlane(mcControlPlane, mcNamespace)
+	// The bus is declared from the start rather than added with the network
+	// service: the validating webhook requires it beside services.neutron, and a
+	// messaging block cannot be added to a live ControlPlane and then removed
+	// again, so declaring it once keeps the later update to the service block
+	// alone.
+	cp.Spec.Infrastructure.Messaging = &commonv1.MessagingSpec{
+		SecretRef: &commonv1.SecretRefSpec{Name: mcBusSecret},
+	}
 	cpKey := types.NamespacedName{Name: mcControlPlane, Namespace: mcNamespace}
 
 	// Every object the placed Keystone service takes with it, keyed in the
@@ -218,6 +242,10 @@ func TestIntegration_Multicluster_ControlPlanePlacement(t *testing.T) {
 	dbCredKey := client.ObjectKey{Namespace: mcKeystoneNamespace, Name: dbCredentialSecretName(cp)}
 	dbCredCertKey := client.ObjectKey{Namespace: mcKeystoneNamespace, Name: dbCredentialClientCertName(cp)}
 	adminPasswordKey := client.ObjectKey{Namespace: mcKeystoneNamespace, Name: adminPasswordSecretName(cp)}
+	// The one object the placed NETWORK service takes with it that no other
+	// service has: the shared bus, delivered as a Secret on the cluster Neutron
+	// runs on. It is asserted in the network subtest and swept in the deletion one.
+	neutronBusKey := client.ObjectKey{Namespace: mcNetworkNamespace, Name: neutronMessagingSecretName(cp)}
 
 	t.Run("register the target cluster", func(t *testing.T) {
 		g := NewGomegaWithT(t)
@@ -251,6 +279,13 @@ func TestIntegration_Multicluster_ControlPlanePlacement(t *testing.T) {
 		// seeded yet: that namespace does not exist on either cluster until the
 		// reconciler creates it.
 		ensureReadySecretStore(t, ctx, mgmtClient, esoTenantStoreName, mcNamespace)
+		// The brownfield bus the ControlPlane declares. It is read in the
+		// ControlPlane's own namespace on the management cluster, whatever cluster
+		// the service consuming it runs on.
+		g.Expect(mgmtClient.Create(ctx, &corev1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: mcBusSecret, Namespace: mcNamespace},
+			Data:       map[string][]byte{commonv1.DefaultTransportURLSecretKey: []byte(mcBusTransportURL)},
+		})).To(Succeed(), "seed the brownfield transport-URL Secret")
 
 		cp.Spec.Services.Keystone.Namespace = &c5c3v1alpha1.ServiceNamespaceSpec{
 			Name:      mcKeystoneNamespace,
@@ -587,6 +622,143 @@ func TestIntegration_Multicluster_ControlPlanePlacement(t *testing.T) {
 		g.Expect(cond.Reason).To(Equal(reasonWaitingForServiceRegistration))
 	})
 
+	t.Run("a placed network service takes its bus credentials and its OVN gate with it", func(t *testing.T) {
+		g := NewGomegaWithT(t)
+
+		// The OVNCentral the network service programs, created beside the
+		// ControlPlane rather than in the network namespace: the ref below spells no
+		// namespace, and an empty one resolves to the ControlPlane's own namespace.
+		// The defaulting webhook writes that value into the ref, and
+		// NeutronOVNCentralNamespace() reads an empty one the same way for a CR that
+		// bypassed admission. Its targetClusterRef names the cluster the service is
+		// placed on, so reconcileOVN selects the in-cluster database addresses and
+		// never demands externallyReachable.
+		ovnKey := client.ObjectKey{Namespace: mcNamespace, Name: mcOVNCentral}
+		g.Expect(mgmtClient.Create(ctx, &ovnv1alpha1.OVNCentral{
+			ObjectMeta: metav1.ObjectMeta{Name: mcOVNCentral, Namespace: mcNamespace},
+			Spec: ovnv1alpha1.OVNCentralSpec{
+				TLS:              ovnv1alpha1.OVNTLSSpec{IssuerRef: ovnv1alpha1.OVNIssuerRef{Name: "test-issuer"}},
+				TargetClusterRef: &commonv1.TargetClusterRefSpec{Name: mcTargetCluster},
+			},
+		})).To(Succeed(), "create the referenced OVNCentral on the management cluster")
+		simulateOVNCentralReadyWhenPresent(t, ctx, mgmtClient, ovnKey)
+
+		// The network service joins the plane on the same target cluster, in a
+		// namespace of its own, advertising an externally routable address for the
+		// reason its image sibling does.
+		g.Eventually(func() error {
+			live := &c5c3v1alpha1.ControlPlane{}
+			if err := mgmtClient.Get(ctx, cpKey, live); err != nil {
+				return err
+			}
+			live.Spec.Services.Neutron = &c5c3v1alpha1.ServiceNeutronSpec{
+				WorkerReplicas: ptr.To(int32(1)),
+				OVN: c5c3v1alpha1.NeutronOVNSpec{
+					CentralRef: c5c3v1alpha1.NeutronOVNCentralRef{Name: mcOVNCentral},
+				},
+				Namespace: &c5c3v1alpha1.ServiceNamespaceSpec{
+					Name:      mcNetworkNamespace,
+					Lifecycle: c5c3v1alpha1.ServiceNamespaceLifecycleManaged,
+				},
+				PublicEndpoint:   "https://neutron.example.com",
+				TargetClusterRef: &commonv1.TargetClusterRefSpec{Name: mcTargetCluster},
+			}
+			return mgmtClient.Update(ctx, live)
+		}, itEventuallyTimeout, itPollInterval).Should(Succeed(), "place the network service on the target cluster")
+
+		// --- The namespace is created on both clusters, and the backing services
+		// follow the service onto the target. Infrastructure short-circuits the
+		// pipeline while either is converging, so nothing below runs until they
+		// report.
+		networkNSKey := client.ObjectKey{Name: mcNetworkNamespace}
+		mcEventuallyExists(t, ctx, targetClient, networkNSKey, &corev1.Namespace{}, "network service namespace")
+		mcEventuallyExists(t, ctx, mgmtClient, networkNSKey, &corev1.Namespace{}, "network service namespace")
+
+		neutronMariaDBKey := client.ObjectKey{
+			Namespace: mcNetworkNamespace,
+			Name:      cp.Spec.Infrastructure.Database.ClusterRef.Name,
+		}
+		neutronMemcachedKey := client.ObjectKey{
+			Namespace: mcNetworkNamespace,
+			Name:      cp.Spec.Infrastructure.Cache.ClusterRef.Name,
+		}
+		mcEventuallyExists(t, ctx, targetClient, neutronMariaDBKey, &mariadbv1alpha1.MariaDB{}, "network-side MariaDB")
+		mcExpectAbsent(t, ctx, mgmtClient, neutronMariaDBKey, &mariadbv1alpha1.MariaDB{}, "network-side MariaDB")
+		simulateMariaDBReadyWhenPresent(t, ctx, targetClient, neutronMariaDBKey)
+		simulateMemcachedReadyWhenPresent(t, ctx, targetClient, neutronMemcachedKey)
+
+		// --- The tenant store of the placed namespace exists on both clusters, for
+		// the reason the image service's does, and the plane is gated on both.
+		networkStoreKey := client.ObjectKey{Namespace: mcNetworkNamespace, Name: esoTenantStoreName}
+		mcEventuallyExists(t, ctx, mgmtClient, networkStoreKey, &esov1.SecretStore{}, "management-side tenant SecretStore")
+		mcEventuallyExists(t, ctx, targetClient, networkStoreKey, &esov1.SecretStore{}, "target-side tenant SecretStore")
+		ensureReadySecretStore(t, ctx, mgmtClient, esoTenantStoreName, mcNetworkNamespace)
+		ensureReadySecretStore(t, ctx, targetClient, esoTenantStoreName, mcNetworkNamespace)
+		waitForControlPlaneCondition(t, ctx, mgmtClient, cpKey,
+			conditionTypeESOTenantStoreReady, metav1.ConditionTrue, itEventuallyTimeout)
+
+		// --- The OVN gate. The ControlPlane owns nothing of it: it reads the central
+		// on the management cluster and mirrors the verdict, which is what the
+		// projection behind it consumes.
+		// The wait is on the reason as well as on the status: before the network
+		// service was declared OVNReady was already True, with reason OVNNotManaged.
+		g.Eventually(func(ig Gomega) {
+			live := &c5c3v1alpha1.ControlPlane{}
+			ig.Expect(mgmtClient.Get(ctx, cpKey, live)).To(Succeed())
+			cond := meta.FindStatusCondition(live.Status.Conditions, conditionTypeOVNReady)
+			ig.Expect(cond).NotTo(BeNil())
+			ig.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+			ig.Expect(cond.Reason).To(Equal("OVNCentralReady"))
+		}, itEventuallyTimeout, itPollInterval).Should(Succeed(),
+			"the referenced central serves both databases on the cluster the service was placed on")
+
+		// --- The bus follows the service. It is declared and read in the
+		// ControlPlane's own namespace on the management cluster, and delivered as a
+		// Secret in the network namespace on the cluster the service runs on, claimed
+		// by the ownership labels because no owner reference crosses a cluster.
+		busSecret := &corev1.Secret{}
+		mcEventuallyExists(t, ctx, targetClient, neutronBusKey, busSecret, "neutron messaging Secret")
+		g.Expect(string(busSecret.Data[commonv1.DefaultTransportURLSecretKey])).To(Equal(mcBusTransportURL),
+			"the placed service receives the URL the ControlPlane's own bus block declares")
+		mcExpectRemoteClaim(t, ctx, targetClient, neutronBusKey, &corev1.Secret{}, "neutron messaging Secret", cp)
+		mcExpectAbsent(t, ctx, mgmtClient, neutronBusKey, &corev1.Secret{}, "neutron messaging Secret")
+
+		// --- The registration is reconciled at home whatever cluster the service
+		// runs on, exactly as the image service's is.
+		registrationKey := client.ObjectKey{Namespace: mcNetworkNamespace, Name: mcControlPlane + "-neutron"}
+		mcEventuallyExists(t, ctx, mgmtClient, registrationKey, &c5c3v1alpha1.KeystoneService{},
+			"Neutron registration")
+		mcExpectAbsent(t, ctx, targetClient, registrationKey, &c5c3v1alpha1.KeystoneService{},
+			"Neutron registration")
+
+		// --- Its credentials, though, follow the service: the ControlPlane
+		// materialises the registration's own OpenBao path a second time on the
+		// cluster the network service runs on, under the name its pods read.
+		mirrorKey := client.ObjectKey{Namespace: mcNetworkNamespace, Name: mcControlPlane + "-neutron-credentials"}
+		mirror := &esov1.ExternalSecret{}
+		mcEventuallyExists(t, ctx, targetClient, mirrorKey, mirror, "registration credentials mirror")
+		g.Expect(mirror.Spec.Data).NotTo(BeEmpty())
+		g.Expect(mirror.Spec.Data[0].RemoteRef.Key).To(Equal(
+			"openstack/keystone/"+mcNetworkNamespace+"/"+mcControlPlane+"-neutron/service-accounts/credentials"),
+			"the mirror reads the registration's own per-CR OpenBao path")
+		mcExpectRemoteClaim(t, ctx, targetClient, mirrorKey, &esov1.ExternalSecret{},
+			"registration credentials mirror", cp)
+
+		// --- And that is as far as this plane goes: no KeystoneService controller
+		// runs here, so the registration never provisions the Keystone account and
+		// NeutronReady parks on it rather than projecting a Neutron that would
+		// authenticate as a user nothing created.
+		g.Eventually(func(ig Gomega) {
+			live := &c5c3v1alpha1.ControlPlane{}
+			ig.Expect(mgmtClient.Get(ctx, cpKey, live)).To(Succeed())
+			cond := meta.FindStatusCondition(live.Status.Conditions, conditionTypeNeutronReady)
+			ig.Expect(cond).NotTo(BeNil())
+			ig.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+			ig.Expect(cond.Reason).To(Equal(reasonWaitingForServiceRegistration))
+		}, itEventuallyTimeout, itPollInterval).Should(Succeed(),
+			"the network service parks on the account its registration has not provisioned")
+	})
+
 	t.Run("a ControlPlane naming an unregistered cluster creates nothing", func(t *testing.T) {
 		g := NewGomegaWithT(t)
 
@@ -658,6 +830,7 @@ func TestIntegration_Multicluster_ControlPlanePlacement(t *testing.T) {
 			{dbCredKey, &esgenv1alpha1.VaultDynamicSecret{}, "DB-credential generator"},
 			{dbCredKey, &esov1.ExternalSecret{}, "DB-credential ExternalSecret"},
 			{adminPasswordKey, &esov1.ExternalSecret{}, "admin-password ExternalSecret"},
+			{neutronBusKey, &corev1.Secret{}, "neutron messaging Secret"},
 		}
 		g.Eventually(func(ig Gomega) {
 			for _, child := range swept {
@@ -673,14 +846,16 @@ func TestIntegration_Multicluster_ControlPlanePlacement(t *testing.T) {
 		// Terminating forever. The DeletionTimestamp is what the operator is
 		// responsible for, on both clusters — it created the namespace on both.
 		for name, c := range map[string]client.Client{"target": targetClient, "management": mgmtClient} {
-			g.Eventually(func() bool {
-				ns := &corev1.Namespace{}
-				if err := c.Get(ctx, client.ObjectKey{Name: mcKeystoneNamespace}, ns); err != nil {
-					return apierrors.IsNotFound(err)
-				}
-				return !ns.DeletionTimestamp.IsZero()
-			}, itEventuallyTimeout, itPollInterval).Should(BeTrue(),
-				"the Managed service namespace must be deleted on the %s cluster", name)
+			for _, namespace := range []string{mcKeystoneNamespace, mcNetworkNamespace} {
+				g.Eventually(func() bool {
+					ns := &corev1.Namespace{}
+					if err := c.Get(ctx, client.ObjectKey{Name: namespace}, ns); err != nil {
+						return apierrors.IsNotFound(err)
+					}
+					return !ns.DeletionTimestamp.IsZero()
+				}, itEventuallyTimeout, itPollInterval).Should(BeTrue(),
+					"the Managed %s namespace must be deleted on the %s cluster", namespace, name)
+			}
 		}
 
 		// Both finalizers released, so the CR leaves etcd.
