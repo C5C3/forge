@@ -269,12 +269,12 @@ main() {
   # onboarding, next to the presence-independent barbican-db auth role in
   # setup-auth.sh.
   #
-  # MUST STAY IN SYNC (neutron): the neutron-<namespace> role name below and the
-  # fixed 'neutron' schema are the derivation the c5c3 operator's Neutron DB
-  # credential leg has to assert once #906 adds spec.services.neutron. Until then
-  # no ControlPlane declares a neutron service, so the presence gate skips this
-  # leg on every run. Its auth half, the neutron-db role and the policy it
-  # binds, lands with #906 too.
+  # MUST STAY IN SYNC (neutron): the neutron-<namespace> role name below is the
+  # derivation neutronDBDynamicRoleFor asserts in
+  # operators/c5c3/internal/controller/reconcile_neutron_dbcredentials.go, and the
+  # schema is the fixed 'neutron' one. This leg is the engine half of the neutron
+  # onboarding; the auth half is in setup-auth.sh, where the neutron-db role binds
+  # the neutron-db-dynamic policy that grants exactly this creds path.
   local svc svc_ns svc_mariadb
   for svc in glance placement barbican neutron; do
     if [[ -z "$(get_controlplane_field "{.spec.services.${svc}}" '')" ]]; then

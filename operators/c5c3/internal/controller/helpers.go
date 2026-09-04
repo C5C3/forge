@@ -144,6 +144,30 @@ func effectiveBarbicanCache(cp *c5c3v1alpha1.ControlPlane) *commonv1.CacheSpec {
 	return nil
 }
 
+// effectiveNeutronDatabase resolves the database instance the Neutron service
+// connects to.
+func effectiveNeutronDatabase(cp *c5c3v1alpha1.ControlPlane) *commonv1.DatabaseSpec {
+	if db := cp.DedicatedNeutronDatabase(); db != nil {
+		return db
+	}
+	if cp.Spec.Infrastructure != nil {
+		return &cp.Spec.Infrastructure.Database
+	}
+	return nil
+}
+
+// effectiveNeutronCache resolves the cache instance the Neutron service connects
+// to.
+func effectiveNeutronCache(cp *c5c3v1alpha1.ControlPlane) *commonv1.CacheSpec {
+	if cache := cp.DedicatedNeutronCache(); cache != nil {
+		return cache
+	}
+	if cp.Spec.Infrastructure != nil {
+		return &cp.Spec.Infrastructure.Cache
+	}
+	return nil
+}
+
 // targetClusterRefForNamespace resolves the target cluster the namespace named
 // namespace lives on: nil — the local cluster the operator runs on — for the
 // ControlPlane's own namespace, and otherwise the ref of a service that declares
@@ -173,6 +197,7 @@ func targetClusterRefForNamespace(cp *c5c3v1alpha1.ControlPlane, namespace strin
 		{cp.GlanceNamespace(), cp.GlanceTargetClusterRef()},
 		{cp.PlacementNamespace(), cp.PlacementTargetClusterRef()},
 		{cp.BarbicanNamespace(), cp.BarbicanTargetClusterRef()},
+		{cp.NeutronNamespace(), cp.NeutronTargetClusterRef()},
 	} {
 		if svc.namespace == namespace {
 			return svc.ref

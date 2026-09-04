@@ -453,6 +453,14 @@ func (r *ControlPlaneReconciler) managedInfraInstances(cp *c5c3v1alpha1.ControlP
 		addCache(effectiveBarbicanCache(cp), barbicanNS, barbicanCacheDeclaredAt(cp))
 	}
 
+	// Neutron's database and cache are gated on the DECLARATION for the same
+	// no-consumer-no-instance reason as Barbican's above.
+	if cp.Spec.Services.Neutron != nil {
+		neutronNS := cp.NeutronNamespace()
+		addDatabase(effectiveNeutronDatabase(cp), neutronNS, neutronDatabaseDeclaredAt(cp))
+		addCache(effectiveNeutronCache(cp), neutronNS, neutronCacheDeclaredAt(cp))
+	}
+
 	// The shared message bus is the one class enumerated at the ControlPlane's
 	// own namespace regardless of consumers: see the doc comment above. The nil
 	// check on the block mirrors the effective-* resolvers, so a webhook-bypassed
@@ -527,6 +535,20 @@ func barbicanDatabaseDeclaredAt(cp *c5c3v1alpha1.ControlPlane) string {
 func barbicanCacheDeclaredAt(cp *c5c3v1alpha1.ControlPlane) string {
 	if cp.DedicatedBarbicanCache() != nil {
 		return "spec.services.barbican.dedicatedBackingServices.cache"
+	}
+	return "spec.infrastructure.cache"
+}
+
+func neutronDatabaseDeclaredAt(cp *c5c3v1alpha1.ControlPlane) string {
+	if cp.DedicatedNeutronDatabase() != nil {
+		return "spec.services.neutron.dedicatedBackingServices.database"
+	}
+	return "spec.infrastructure.database"
+}
+
+func neutronCacheDeclaredAt(cp *c5c3v1alpha1.ControlPlane) string {
+	if cp.DedicatedNeutronCache() != nil {
+		return "spec.services.neutron.dedicatedBackingServices.cache"
 	}
 	return "spec.infrastructure.cache"
 }

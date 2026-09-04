@@ -33,6 +33,10 @@ func TestTargetClusterRefForNamespace(t *testing.T) {
 					Horizon: &c5c3v1alpha1.ServiceHorizonSpec{
 						Namespace: &c5c3v1alpha1.ServiceNamespaceSpec{Name: "dashboard"},
 					},
+					Neutron: &c5c3v1alpha1.ServiceNeutronSpec{
+						Namespace:        &c5c3v1alpha1.ServiceNamespaceSpec{Name: "network"},
+						TargetClusterRef: &commonv1.TargetClusterRefSpec{Name: "edge-b"},
+					},
 				},
 			},
 		}
@@ -43,6 +47,12 @@ func TestTargetClusterRefForNamespace(t *testing.T) {
 	// namespace — which never moves.
 	bypassed := placed()
 	bypassed.Spec.Services.Keystone.Namespace = nil
+
+	// The same shape on the network service: a co-located Neutron contributes the
+	// ControlPlane's own namespace to the table, which the early return has
+	// already answered.
+	bypassedNeutron := placed()
+	bypassedNeutron.Spec.Services.Neutron.Namespace = nil
 
 	tests := []struct {
 		name      string
@@ -55,6 +65,8 @@ func TestTargetClusterRefForNamespace(t *testing.T) {
 		{name: "an unplaced service's namespace is local", cp: placed(), namespace: "dashboard"},
 		{name: "a namespace no service declares is local", cp: placed(), namespace: "unknown"},
 		{name: "a ref without a namespace block leaves the own namespace local", cp: bypassed, namespace: "openstack"},
+		{name: "the network service's namespace answers with its ref", cp: placed(), namespace: "network", want: "edge-b"},
+		{name: "a co-located neutron leaves the own namespace local", cp: bypassedNeutron, namespace: "openstack"},
 	}
 
 	for _, tc := range tests {
@@ -188,6 +200,8 @@ func TestEffectiveBackingServices(t *testing.T) {
 		wantKeystoneDB    string // "" = expect nil
 		wantKeystoneCache string
 		wantHorizonCache  string
+		wantNeutronDB     string
+		wantNeutronCache  string
 	}{
 		{
 			name: "no dedicated blocks: every service shares the ControlPlane-wide instances",
@@ -196,11 +210,14 @@ func TestEffectiveBackingServices(t *testing.T) {
 				Services: c5c3v1alpha1.ServicesSpec{
 					Keystone: &c5c3v1alpha1.ServiceKeystoneSpec{},
 					Horizon:  &c5c3v1alpha1.ServiceHorizonSpec{},
+					Neutron:  &c5c3v1alpha1.ServiceNeutronSpec{},
 				},
 			}},
 			wantKeystoneDB:    "openstack-db",
 			wantKeystoneCache: "openstack-memcached",
 			wantHorizonCache:  "openstack-memcached",
+			wantNeutronDB:     "openstack-db",
+			wantNeutronCache:  "openstack-memcached",
 		},
 		{
 			name: "keystone takes a dedicated database only: its cache stays shared",
@@ -221,6 +238,8 @@ func TestEffectiveBackingServices(t *testing.T) {
 			wantKeystoneDB:    "cp-keystone-db",
 			wantKeystoneCache: "openstack-memcached",
 			wantHorizonCache:  "openstack-memcached",
+			wantNeutronDB:     "openstack-db",
+			wantNeutronCache:  "openstack-memcached",
 		},
 		{
 			name: "each service takes its own dedicated cache",
@@ -248,6 +267,34 @@ func TestEffectiveBackingServices(t *testing.T) {
 			wantKeystoneDB:    "openstack-db",
 			wantKeystoneCache: "cp-keystone-cache",
 			wantHorizonCache:  "cp-horizon-cache",
+			wantNeutronDB:     "openstack-db",
+			wantNeutronCache:  "openstack-memcached",
+		},
+		{
+			name: "neutron takes both instances dedicated: keystone keeps the shared ones",
+			cp: &c5c3v1alpha1.ControlPlane{Spec: c5c3v1alpha1.ControlPlaneSpec{
+				Infrastructure: sharedInfra(),
+				Services: c5c3v1alpha1.ServicesSpec{
+					Keystone: &c5c3v1alpha1.ServiceKeystoneSpec{},
+					Neutron: &c5c3v1alpha1.ServiceNeutronSpec{
+						DedicatedBackingServices: &c5c3v1alpha1.NeutronDedicatedBackingServicesSpec{
+							Database: &commonv1.DatabaseSpec{
+								ClusterRef: &corev1.LocalObjectReference{Name: "cp-neutron-db"},
+								Database:   "neutron",
+							},
+							Cache: &commonv1.CacheSpec{
+								ClusterRef: &corev1.LocalObjectReference{Name: "cp-neutron-cache"},
+								Backend:    commonv1.DefaultCacheBackend,
+							},
+						},
+					},
+				},
+			}},
+			wantKeystoneDB:    "openstack-db",
+			wantKeystoneCache: "openstack-memcached",
+			wantHorizonCache:  "openstack-memcached",
+			wantNeutronDB:     "cp-neutron-db",
+			wantNeutronCache:  "cp-neutron-cache",
 		},
 		{
 			name: "no infrastructure block and no dedicated instances: nothing resolves",
@@ -288,6 +335,22 @@ func TestEffectiveBackingServices(t *testing.T) {
 			}
 			if gotHZCache != tc.wantHorizonCache {
 				t.Errorf("effectiveHorizonCache() = %q, want %q", gotHZCache, tc.wantHorizonCache)
+			}
+
+			var gotNTDB string
+			if db := effectiveNeutronDatabase(tc.cp); db != nil {
+				gotNTDB = clusterRefName(db.ClusterRef)
+			}
+			if gotNTDB != tc.wantNeutronDB {
+				t.Errorf("effectiveNeutronDatabase() = %q, want %q", gotNTDB, tc.wantNeutronDB)
+			}
+
+			var gotNTCache string
+			if cache := effectiveNeutronCache(tc.cp); cache != nil {
+				gotNTCache = clusterRefName(cache.ClusterRef)
+			}
+			if gotNTCache != tc.wantNeutronCache {
+				t.Errorf("effectiveNeutronCache() = %q, want %q", gotNTCache, tc.wantNeutronCache)
 			}
 		})
 	}

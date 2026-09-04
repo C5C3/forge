@@ -1405,6 +1405,85 @@ func TestBarbicanDeclaredAt_FallsBackToTheSharedBlock(t *testing.T) {
 	g.Expect(barbicanCacheDeclaredAt(cp)).To(Equal("spec.infrastructure.cache"))
 }
 
+// --- Neutron: a sixth database + cache consumer ---
+
+// TestManagedInfraInstances_NeutronEnumeratedOnlyWhenDeclared pins the
+// no-consumer-no-instance rule for Neutron: an undeclared Neutron enumerates
+// nothing, and a co-located declared Neutron resolves to the SAME shared database
+// and cache as Keystone, so the entries dedup away rather than provisioning a
+// second set.
+func TestManagedInfraInstances_NeutronEnumeratedOnlyWhenDeclared(t *testing.T) {
+	g := NewGomegaWithT(t)
+	s := infraTestScheme(t)
+	cp := managedInfraControlPlane()
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cp).Build()
+	r := &ControlPlaneReconciler{Client: c, Scheme: s}
+
+	// Without services.neutron: only Keystone's shared database and cache.
+	g.Expect(r.managedInfraInstances(cp)).To(HaveLen(2))
+
+	// With services.neutron sharing the ControlPlane's namespace: Neutron resolves
+	// to the same shared instances, so the (kind, namespace, name) dedup collapses
+	// them, still two.
+	cp.Spec.Services.Neutron = &c5c3v1alpha1.ServiceNeutronSpec{
+		OVN: c5c3v1alpha1.NeutronOVNSpec{
+			CentralRef: c5c3v1alpha1.NeutronOVNCentralRef{Name: "ovn"},
+		},
+	}
+	g.Expect(r.managedInfraInstances(cp)).To(HaveLen(2),
+		"a co-located Neutron shares Keystone's instances, so nothing new is enumerated")
+}
+
+// TestManagedInfraInstances_NeutronDedicatedBackingServices verifies a Neutron
+// that opts into a dedicated database is enumerated as its own instance (declared
+// at the dedicated path) in the namespace the network service occupies, while its
+// still-shared cache dedups against Keystone's and keeps naming the shared block.
+func TestManagedInfraInstances_NeutronDedicatedBackingServices(t *testing.T) {
+	g := NewGomegaWithT(t)
+	s := infraTestScheme(t)
+	cp := managedInfraControlPlane()
+	cp.Namespace = "openstack"
+	cp.Spec.Services = c5c3v1alpha1.ServicesSpec{
+		Keystone: &c5c3v1alpha1.ServiceKeystoneSpec{},
+		Neutron: &c5c3v1alpha1.ServiceNeutronSpec{
+			Namespace: &c5c3v1alpha1.ServiceNamespaceSpec{Name: "network"},
+			OVN: c5c3v1alpha1.NeutronOVNSpec{
+				CentralRef: c5c3v1alpha1.NeutronOVNCentralRef{Name: "ovn"},
+			},
+			DedicatedBackingServices: &c5c3v1alpha1.NeutronDedicatedBackingServicesSpec{
+				Database: &commonv1.DatabaseSpec{
+					ClusterRef:      &corev1.LocalObjectReference{Name: "cp-neutron-db"},
+					Database:        "neutron",
+					SecretRef:       commonv1.SecretRefSpec{Name: "neutron-db"},
+					CredentialsMode: commonv1.CredentialsModeStatic,
+					Replicas:        1,
+				},
+			},
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cp).Build()
+	r := &ControlPlaneReconciler{Client: c, Scheme: s}
+
+	instances := r.managedInfraInstances(cp)
+	byName := make(map[string]infraInstance, len(instances))
+	for _, inst := range instances {
+		byName[inst.kind+"/"+inst.name] = inst
+	}
+	g.Expect(byName).To(HaveKey("MariaDB/cp-neutron-db"))
+	g.Expect(byName["MariaDB/cp-neutron-db"].declaredAt).To(
+		Equal("spec.services.neutron.dedicatedBackingServices.database"),
+	)
+	g.Expect(byName["MariaDB/cp-neutron-db"].namespace).To(Equal("network"),
+		"the backing services follow the service into its namespace")
+	// Keystone still shares the ControlPlane database, and Neutron's own cache is
+	// not dedicated, so it resolves to the shared cache materialized a second time
+	// in the network namespace.
+	g.Expect(byName).To(HaveKey("MariaDB/openstack-db"))
+	g.Expect(byName).To(HaveKey("Memcached/openstack-memcached"))
+	g.Expect(neutronCacheDeclaredAt(cp)).To(Equal("spec.infrastructure.cache"),
+		"an undeclared dedicated cache keeps naming the shared block")
+}
+
 // --- per-service target clusters: the backing services follow the service ---
 
 // placedInfraControlPlane places Horizon — and with it the cache it resolves to —

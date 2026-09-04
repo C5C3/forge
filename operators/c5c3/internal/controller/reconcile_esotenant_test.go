@@ -612,6 +612,44 @@ func TestReconcileESOTenantStore_AllowlistedPlacedNamespaceGetsTheHomeCopy(t *te
 		&esov1.SecretStore{})).To(Succeed())
 }
 
+// TestHostsHomeRegistration_Neutron pins the network service's arm of the
+// home-registration question: a placed Neutron namespace hosts the KeystoneService
+// registration projected for it, so it needs the tenant store at home as well as
+// on its own cluster. A namespace the ControlPlane placed nothing in answers
+// false, and so does the Neutron namespace of a ControlPlane that declares no
+// network service, because an undeclared Neutron resolves to the ControlPlane's
+// own namespace instead.
+func TestHostsHomeRegistration_Neutron(t *testing.T) {
+	g := NewGomegaWithT(t)
+
+	cp := &c5c3v1alpha1.ControlPlane{
+		ObjectMeta: metav1.ObjectMeta{Name: "cp", Namespace: "openstack"},
+		Spec: c5c3v1alpha1.ControlPlaneSpec{
+			Services: c5c3v1alpha1.ServicesSpec{
+				Neutron: &c5c3v1alpha1.ServiceNeutronSpec{
+					Namespace: &c5c3v1alpha1.ServiceNamespaceSpec{
+						Name: "network", Lifecycle: c5c3v1alpha1.ServiceNamespaceLifecycleManaged,
+					},
+					TargetClusterRef: &commonv1.TargetClusterRefSpec{Name: "edge-a"},
+					OVN: c5c3v1alpha1.NeutronOVNSpec{
+						CentralRef: c5c3v1alpha1.NeutronOVNCentralRef{Name: "ovn"},
+					},
+				},
+			},
+		},
+	}
+
+	g.Expect(hostsHomeRegistration(cp, "network")).To(BeTrue(),
+		"the placed Neutron namespace hosts the registration projected for the network service")
+	g.Expect(hostsHomeRegistration(cp, "storage")).To(BeFalse(),
+		"a namespace this ControlPlane placed nothing in hosts no registration")
+
+	undeclared := cp.DeepCopy()
+	undeclared.Spec.Services.Neutron = nil
+	g.Expect(hostsHomeRegistration(undeclared, "network")).To(BeFalse(),
+		"without a neutron block the network namespace belongs to no service of this plane")
+}
+
 // TestReconcileESOTenantStore_ReadyGatesOnBothPlacedStores verifies the readiness
 // gate covers BOTH copies of a placed REGISTRATION-HOSTING namespace's store, each
 // read from the cluster it was written to. The two carry different delivery
