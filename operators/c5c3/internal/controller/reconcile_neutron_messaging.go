@@ -114,19 +114,12 @@ func (r *ControlPlaneReconciler) reconcileNeutronMessaging(
 			namespace, name, serr)
 	}
 
-	caName := neutronMessagingCASecretName(cp)
 	tls := cp.Spec.Infrastructure.Messaging.TLS
 	if tls == nil {
-		// A plaintext bus leaves no mirror behind: dropping the tls block has to
-		// converge the Neutron namespace, not leave a trust anchor nothing reads.
-		// A same-named Secret this ControlPlane never wrote is left alone.
-		if derr := commonreconcile.DeleteOrphanedChildFunc(ctx, children, &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: caName, Namespace: namespace},
-		}, func(live client.Object) bool { return isControlPlaneChild(live, cp) }); derr != nil {
-			failed("NeutronMessagingError", derr.Error())
-			return ctrl.Result{}, true, fmt.Errorf("deleting the stale neutron messaging CA Secret %s/%s: %w",
-				namespace, caName, derr)
-		}
+		// A plaintext bus leaves no mirror behind, but the mirror is NOT reaped
+		// here: the live child still names it, and the projection that drops that
+		// pointer is several halting gates further down the pass.
+		// pruneNeutronMessagingCA runs on the far side of it.
 		return ctrl.Result{}, false, nil
 	}
 
@@ -161,6 +154,7 @@ func (r *ControlPlaneReconciler) reconcileNeutronMessaging(
 		return ctrl.Result{RequeueAfter: infraRequeueAfter}, true, nil
 	}
 
+	caName := neutronMessagingCASecretName(cp)
 	if serr := r.ensureOwnedSecret(ctx, children, cp, caName, namespace, func(secret *corev1.Secret) error {
 		secret.Data[neutronMessagingCAKey] = bundle
 		return nil
@@ -170,5 +164,51 @@ func (r *ControlPlaneReconciler) reconcileNeutronMessaging(
 			namespace, caName, serr)
 	}
 
+	return ctrl.Result{}, false, nil
+}
+
+// pruneNeutronMessagingCA removes the CA mirror once the shared bus no longer
+// declares TLS. A plaintext bus must leave no trust anchor behind in the Neutron
+// namespace, and dropping the tls block has to converge that namespace rather
+// than pin the last mirrored bundle.
+//
+// It is deliberately NOT part of reconcileNeutronMessaging, which runs BEFORE the
+// projection. The live child's spec.messaging.tls names this Secret as a volume
+// source, and every gate between the two — the KeystoneService registration mid
+// service-account rotation, a Dynamic DB credential mid rotation, a transient API
+// error — halts the pass with the pointer still in place. Deleting the mirror
+// there would leave the child naming a Secret that no longer exists, so every
+// Neutron pod that restarts in that window wedges on CreateContainerConfigError,
+// with nothing in the condition set naming the cause.
+//
+// Removing the pointer from the CR is not enough either: the workload that mounts
+// the mirror is rendered by the neutron-operator, one pass behind the apply. The
+// caller therefore runs this only once the child reports having converged on the
+// pointer-free spec — see the gate in reconcileNeutron — so the referent never
+// outlives its last reference.
+//
+// A same-named Secret this ControlPlane never wrote is left alone. halt has the
+// same meaning as in reconcileNeutronMessaging, and every condition is on
+// NeutronReady.
+func (r *ControlPlaneReconciler) pruneNeutronMessagingCA(
+	ctx context.Context, cp *c5c3v1alpha1.ControlPlane,
+) (res ctrl.Result, halt bool, err error) {
+	failed := conditionFailer(cp, conditionTypeNeutronReady)
+
+	namespace := cp.NeutronNamespace()
+	children, err := r.childrenClientFor(ctx, cp, namespace)
+	if err != nil {
+		failed(commonmulticluster.TargetClusterUnavailable, err.Error())
+		return ctrl.Result{RequeueAfter: infraRequeueAfter}, true, nil
+	}
+
+	caName := neutronMessagingCASecretName(cp)
+	if derr := commonreconcile.DeleteOrphanedChildFunc(ctx, children, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: caName, Namespace: namespace},
+	}, func(live client.Object) bool { return isControlPlaneChild(live, cp) }); derr != nil {
+		failed("NeutronMessagingError", derr.Error())
+		return ctrl.Result{}, true, fmt.Errorf("deleting the stale neutron messaging CA Secret %s/%s: %w",
+			namespace, caName, derr)
+	}
 	return ctrl.Result{}, false, nil
 }

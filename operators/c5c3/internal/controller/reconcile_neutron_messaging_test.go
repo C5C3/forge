@@ -498,10 +498,14 @@ func TestReconcileNeutronMessaging_TLSHaltsWhenTheCABundleKeyIsMissing(t *testin
 	g.Expect(getNeutronMsgSecret(t, r.Client, "openstack", neutronMessagingCASecretName(cp))).To(BeNil())
 }
 
-// TestReconcileNeutronMessaging_NoTLSDeletesAStaleCAMirror covers dropping the tls
-// block from a bus that had one: the mirror the earlier pass wrote is trust nobody
-// reads any more, so it comes down instead of lingering in the Neutron namespace.
-func TestReconcileNeutronMessaging_NoTLSDeletesAStaleCAMirror(t *testing.T) {
+// TestPruneNeutronMessagingCA_DeletesAStaleCAMirror covers dropping the tls block
+// from a bus that had one: the mirror the earlier pass wrote is trust nobody reads
+// any more, so it comes down instead of lingering in the Neutron namespace.
+//
+// The prune is its own entry point, not part of the messaging leg, because the
+// live child still names the mirror until the projection several gates later
+// rewrites it. reconcileNeutron calls this only on the far side of that apply.
+func TestPruneNeutronMessagingCA_DeletesAStaleCAMirror(t *testing.T) {
 	g := NewGomegaWithT(t)
 	s := neutronMessagingScheme(t)
 	cp := placeNeutron(neutronMessagingControlPlane(), "networking", "")
@@ -518,7 +522,7 @@ func TestReconcileNeutronMessaging_NoTLSDeletesAStaleCAMirror(t *testing.T) {
 	}
 	r := newNeutronMessagingReconciler(t, s, cp, neutronMsgRabbitmqCluster(), neutronMsgDefaultUserSecret(), stale)
 
-	_, halt, err := r.reconcileNeutronMessaging(context.Background(), cp)
+	_, halt, err := r.pruneNeutronMessagingCA(context.Background(), cp)
 
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(halt).To(BeFalse())
@@ -526,10 +530,10 @@ func TestReconcileNeutronMessaging_NoTLSDeletesAStaleCAMirror(t *testing.T) {
 		"a mirror this ControlPlane wrote must not outlive the tls block")
 }
 
-// TestReconcileNeutronMessaging_NoTLSLeavesAForeignCAMirror covers the same name
-// held by somebody else. The cleanup deletes children, not neighbours, so an
-// unowned Secret survives the pass untouched.
-func TestReconcileNeutronMessaging_NoTLSLeavesAForeignCAMirror(t *testing.T) {
+// TestPruneNeutronMessagingCA_LeavesAForeignCAMirror covers the same name held by
+// somebody else. The cleanup deletes children, not neighbours, so an unowned
+// Secret survives the pass untouched.
+func TestPruneNeutronMessagingCA_LeavesAForeignCAMirror(t *testing.T) {
 	g := NewGomegaWithT(t)
 	s := neutronMessagingScheme(t)
 	cp := placeNeutron(neutronMessagingControlPlane(), "networking", "")
@@ -543,7 +547,7 @@ func TestReconcileNeutronMessaging_NoTLSLeavesAForeignCAMirror(t *testing.T) {
 	}
 	r := newNeutronMessagingReconciler(t, s, cp, neutronMsgRabbitmqCluster(), neutronMsgDefaultUserSecret(), foreign)
 
-	_, halt, err := r.reconcileNeutronMessaging(context.Background(), cp)
+	_, halt, err := r.pruneNeutronMessagingCA(context.Background(), cp)
 
 	g.Expect(err).NotTo(HaveOccurred())
 	g.Expect(halt).To(BeFalse())

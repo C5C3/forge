@@ -137,6 +137,15 @@ func desiredBarbicanRegistration(cp *c5c3v1alpha1.ControlPlane) *c5c3v1alpha1.Ke
 		c5c3v1alpha1.BarbicanServiceAccountName, c5c3v1alpha1.BarbicanServiceProjectName)
 }
 
+// desiredNeutronRegistration builds the registration child for Neutron: the
+// network catalog entry and the "neutron" service account.
+func desiredNeutronRegistration(cp *c5c3v1alpha1.ControlPlane) *c5c3v1alpha1.KeystoneService {
+	return builtinRegistration(cp, neutronName(cp), cp.NeutronNamespace(), "network", "neutron",
+		internalCatalogURL(cp.NeutronTargetClusterRef(), neutronEndpointURL(cp), neutronCatalogURL(cp)),
+		neutronCatalogURL(cp),
+		c5c3v1alpha1.NeutronServiceAccountName, c5c3v1alpha1.NeutronServiceProjectName)
+}
+
 // reconcileBuiltinRegistration drives the registration leg every built-in
 // service shares: it applies the registration child, mirrors the credentials the
 // child delivers onto the cluster a placed service runs on, and gates on the

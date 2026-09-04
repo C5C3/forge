@@ -39,6 +39,7 @@ import (
 	commonv1 "github.com/c5c3/cobaltcore/internal/common/types"
 	barbicanv1alpha1 "github.com/c5c3/cobaltcore/operators/barbican/api/v1alpha1"
 	c5c3v1alpha1 "github.com/c5c3/cobaltcore/operators/c5c3/api/v1alpha1"
+	neutronv1alpha1 "github.com/c5c3/cobaltcore/operators/neutron/api/v1alpha1"
 )
 
 // korcFinalizerPrefix is the common prefix of the finalizers K-ORC adds to the
@@ -738,9 +739,9 @@ func (r *ControlPlaneReconciler) teardownReader(c client.Client) client.Reader {
 
 // crossNamespaceServiceChildren returns the service children the ControlPlane
 // placed in namespace: the Keystone child when the Keystone service is assigned
-// there, and the Horizon, Glance, Placement, and Barbican children likewise. Each
-// is matched by its deterministic name; ownership is re-checked against the live
-// object before anything is deleted.
+// there, and the Horizon, Glance, Placement, Barbican, and Neutron children
+// likewise. Each is matched by its deterministic name; ownership is re-checked
+// against the live object before anything is deleted.
 //
 // The Barbican arm names three objects rather than one, because its secret store
 // and the dedicated OpenBao instance behind it belong in the WAIT SET too. The
@@ -785,6 +786,13 @@ func crossNamespaceServiceChildren(cp *c5c3v1alpha1.ControlPlane, namespace stri
 				ObjectMeta: metav1.ObjectMeta{Name: barbicanOpenBaoName(cp), Namespace: namespace},
 			},
 		)
+	}
+	// The OVNCentral the network service references is NOT in here, and is deleted
+	// nowhere: it is deployed outside the plane and only read (see reconcileOVN).
+	if cp.NeutronNamespace() == namespace {
+		children = append(children, &neutronv1alpha1.Neutron{
+			ObjectMeta: metav1.ObjectMeta{Name: neutronName(cp), Namespace: namespace},
+		})
 	}
 	return children
 }
@@ -1073,8 +1081,9 @@ func (r *ControlPlaneReconciler) deleteManagedNamespace(
 // nothing cascades and every object has to be named. The set is deterministic
 // (every name is derived from the ControlPlane), so nothing has to be discovered:
 // the backing services, the admin-password and Keystone DB-credential material, the
-// Glance, Placement, and Barbican DB-credential material, the Barbican secret store
-// with the dedicated OpenBao ensemble behind it, and the tenant-store trio.
+// Glance, Placement, Barbican, and Neutron DB-credential material, the Barbican
+// secret store with the dedicated OpenBao ensemble behind it, the bus delivery the
+// network service reads, and the tenant-store trio.
 //
 // The tenant-store trio goes LAST: the service children deleted before this ran
 // their own ESO cleanup through that store, and an ESO PushSecret cannot purge its
@@ -1207,6 +1216,32 @@ func (r *ControlPlaneReconciler) sweepExternalNamespaceResidue(
 			}},
 		)
 	}
+	// The Neutron credential material, which follows the network service, in the
+	// same four shapes as Glance's above, plus the bus delivery the ControlPlane
+	// wrote beside the child: the brownfield transport-URL Secret and the CA
+	// mirror. The OVNCentral the child references is NOT in here, and is deleted
+	// nowhere: it is deployed outside the plane and only read (see reconcileOVN).
+	if cp.NeutronNamespace() == namespace {
+		objs = append(
+			objs,
+			&esov1.ExternalSecret{ObjectMeta: metav1.ObjectMeta{
+				Name: neutronDBCredentialSecretName(cp), Namespace: namespace,
+			}},
+			&esgenv1alpha1.VaultDynamicSecret{ObjectMeta: metav1.ObjectMeta{
+				Name: neutronDBCredentialSecretName(cp), Namespace: namespace,
+			}},
+			unstructuredIn(certificateGVK, neutronDBCredentialClientCertName(cp)),
+			&corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+				Name: neutronDBCredentialServiceAccountName, Namespace: namespace,
+			}},
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+				Name: neutronMessagingSecretName(cp), Namespace: namespace,
+			}},
+			&corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+				Name: neutronMessagingCASecretName(cp), Namespace: namespace,
+			}},
+		)
+	}
 	// The tenant store LAST: everything above authenticated through it.
 	objs = append(
 		objs,
@@ -1314,6 +1349,7 @@ func projectedRegistrationKeys(cp *c5c3v1alpha1.ControlPlane) []client.ObjectKey
 		{Name: glanceName(cp), Namespace: cp.GlanceNamespace()},
 		{Name: placementName(cp), Namespace: cp.PlacementNamespace()},
 		{Name: barbicanName(cp), Namespace: cp.BarbicanNamespace()},
+		{Name: neutronName(cp), Namespace: cp.NeutronNamespace()},
 	}
 }
 

@@ -4,24 +4,60 @@
 
 // Tests for the Neutron DB-credentials concern
 // (reconcile_neutron_dbcredentials.go): the target the service-agnostic builders
-// in reconcile_dbcredentials.go consume, the two OpenBao handles it carries, and
-// the per-service databaseCredentialsMode override plus the Static opt-out that
-// decide the mode. The concern is pure data — no Neutron sub-reconciler consumes
-// it yet, so the reconcile-driven twins of the Placement tests (the projected
-// generator objects and their Static teardown) land with that sub-reconciler —
-// and the fixture is a bare ControlPlane rather than a fake client.
+// in reconcile_dbcredentials.go consume, the two OpenBao handles it carries, the
+// per-service databaseCredentialsMode override plus the Static opt-out that decide
+// the mode, and the objects reconcileNeutron projects from them. The handle tests
+// run against a bare ControlPlane; the reconcile-driven ones reuse
+// neutronControlPlane / newNeutronTestReconciler from reconcile_neutron_test.go.
 package controller
 
 import (
+	"context"
 	"testing"
 
+	esov1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
+	esgenv1alpha1 "github.com/external-secrets/external-secrets/apis/generators/v1alpha1"
 	. "github.com/onsi/gomega"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	commonv1 "github.com/c5c3/cobaltcore/internal/common/types"
 	c5c3v1alpha1 "github.com/c5c3/cobaltcore/operators/c5c3/api/v1alpha1"
 )
+
+// getNeutronVDS fetches the projected Neutron VaultDynamicSecret generator at its
+// derived name/namespace.
+func getNeutronVDS(t *testing.T, r *ControlPlaneReconciler, cp *c5c3v1alpha1.ControlPlane) (*esgenv1alpha1.VaultDynamicSecret, error) {
+	t.Helper()
+	vds := &esgenv1alpha1.VaultDynamicSecret{}
+	err := r.Get(context.Background(),
+		types.NamespacedName{Namespace: cp.NeutronNamespace(), Name: neutronDBCredentialSecretName(cp)}, vds)
+	return vds, err
+}
+
+// getNeutronDBCredES fetches the projected Neutron DB-credential ExternalSecret at
+// its derived name/namespace.
+func getNeutronDBCredES(t *testing.T, r *ControlPlaneReconciler, cp *c5c3v1alpha1.ControlPlane) (*esov1.ExternalSecret, error) {
+	t.Helper()
+	es := &esov1.ExternalSecret{}
+	err := r.Get(context.Background(),
+		types.NamespacedName{Namespace: cp.NeutronNamespace(), Name: neutronDBCredentialSecretName(cp)}, es)
+	return es, err
+}
+
+// neutronLeftoverClientCert builds the Neutron mTLS client Certificate at its
+// derived name/namespace, as a prior Dynamic deployment left it.
+func neutronLeftoverClientCert(cp *c5c3v1alpha1.ControlPlane) *unstructured.Unstructured {
+	cert := &unstructured.Unstructured{}
+	cert.SetGroupVersionKind(certificateGVK)
+	cert.SetName(neutronDBCredentialClientCertName(cp))
+	cert.SetNamespace(cp.NeutronNamespace())
+	return cert
+}
 
 // neutronDBCredentialsControlPlane builds a ControlPlane on the managed SHARED
 // database with a Neutron service block, the shape the Dynamic default applies
@@ -145,4 +181,198 @@ func TestNeutronDBCredentialsDynamicEnabled_DedicatedIsStaticEvenWhenModeBypasse
 	shared.Spec.Infrastructure.Database.CredentialsMode = commonv1.CredentialsModeDynamic
 	g.Expect(neutronDBCredentialsDynamicEnabled(shared)).To(BeTrue(),
 		"a managed shared database with no per-service override inherits the ControlPlane-wide Dynamic mode")
+}
+
+// TestReconcileNeutron_DynamicDefaultProjectsEngineObjects verifies a managed
+// shared neutron database (default Dynamic) projects the generator-backed
+// ExternalSecret (no static Data), the VaultDynamicSecret with role neutron-db and
+// the per-tenant creds path, the neutron-db-creds ServiceAccount, and the mTLS
+// client Certificate named <neutron-name>-db-openbao-client.
+func TestReconcileNeutron_DynamicDefaultProjectsEngineObjects(t *testing.T) {
+	g := NewGomegaWithT(t)
+	cp := neutronControlPlane()
+	r := newNeutronTestReconciler(t, cp)
+	ctx := context.Background()
+
+	g.Expect(neutronDBCredentialsDynamicEnabled(cp)).To(BeTrue(),
+		"a managed shared neutron database defaults to Dynamic")
+
+	_, err := r.reconcileNeutron(ctx, cp)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	// ExternalSecret: generator-backed, no static KV Data, no SecretStoreRef.
+	es, err := getNeutronDBCredES(t, r, cp)
+	g.Expect(err).NotTo(HaveOccurred(), "operator must create the Neutron DB-credential ExternalSecret")
+	g.Expect(es.Spec.Data).To(BeEmpty(), "the Dynamic ExternalSecret must carry no static Data refs")
+	g.Expect(es.Spec.SecretStoreRef.Name).To(BeEmpty(),
+		"a generator-backed ExternalSecret must not reference a SecretStore")
+	g.Expect(es.Spec.DataFrom).To(HaveLen(1))
+	g.Expect(es.Spec.DataFrom[0].SourceRef).NotTo(BeNil())
+	g.Expect(es.Spec.DataFrom[0].SourceRef.GeneratorRef).NotTo(BeNil())
+	g.Expect(es.Spec.DataFrom[0].SourceRef.GeneratorRef.Kind).To(Equal("VaultDynamicSecret"))
+	g.Expect(es.Spec.DataFrom[0].SourceRef.GeneratorRef.Name).To(Equal(neutronDBCredentialSecretName(cp)))
+
+	// VaultDynamicSecret: role neutron-db, per-tenant creds path, same-namespace refs.
+	vds, err := getNeutronVDS(t, r, cp)
+	g.Expect(err).NotTo(HaveOccurred(), "operator must create the Neutron VaultDynamicSecret generator")
+	g.Expect(vds.Spec.Path).To(Equal("database/mariadb/creds/neutron-default"))
+	g.Expect(vds.Spec.Method).To(Equal("GET"))
+	g.Expect(vds.Spec.Provider).NotTo(BeNil())
+	g.Expect(vds.Spec.Provider.Auth.Kubernetes.Role).To(Equal(neutronDBDynamicVaultRole))
+	g.Expect(vds.Spec.Provider.Auth.Kubernetes.Role).To(Equal("neutron-db"))
+	g.Expect(vds.Spec.Provider.Auth.Kubernetes.ServiceAccountRef.Name).To(Equal(neutronDBCredentialServiceAccountName))
+	g.Expect(vds.Spec.Provider.CAProvider.Name).To(Equal(neutronDBCredentialClientCertName(cp)))
+	g.Expect(vds.Spec.Provider.ClientTLS.CertSecretRef.Name).To(Equal(neutronDBCredentialClientCertName(cp)))
+	g.Expect(vds.Spec.Provider.ClientTLS.KeySecretRef.Name).To(Equal(neutronDBCredentialClientCertName(cp)))
+
+	// ServiceAccount neutron-db-creds, the name the neutron-db auth role binds.
+	g.Expect(neutronDBCredentialServiceAccountName).To(Equal("neutron-db-creds"))
+	sa := &corev1.ServiceAccount{}
+	g.Expect(r.Get(ctx, types.NamespacedName{
+		Namespace: cp.NeutronNamespace(), Name: neutronDBCredentialServiceAccountName,
+	}, sa)).To(Succeed())
+
+	// Certificate <neutron-name>-db-openbao-client with the CA issuer.
+	g.Expect(neutronDBCredentialClientCertName(cp)).To(Equal("cp-neutron-db-openbao-client"))
+	cert := &unstructured.Unstructured{}
+	cert.SetGroupVersionKind(certificateGVK)
+	g.Expect(r.Get(ctx, types.NamespacedName{
+		Namespace: cp.NeutronNamespace(), Name: neutronDBCredentialClientCertName(cp),
+	}, cert)).To(Succeed())
+	issuer, _, _ := unstructured.NestedString(cert.Object, "spec", "issuerRef", "name")
+	g.Expect(issuer).To(Equal(openBaoCAIssuerName))
+
+	// The projected child carries Dynamic.
+	nn := getProjectedNeutron(t, r.Client, cp)
+	g.Expect(nn.Spec.Database.CredentialsMode).To(Equal(commonv1.CredentialsModeDynamic))
+}
+
+// TestReconcileNeutron_StaticOptOutProjectsKVAndTearsDownDynamic verifies that
+// both opt-out routes, the shared credentialsMode: Static and the per-service
+// services.neutron.databaseCredentialsMode: Static, project the KV-backed
+// ExternalSecret, tear down any leftover generator objects, and stamp the child
+// Static.
+func TestReconcileNeutron_StaticOptOutProjectsKVAndTearsDownDynamic(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		apply func(cp *c5c3v1alpha1.ControlPlane)
+	}{
+		{
+			name: "shared credentialsMode Static",
+			apply: func(cp *c5c3v1alpha1.ControlPlane) {
+				cp.Spec.Infrastructure.Database.CredentialsMode = commonv1.CredentialsModeStatic
+			},
+		},
+		{
+			name: "per-service databaseCredentialsMode Static",
+			apply: func(cp *c5c3v1alpha1.ControlPlane) {
+				cp.Spec.Services.Neutron.DatabaseCredentialsMode = commonv1.CredentialsModeStatic
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			g := NewGomegaWithT(t)
+			cp := neutronControlPlane()
+			tt.apply(cp)
+			g.Expect(neutronDBCredentialsDynamicEnabled(cp)).To(BeFalse())
+
+			// Pre-seed the leftover generator, SA and mTLS client Certificate from a
+			// prior Dynamic deployment, each carrying the ownership a live projection
+			// stamps: the teardown is gated on it.
+			s := neutronTestScheme(t)
+			target := neutronDBCredentialTarget(cp)
+			leftovers := []client.Object{
+				dbCredentialVaultDynamicSecret(target, openBaoDefaultServer, openBaoDefaultKubernetesMount),
+				dbCredentialServiceAccount(target),
+				neutronLeftoverClientCert(cp),
+			}
+			for _, obj := range leftovers {
+				g.Expect(claimChildOwnership(localWriter(), cp, obj, s)).To(Succeed())
+			}
+			r := newNeutronTestReconciler(t, append([]client.Object{cp}, leftovers...)...)
+			ctx := context.Background()
+
+			_, err := r.reconcileNeutron(ctx, cp)
+			g.Expect(err).NotTo(HaveOccurred())
+
+			es, err := getNeutronDBCredES(t, r, cp)
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(es.Spec.DataFrom).To(BeEmpty(), "the Static opt-out must project the KV ExternalSecret")
+			g.Expect(es.Spec.Data).To(HaveLen(2))
+			g.Expect(es.Spec.Data[0].RemoteRef.Key).To(Equal(neutronDBCredentialRemoteKeyFor(cp)))
+
+			_, vdsErr := getNeutronVDS(t, r, cp)
+			g.Expect(apierrors.IsNotFound(vdsErr)).To(BeTrue(),
+				"the Static opt-out must delete the leftover VaultDynamicSecret")
+
+			saErr := r.Get(ctx, types.NamespacedName{
+				Namespace: cp.NeutronNamespace(), Name: neutronDBCredentialServiceAccountName,
+			}, &corev1.ServiceAccount{})
+			g.Expect(apierrors.IsNotFound(saErr)).To(BeTrue(),
+				"the Static opt-out must delete the generator's ServiceAccount")
+
+			sweptCert := &unstructured.Unstructured{}
+			sweptCert.SetGroupVersionKind(certificateGVK)
+			certErr := r.Get(ctx, types.NamespacedName{
+				Namespace: cp.NeutronNamespace(), Name: neutronDBCredentialClientCertName(cp),
+			}, sweptCert)
+			g.Expect(apierrors.IsNotFound(certErr)).To(BeTrue(),
+				"the Static opt-out must delete the leftover mTLS client Certificate")
+
+			nn := getProjectedNeutron(t, r.Client, cp)
+			g.Expect(nn.Spec.Database.CredentialsMode).To(Equal(commonv1.CredentialsModeStatic))
+		})
+	}
+}
+
+// TestReconcileNeutron_DynamicObjectsLandInTheNeutronNamespace verifies every
+// dynamic object lands beside the Neutron child in a namespace of its own: the
+// ServiceAccount whose token OpenBao authenticates, the mTLS client Certificate,
+// the generator, and the ExternalSecret, carrying the ownership labels rather than
+// an owner reference, and nothing is left in the ControlPlane's namespace.
+func TestReconcileNeutron_DynamicObjectsLandInTheNeutronNamespace(t *testing.T) {
+	g := NewGomegaWithT(t)
+	cp := neutronControlPlane()
+	cp.Spec.Services.Neutron.Namespace = &c5c3v1alpha1.ServiceNamespaceSpec{
+		Name: "network", Lifecycle: c5c3v1alpha1.ServiceNamespaceLifecycleManaged,
+	}
+	r := newNeutronTestReconciler(t, cp)
+	ctx := context.Background()
+
+	_, err := r.reconcileNeutron(ctx, cp)
+	g.Expect(err).NotTo(HaveOccurred())
+
+	es := &esov1.ExternalSecret{}
+	g.Expect(r.Get(ctx, types.NamespacedName{
+		Namespace: "network", Name: neutronDBCredentialSecretName(cp),
+	}, es)).To(Succeed())
+	g.Expect(es.OwnerReferences).To(BeEmpty(), "a cross-namespace object cannot carry an owner reference")
+	g.Expect(es.Labels).To(HaveKeyWithValue(controlPlaneNameLabel, "cp"))
+
+	vds := &esgenv1alpha1.VaultDynamicSecret{}
+	g.Expect(r.Get(ctx, types.NamespacedName{
+		Namespace: "network", Name: neutronDBCredentialSecretName(cp),
+	}, vds)).To(Succeed())
+	g.Expect(vds.Spec.Path).To(Equal("database/mariadb/creds/neutron-network"),
+		"the generator's per-tenant path follows the neutron namespace")
+
+	sa := &corev1.ServiceAccount{}
+	g.Expect(r.Get(ctx, types.NamespacedName{
+		Namespace: "network", Name: neutronDBCredentialServiceAccountName,
+	}, sa)).To(Succeed(), "the generator's SA must authenticate from the namespace the policy grants")
+	g.Expect(sa.Name).To(Equal("neutron-db-creds"))
+
+	cert := &unstructured.Unstructured{}
+	cert.SetGroupVersionKind(certificateGVK)
+	g.Expect(r.Get(ctx, types.NamespacedName{
+		Namespace: "network", Name: neutronDBCredentialClientCertName(cp),
+	}, cert)).To(Succeed())
+
+	// Nothing may be left in the ControlPlane's own namespace.
+	g.Expect(r.Get(ctx, types.NamespacedName{
+		Namespace: "default", Name: neutronDBCredentialSecretName(cp),
+	}, &esov1.ExternalSecret{})).NotTo(Succeed())
+	g.Expect(r.Get(ctx, types.NamespacedName{
+		Namespace: "default", Name: neutronDBCredentialSecretName(cp),
+	}, &esgenv1alpha1.VaultDynamicSecret{})).NotTo(Succeed())
 }

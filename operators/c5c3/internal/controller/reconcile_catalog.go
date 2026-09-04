@@ -396,3 +396,24 @@ func barbicanCatalogURL(cp *c5c3v1alpha1.ControlPlane) string {
 	}
 	return barbicanEndpointURL(cp)
 }
+
+// neutronCatalogURL returns the URL registered for the K-ORC network catalog
+// PUBLIC Endpoint. Like the image, placement and key-manager rows, the network
+// service registers both a public and an internal endpoint from the start; the
+// internal endpoint advertises the in-cluster Service URL (neutronEndpointURL) as
+// long as the service is co-located (see internalCatalogURL), while the public one
+// prefers an explicit services.neutron.publicEndpoint (the only way to advertise a
+// non-443 external port), then the externally routable gateway hostname
+// ("https://{gateway.hostname}"), and falls back to that same in-cluster URL when
+// Neutron is not exposed via a Gateway. Unlike keystoneCatalogURL there is no
+// "/v3" path suffix: the Neutron API is served at the root, and clients discover
+// "/v2.0" themselves.
+func neutronCatalogURL(cp *c5c3v1alpha1.ControlPlane) string {
+	if pe := cp.Spec.Services.Neutron.PublicEndpoint; pe != "" {
+		return pe
+	}
+	if gw := cp.Spec.Services.Neutron.Gateway; gw != nil {
+		return fmt.Sprintf("https://%s", gw.Hostname)
+	}
+	return neutronEndpointURL(cp)
+}

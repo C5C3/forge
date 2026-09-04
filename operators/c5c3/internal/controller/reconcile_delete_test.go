@@ -19,6 +19,7 @@ import (
 	glancev1alpha1 "github.com/c5c3/cobaltcore/operators/glance/api/v1alpha1"
 	horizonv1alpha1 "github.com/c5c3/cobaltcore/operators/horizon/api/v1alpha1"
 	keystonev1alpha1 "github.com/c5c3/cobaltcore/operators/keystone/api/v1alpha1"
+	neutronv1alpha1 "github.com/c5c3/cobaltcore/operators/neutron/api/v1alpha1"
 	placementv1alpha1 "github.com/c5c3/cobaltcore/operators/placement/api/v1alpha1"
 	openbaov1alpha1 "github.com/dc-tec/openbao-operator/api/v1alpha1"
 	esov1 "github.com/external-secrets/external-secrets/apis/externalsecrets/v1"
@@ -820,7 +821,7 @@ func TestDeleteProjectedRegistrations_EnumeratesAPreservedRegistration(t *testin
 	ctx := context.Background()
 
 	s := korcTestScheme(t)
-	cp := deletingControlPlane(0) // no services.glance at all
+	cp := deletingControlPlane(0) // no services.glance and no services.neutron at all
 	preserved := &c5c3v1alpha1.KeystoneService{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      glanceName(cp),
@@ -828,14 +829,23 @@ func TestDeleteProjectedRegistrations_EnumeratesAPreservedRegistration(t *testin
 			Labels:    controlPlaneChildLabels(cp),
 		},
 	}
-	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cp, preserved).Build()
+	preservedNeutron := &c5c3v1alpha1.KeystoneService{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      neutronName(cp),
+			Namespace: cp.Namespace,
+			Labels:    controlPlaneChildLabels(cp),
+		},
+	}
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cp, preserved, preservedNeutron).Build()
 	r := &ControlPlaneReconciler{Client: c, Scheme: s, Recorder: record.NewFakeRecorder(10)}
 
 	_, err := r.deleteProjectedRegistrations(ctx, cp)
 	g.Expect(err).NotTo(HaveOccurred())
-	err = c.Get(ctx, client.ObjectKeyFromObject(preserved), &c5c3v1alpha1.KeystoneService{})
-	g.Expect(apierrors.IsNotFound(err)).To(BeTrue(),
-		"a registration preserved past its service block must still be torn down with the ControlPlane")
+	for _, ks := range []*c5c3v1alpha1.KeystoneService{preserved, preservedNeutron} {
+		err = c.Get(ctx, client.ObjectKeyFromObject(ks), &c5c3v1alpha1.KeystoneService{})
+		g.Expect(apierrors.IsNotFound(err)).To(BeTrue(),
+			"a registration preserved past its service block must still be torn down with the ControlPlane")
+	}
 }
 
 // TestReconcileDelete_StallEscapeReleasesTheStalledRegistrationsChildren pins the
@@ -2135,6 +2145,39 @@ func TestCrossNamespaceServiceChildren_IncludesPlacement(t *testing.T) {
 	g.Expect(hasPlacement("unrelated")).To(BeFalse(), "a namespace Placement was not placed in must not name it")
 }
 
+// TestCrossNamespaceServiceChildren_IncludesNeutron is the same guard for the
+// Neutron child: it is enumerated for the namespace it was assigned to and
+// excluded from any other, so a Neutron placed in a namespace of its own is torn
+// down by the finalizer sweep (it carries no owner reference to garbage-collect
+// it). The OVNCentral it references is enumerated nowhere, on purpose: the plane
+// only reads it.
+func TestCrossNamespaceServiceChildren_IncludesNeutron(t *testing.T) {
+	g := NewGomegaWithT(t)
+	cp := korcControlPlane()
+	cp.Spec.Services.Neutron = &c5c3v1alpha1.ServiceNeutronSpec{
+		Namespace: &c5c3v1alpha1.ServiceNamespaceSpec{
+			Name: "network", Lifecycle: c5c3v1alpha1.ServiceNamespaceLifecycleManaged,
+		},
+		OVN: c5c3v1alpha1.NeutronOVNSpec{
+			CentralRef: c5c3v1alpha1.NeutronOVNCentralRef{Name: "ovn", Namespace: "ovn-system"},
+		},
+	}
+
+	hasNeutron := func(namespace string) bool {
+		for _, child := range crossNamespaceServiceChildren(cp, namespace) {
+			if _, ok := child.(*neutronv1alpha1.Neutron); ok && child.GetName() == neutronName(cp) {
+				return true
+			}
+		}
+		return false
+	}
+
+	g.Expect(hasNeutron("network")).To(BeTrue(), "the Neutron child is enumerated for its assigned namespace")
+	g.Expect(hasNeutron("unrelated")).To(BeFalse(), "a namespace Neutron was not placed in must not name it")
+	g.Expect(crossNamespaceServiceChildren(cp, "ovn-system")).To(BeEmpty(),
+		"the referenced OVNCentral is never enumerated for deletion")
+}
+
 // TestDeleteServiceChildrenIn_SweepsOwnedGlanceBackends verifies the cross-namespace
 // teardown reaps the projected GlanceBackend children the ControlPlane placed in a
 // dedicated namespace: a c5c3-owned backend carrying the glance child's name prefix
@@ -2827,6 +2870,81 @@ func TestSweepExternalNamespaceResidue_RemovesTheBarbicanResidue(t *testing.T) {
 
 	r.sweepExternalNamespaceResidue(ctx, c, cp, ns)
 	expectSwept(t, c, residue...)
+}
+
+// neutronTeardownNamespace is the namespace the Neutron fixtures below place the
+// network service in.
+const neutronTeardownNamespace = "network"
+
+// deletingNeutronControlPlane returns a deleting ControlPlane whose network
+// service lives in a namespace of its own, under the given lifecycle.
+func deletingNeutronControlPlane(
+	deletionAge time.Duration, lifecycle c5c3v1alpha1.ServiceNamespaceLifecycle,
+) *c5c3v1alpha1.ControlPlane {
+	cp := deletingControlPlane(deletionAge)
+	cp.Spec.Services.Neutron = &c5c3v1alpha1.ServiceNeutronSpec{
+		Namespace: &c5c3v1alpha1.ServiceNamespaceSpec{
+			Name: neutronTeardownNamespace, Lifecycle: lifecycle,
+		},
+		OVN: c5c3v1alpha1.NeutronOVNSpec{
+			CentralRef: c5c3v1alpha1.NeutronOVNCentralRef{Name: "ovn", Namespace: "ovn-system"},
+		},
+	}
+	return cp
+}
+
+// TestSweepExternalNamespaceResidue_RemovesTheNeutronResidue covers the External
+// lifecycle for the network service, where the namespace survives the ControlPlane
+// so nothing cascades and every object has to be named: the DB-credential material
+// in the same four shapes as Glance's, plus the bus delivery beside it, the
+// transport-URL Secret and the CA mirror. A same-named Secret this ControlPlane
+// never wrote is left alone.
+func TestSweepExternalNamespaceResidue_RemovesTheNeutronResidue(t *testing.T) {
+	ctx := context.Background()
+	s := namespaceTeardownScheme(t)
+
+	cp := deletingNeutronControlPlane(time.Minute, c5c3v1alpha1.ServiceNamespaceLifecycleExternal)
+	ns := neutronTeardownNamespace
+
+	dbES := &esov1.ExternalSecret{ObjectMeta: metav1.ObjectMeta{
+		Name: neutronDBCredentialSecretName(cp), Namespace: ns, Labels: controlPlaneChildLabels(cp),
+	}}
+	dbVDS := &esgenv1alpha1.VaultDynamicSecret{ObjectMeta: metav1.ObjectMeta{
+		Name: neutronDBCredentialSecretName(cp), Namespace: ns, Labels: controlPlaneChildLabels(cp),
+	}}
+	dbCert := &unstructured.Unstructured{}
+	dbCert.SetGroupVersionKind(certificateGVK)
+	dbCert.SetName(neutronDBCredentialClientCertName(cp))
+	dbCert.SetNamespace(ns)
+	dbCert.SetLabels(controlPlaneChildLabels(cp))
+	dbSA := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+		Name: neutronDBCredentialServiceAccountName, Namespace: ns, Labels: controlPlaneChildLabels(cp),
+	}}
+	bus := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: neutronMessagingSecretName(cp), Namespace: ns, Labels: controlPlaneChildLabels(cp),
+	}}
+	busCA := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: neutronMessagingCASecretName(cp), Namespace: ns, Labels: controlPlaneChildLabels(cp),
+	}}
+
+	residue := []client.Object{dbES, dbVDS, dbCert, dbSA, bus, busCA}
+	c := fake.NewClientBuilder().WithScheme(s).
+		WithObjects(append([]client.Object{cp}, residue...)...).Build()
+	r := &ControlPlaneReconciler{Client: c, Scheme: s, Recorder: record.NewFakeRecorder(10)}
+
+	r.sweepExternalNamespaceResidue(ctx, c, cp, ns)
+	expectSwept(t, c, residue...)
+
+	// A Secret at the derived transport-URL name that carries none of our labels
+	// belongs to somebody else in this shared namespace and survives.
+	foreign := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: neutronMessagingSecretName(cp), Namespace: ns,
+	}}
+	c2 := fake.NewClientBuilder().WithScheme(s).WithObjects(cp, foreign).Build()
+	r2 := &ControlPlaneReconciler{Client: c2, Scheme: s, Recorder: record.NewFakeRecorder(10)}
+
+	r2.sweepExternalNamespaceResidue(ctx, c2, cp, ns)
+	expectPresent(t, c2, foreign)
 }
 
 // --- placed-namespace teardown ---

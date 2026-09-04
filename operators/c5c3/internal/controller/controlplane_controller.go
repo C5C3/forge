@@ -15,6 +15,7 @@ import (
 	glancev1alpha1 "github.com/c5c3/cobaltcore/operators/glance/api/v1alpha1"
 	horizonv1alpha1 "github.com/c5c3/cobaltcore/operators/horizon/api/v1alpha1"
 	keystonev1alpha1 "github.com/c5c3/cobaltcore/operators/keystone/api/v1alpha1"
+	neutronv1alpha1 "github.com/c5c3/cobaltcore/operators/neutron/api/v1alpha1"
 	ovnv1alpha1 "github.com/c5c3/cobaltcore/operators/ovn/api/v1alpha1"
 	placementv1alpha1 "github.com/c5c3/cobaltcore/operators/placement/api/v1alpha1"
 	openbaov1alpha1 "github.com/dc-tec/openbao-operator/api/v1alpha1"
@@ -629,11 +630,22 @@ func (r *ControlPlaneReconciler) Reconcile(ctx context.Context, req ctrl.Request
 				{Name: "OVN", Fn: func(ctx context.Context) (ctrl.Result, error) {
 					return r.reconcileOVN(ctx, &cp)
 				}},
+				// Neutron is gated on KeystoneReady, like its peers, and on
+				// the OVNReady the step above just wrote: the ML2/OVN
+				// mechanism driver has no logical model to write without a
+				// serving central. Past those it delivers the shared bus into
+				// the network service's namespace, projects the
+				// KeystoneService registration and the DB credential the
+				// child consumes, and folds the child's aggregate Ready into
+				// NeutronReady.
+				{Name: "Neutron", Fn: func(ctx context.Context) (ctrl.Result, error) {
+					return r.reconcileNeutron(ctx, &cp)
+				}},
 				// ServiceAccounts aggregates the readiness of the
-				// KeystoneService children the Glance/Placement/Barbican legs
-				// applied earlier in this same pass into
-				// ServiceAccountsReady. It reads only, so it carries no
-				// condition gate.
+				// KeystoneService children the
+				// Glance/Placement/Barbican/Neutron legs applied earlier in
+				// this same pass into ServiceAccountsReady. It reads only, so
+				// it carries no condition gate.
 				{Name: "ServiceAccounts", Fn: func(ctx context.Context) (ctrl.Result, error) {
 					return r.reconcileServiceAccounts(ctx, &cp)
 				}},
@@ -771,6 +783,10 @@ const placementServiceKey = "placement"
 // key manager.
 const barbicanServiceKey = "barbican"
 
+// neutronServiceKey is the key under which status.services reports the Neutron
+// network service.
+const neutronServiceKey = "neutron"
+
 // setServicesStatus records status.services and status.updatePhase on every
 // status write (#476). Both fields were declared on ControlPlaneStatus but never
 // written. status.updatePhase is fixed at Idle until the release-update state
@@ -786,7 +802,7 @@ func setServicesStatus(cp *c5c3v1alpha1.ControlPlane) {
 	// manages no Keystone, so status.services stays empty rather than reporting a
 	// service that does not exist.
 	// One entry per configured service (keystone, horizon, glance, placement,
-	// barbican), in a stable order; unmanaged services are omitted rather than
+	// barbican, neutron), in a stable order; unmanaged services are omitted rather than
 	// reported as a service that does not exist. The entry NAMES carry beyond
 	// status: the webhook's shared/dedicated transition freeze reads
 	// status.services[].name to tell a service's CREATE from a service dropped and
@@ -825,6 +841,13 @@ func setServicesStatus(cp *c5c3v1alpha1.ControlPlane) {
 		services = append(services, c5c3v1alpha1.ServiceStatus{
 			Name:    barbicanServiceKey,
 			Ready:   conditions.AllTrue(cp.Status.Conditions, conditionTypeBarbicanReady),
+			Release: cp.Spec.OpenStackRelease,
+		})
+	}
+	if cp.Spec.Services.Neutron != nil {
+		services = append(services, c5c3v1alpha1.ServiceStatus{
+			Name:    neutronServiceKey,
+			Ready:   conditions.AllTrue(cp.Status.Conditions, conditionTypeNeutronReady),
 			Release: cp.Spec.OpenStackRelease,
 		})
 	}
@@ -1381,6 +1404,10 @@ func (r *ControlPlaneReconciler) buildControlPlaneController(mgr mcmanager.Manag
 	// install on a cluster without the RabbitMQ CRD starts clean, and crdWatchGate
 	// restarts the operator once that CRD appears.
 	//
+	// The Neutron kind joins them for the same reason as its peers: the
+	// neutron-operator is installed only for a ControlPlane that runs the network
+	// service.
+	//
 	// The OVNCentral kind is guarded too, but not from this loop: it is referenced
 	// rather than projected, so it carries neither an Owns leg nor a
 	// cross-namespace child leg and takes a mapper-based Watches leg of its own
@@ -1393,6 +1420,7 @@ func (r *ControlPlaneReconciler) buildControlPlaneController(mgr mcmanager.Manag
 		&placementv1alpha1.Placement{},
 		&barbicanv1alpha1.Barbican{},
 		&barbicanv1alpha1.BarbicanSecretStore{},
+		&neutronv1alpha1.Neutron{},
 		&openbaov1alpha1.OpenBaoCluster{},
 		&openbaov1alpha1.OpenBaoTenant{},
 		rabbitmq,

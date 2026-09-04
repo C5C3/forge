@@ -256,6 +256,40 @@ func TestReconcileServiceAccounts_CountsOnlyEnabledServices(t *testing.T) {
 	g.Expect(cond.Message).To(Equal("1 built-in service registration(s) ready"))
 }
 
+// TestReconcileServiceAccounts_CountsNeutron extends the aggregate to the fourth
+// built-in registration. The network service is waited on exactly like its peers:
+// while its KeystoneService child is missing the aggregate holds and names it, and
+// only with the child present does the count reach four.
+func TestReconcileServiceAccounts_CountsNeutron(t *testing.T) {
+	g := NewGomegaWithT(t)
+	cp := korcControlPlane()
+	cp.Spec.Services.Glance = &c5c3v1alpha1.ServiceGlanceSpec{}
+	cp.Spec.Services.Placement = &c5c3v1alpha1.ServicePlacementSpec{}
+	cp.Spec.Services.Barbican = &c5c3v1alpha1.ServiceBarbicanSpec{}
+	cp.Spec.Services.Neutron = &c5c3v1alpha1.ServiceNeutronSpec{
+		OVN: c5c3v1alpha1.NeutronOVNSpec{CentralRef: c5c3v1alpha1.NeutronOVNCentralRef{Name: "ovn"}},
+	}
+
+	res, err := runServiceAccounts(t, cp,
+		readyGlanceRegistration(cp), readyPlacementRegistration(cp), readyBarbicanRegistration(cp))
+
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(res.RequeueAfter).To(Equal(korcRequeueAfter))
+	cond := serviceAccountsCondition(t, cp)
+	g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+	g.Expect(cond.Reason).To(Equal(reasonWaitingForServiceRegistration))
+	g.Expect(cond.Message).To(ContainSubstring(neutronName(cp)))
+
+	res, err = runServiceAccounts(t, cp, readyGlanceRegistration(cp), readyPlacementRegistration(cp),
+		readyBarbicanRegistration(cp), readyNeutronRegistration(cp))
+
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(res).To(Equal(ctrl.Result{}))
+	cond = serviceAccountsCondition(t, cp)
+	g.Expect(cond.Status).To(Equal(metav1.ConditionTrue))
+	g.Expect(cond.Message).To(Equal("4 built-in service registration(s) ready"))
+}
+
 // TestServiceAccountRoleSlug covers the slug normalization and its case-sensitive
 // collision resistance. The slug names the Role import and RoleAssignment CRs a
 // KeystoneService registration projects per declared role
