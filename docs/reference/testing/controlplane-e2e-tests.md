@@ -95,15 +95,21 @@ Without the stack the suites skip cleanly, so `make e2e` (which runs the whole
 
 ### full-controlplane-keystone
 
-Applies one `ControlPlane` CR and asserts the whole chain link by link, gating
+Applies one `ControlPlane` CR carrying six services (keystone, horizon, glance,
+placement, barbican, neutron) and asserts the whole chain link by link, gating
 each link on the previous one:
 
 1. **Infrastructure** — owned MariaDB (`openstack-db`) and Memcached
    (`openstack-memcached`) created and owned by the ControlPlane;
-   `InfrastructureReady=True`. The suite then onboards the per-tenant OpenBao
-   database-engine role (`setup-database-tenant.sh`), waits for
-   `DBCredentialsReady=True`, and asserts the generator-backed ExternalSecret and
-   engine-issued username.
+   `InfrastructureReady=True`. The shared bus is referenced brownfield
+   (`04-messaging-secret.yaml`, a placeholder transport URL on the reserved
+   `.invalid` TLD), so no broker is projected: the RabbitMQ Cluster Operator's
+   default 1 CPU / 2Gi broker request does not fit the single 4-vCPU CI node
+   beside the other five services and the OVN control plane. The managed
+   projection is what the [messaging](#messaging) suite proves.
+   The suite then onboards the per-tenant OpenBao database-engine role
+   (`setup-database-tenant.sh`), waits for `DBCredentialsReady=True`, and asserts
+   the generator-backed ExternalSecret and engine-issued username.
 2. **Keystone** — owned Keystone CR (`controlplane-keystone-keystone`) with
    the image tag derived from `spec.openStackRelease`, database/cache clusterRefs
    wired to the infra CRs, and `spec.database.credentialsMode: Dynamic`;
@@ -116,9 +122,9 @@ each link on the previous one:
 5. **Catalog** — owned K-ORC Service and Endpoint; `CatalogReady=True`.
 
 5b. **Registrations** — one `KeystoneService` child per built-in service
-   (`…-glance`, `…-placement`, `…-barbican`), each carrying that service's
-   catalog entry and its service account: a managed User and Project, an
-   unmanaged K-ORC Role import, and a managed RoleAssignment. Every child
+   (`…-glance`, `…-placement`, `…-barbican`, `…-neutron`), each carrying that
+   service's catalog entry and its service account: a managed User and Project,
+   an unmanaged K-ORC Role import, and a managed RoleAssignment. Every child
    reports `Ready=AllReady`, and the ControlPlane's `ServiceAccountsReady`
    aggregates them as `ServiceAccountsProvisioned`.
 
@@ -148,7 +154,37 @@ each link on the previous one:
    With no gateway in this fixture, both URLs advertise the in-cluster
    Placement API.
 
+5g. **Barbican child** — owned Barbican CR (`controlplane-keystone-barbican`) on
+   the Placement child's terms, plus the dedicated secret store the fixture asks
+   for: an `OpenBaoCluster` reporting `Available=True`, a `BarbicanSecretStore`
+   reporting `Ready=AllReady`, the AppRole Secret the barbican-operator mints
+   against it, and `SecretStoresReady=AllStoresProjected` on the child;
+   `BarbicanReady=True`.
+
+5h. **Key-manager catalog** — owned K-ORC key-manager Service plus an internal
+   and a public Endpoint, both advertising the in-cluster Barbican API.
+
+5i. **OVN gate + Neutron child** — `OVNReady=True` with reason
+   `OVNCentralReady`, mirroring the standalone `OVNCentral`
+   (`controlplane-keystone-ovn`) the suite applies beside the ControlPlane and
+   never owns. Then the owned Neutron CR (`controlplane-keystone-neutron`) on
+   the Barbican child's terms: database/cache clusterRefs, an engine-issued
+   (Dynamic) DB credential, the derived Keystone endpoint, and the registered
+   `neutron` service user. On top of those it asserts the bus Secret
+   `controlplane-keystone-neutron-messaging` the ControlPlane delivers and the
+   child references brownfield, the `spec.ovn.centralRef` whose empty namespace
+   resolved to the ControlPlane's own, and `spec.workers.deployment.replicas`
+   taken from `services.neutron.workerReplicas`; `NeutronReady=True`.
+
+5j. **Network catalog** — owned K-ORC network Service plus an internal and a
+   public Endpoint, both advertising the in-cluster Neutron API
+   (`http://controlplane-keystone-neutron.openstack.svc:9696`).
+
 6. **Aggregate** — `Ready=True` with reason `AllReady`.
+
+6a. **Service status** — `status.services[]` reports six entries, ready, in the
+   order `setServicesStatus` emits them: keystone, horizon, glance, placement,
+   barbican, neutron.
 
 6b. **Dynamic DB credential engine** — no static DB password remains at rest (the
    retired per-CR KV path is absent, AC 2/6); an engine-issued credential
@@ -164,7 +200,11 @@ each link on the previous one:
    placement row and calls `openstack resource class list` through the
    projected placement endpoint. That call reads a copy of clouds.yaml with the
    `region_name` line stripped, because the projected catalog rows carry no
-   region.
+   region. It closes with the network round trip: `network create
+   cp-verify-net`, a `network show` that has to report `ACTIVE`, and a `network
+   delete`. `cp-verify-net` is a logical network alone, written into the
+   Northbound database by the northd running in the referenced central, so no
+   chassis has to be bound for it.
 
 ### external-keystone
 
@@ -620,7 +660,10 @@ tests/e2e/c5c3/
 ├── full-controlplane-keystone/
 │   ├── chainsaw-test.yaml              Full chain, link by link
 │   ├── 00-controlplane-cr.yaml         ControlPlane CR (controlplane-keystone)
-│   └── 01-openstack-verify-job.yaml    openstack CLI verify Job
+│   ├── 01-openstack-verify-job.yaml    openstack CLI verify Job
+│   ├── 02-horizon-secret-key-externalsecret.yaml  Per-CP Horizon secret key
+│   ├── 03-ovncentral-cr.yaml           Standalone OVNCentral the ControlPlane references
+│   └── 04-messaging-secret.yaml        Brownfield bus Secret (placeholder URL, no broker)
 ├── invalid-cr/
 │   ├── chainsaw-test.yaml              ControlPlane admission rejections
 │   ├── _generate.py                    Canonical scaffold + generator for the fixtures

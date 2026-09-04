@@ -8,15 +8,17 @@
 # delivered to the per-CR k-orc-clouds-yaml Secret by the credential chain) and
 # runs `openstack token issue` + `openstack catalog list` to prove the
 # credential actually works end-to-end and that the identity, image, placement,
-# and key-manager services are catalogued. It also lists the role assignments of
-# the INJECTED "glance", "placement", and "barbican" service accounts and greps
-# for the "service" role, proving the RoleAssignments landed in Keystone, uploads
-# a real image through the projected Glance endpoint into the Garage S3 backend,
-# waits for it to reach "active", and deletes it (proving the image service works
-# end-to-end rather than only being catalogued), lists the placement resource
-# classes through the projected Placement endpoint for the same reason, and
-# stores a secret through the projected Barbican endpoint, reads its payload back
-# and compares it byte for byte against the stored literal.
+# key-manager, and network services are catalogued. It also lists the role
+# assignments of the INJECTED "glance", "placement", "barbican" and "neutron"
+# service accounts and greps for the "service" role, proving the RoleAssignments
+# landed in Keystone, uploads a real image through the projected Glance endpoint
+# into the Garage S3 backend, waits for it to reach "active", and deletes it
+# (proving the image service works end-to-end rather than only being
+# catalogued), lists the placement resource classes through the projected
+# Placement endpoint for the same reason, stores a secret through the projected
+# Barbican endpoint, reads its payload back and compares it byte for byte
+# against the stored literal, and creates, shows and deletes a network through
+# the projected Neutron endpoint.
 #
 # the orc-system copy of k-orc-clouds-yaml was removed; the
 # operator now materialises the per-CR k-orc-clouds-yaml Secret ONLY into the
@@ -66,6 +68,8 @@ spec:
               openstack --os-cloud admin catalog list | grep -qi placement
               echo "== key-manager service catalogued =="
               openstack --os-cloud admin catalog list | grep -qi key-manager
+              echo "== network service catalogued =="
+              openstack --os-cloud admin catalog list | grep -qi network
               echo "== openstack --os-cloud admin role assignment list --names --user glance =="
               openstack --os-cloud admin role assignment list --names --user glance
               openstack --os-cloud admin role assignment list --user glance --names -f value -c Role | grep -qx service
@@ -75,6 +79,9 @@ spec:
               echo "== openstack --os-cloud admin role assignment list --names --user barbican =="
               openstack --os-cloud admin role assignment list --names --user barbican
               openstack --os-cloud admin role assignment list --user barbican --names -f value -c Role | grep -qx service
+              echo "== openstack --os-cloud admin role assignment list --names --user neutron =="
+              openstack --os-cloud admin role assignment list --names --user neutron
+              openstack --os-cloud admin role assignment list --user neutron --names -f value -c Role | grep -qx service
               echo "== image upload round-trip =="
               # The projected K-ORC catalog rows carry no region — K-ORC's
               # EndpointResourceSpec has no region field — while the mounted
@@ -119,6 +126,20 @@ spec:
               test "${RETRIEVED}" = "${SECRET_PAYLOAD}" || { echo "ERROR: retrieved payload '${RETRIEVED}' != stored payload '${SECRET_PAYLOAD}'"; exit 1; }
               OS_CLIENT_CONFIG_FILE=/tmp/clouds-noregion.yaml openstack --os-cloud admin secret delete "${SECRET_HREF}"
               echo "OK: secret round-trip payload matches the stored literal, and the secret was deleted"
+              echo "== network round-trip =="
+              # The D8 CRUD check for the network service, driven through the
+              # ControlPlane's own admin credential rather than a Tempest
+              # identity. cp-verify-net is a pure-OVN LOGICAL network: northd
+              # runs in the referenced OVNCentral and writes it into the
+              # Northbound database, so no chassis has to be bound for the
+              # create to reach ACTIVE. The network rows carry no region either,
+              # so this runs against the region-stripped copy for the reason
+              # documented above.
+              OS_CLIENT_CONFIG_FILE=/tmp/clouds-noregion.yaml openstack --os-cloud admin network create cp-verify-net
+              NET_STATUS="$(OS_CLIENT_CONFIG_FILE=/tmp/clouds-noregion.yaml openstack --os-cloud admin network show cp-verify-net -f value -c status)"
+              test "${NET_STATUS}" = "ACTIVE" || { echo "ERROR: created network status '${NET_STATUS}' != ACTIVE"; exit 1; }
+              OS_CLIENT_CONFIG_FILE=/tmp/clouds-noregion.yaml openstack --os-cloud admin network delete cp-verify-net
+              echo "OK: network round-trip created, showed ACTIVE, and deleted cp-verify-net"
           volumeMounts:
             - name: clouds
               mountPath: /etc/openstack

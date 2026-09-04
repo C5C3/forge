@@ -8,8 +8,9 @@
 #
 #   1. Infrastructure  — owned MariaDB ("openstack-db") + Memcached
 #                        ("openstack-memcached") created in the openstack
-#                        namespace and owned by the ControlPlane;
-#                        InfrastructureReady=True.
+#                        namespace and owned by the ControlPlane; the shared bus
+#                        is referenced brownfield (04-messaging-secret.yaml), so
+#                        no broker is projected; InfrastructureReady=True.
 #   2. Keystone        — owned Keystone CR ("controlplane-keystone-keystone")
 #                        with image tag derived from spec.openStackRelease,
 #                        database/cache clusterRefs wired to the infra CRs, and
@@ -30,11 +31,11 @@
 #   5. Catalog         — owned K-ORC Service ("…-identity-service") + Endpoint
 #                        ("…-identity-endpoint"); CatalogReady=True.
 #   5b. Registrations  — one KeystoneService child per built-in service
-#                        ("…-glance", "…-placement", "…-barbican"), each carrying
-#                        that service's catalog entry and its service account. The
-#                        stored ControlPlane carries no inline account surface;
-#                        every child reports Ready=True (AllReady) over
-#                        CatalogReady=CatalogRegistered and
+#                        ("…-glance", "…-placement", "…-barbican", "…-neutron"),
+#                        each carrying that service's catalog entry and its
+#                        service account. The stored ControlPlane carries no
+#                        inline account surface; every child reports Ready=True
+#                        (AllReady) over CatalogReady=CatalogRegistered and
 #                        AccountReady=AccountProvisioned, and the K-ORC
 #                        RoleAssignment it label-owns is Available.
 #   5c. Glance child   — owned Glance CR ("…-glance") with database/cache clusterRefs,
@@ -70,14 +71,27 @@
 #                        internal/public Endpoints, resolved through its ownership
 #                        labels, both URLs the in-cluster Barbican API (no gateway
 #                        in this fixture).
+#   5i. OVN + Neutron  — OVNReady=True (reason OVNCentralReady) mirroring the
+#                        standalone OVNCentral this suite applies beside the
+#                        ControlPlane, then the owned Neutron CR ("…-neutron") on
+#                        the Barbican child's terms plus the bus Secret
+#                        ("…-neutron-messaging") it references brownfield, the
+#                        resolved OVN centralRef and the sized RPC workers;
+#                        NeutronReady=True.
+#   5j. Network cat.   — the network registration's K-ORC Service +
+#                        internal/public Endpoints, resolved through its ownership
+#                        labels, both URLs the in-cluster Neutron API (no gateway
+#                        in this fixture).
 #   6. Aggregate       — ControlPlane Ready=True (reason AllReady).
 #   7. API reachable   — Keystone /v3 returns HTTP 200; `openstack token issue`,
-#                        `openstack catalog list` (identity, image, placement, AND
-#                        key-manager), an image upload round-trip through the
-#                        projected Glance endpoint into the Garage S3 backend, a
-#                        placement resource-class listing, and a Barbican secret
-#                        store/get round-trip whose retrieved payload is compared
-#                        byte for byte against the stored literal all succeed using
+#                        `openstack catalog list` (identity, image, placement,
+#                        key-manager AND network), an image upload round-trip
+#                        through the projected Glance endpoint into the Garage S3
+#                        backend, a placement resource-class listing, a Barbican
+#                        secret store/get round-trip whose retrieved payload is
+#                        compared byte for byte against the stored literal, and a
+#                        network create/show/delete round-trip through the
+#                        projected Neutron endpoint all succeed using
 #                        the materialised admin clouds.yaml (proves the minted,
 #                        pushed, re-materialised application credential
 #                        authenticates and the services work).
@@ -153,7 +167,7 @@ spec:
   # ── Step 1: Presence-gate, apply the ControlPlane, assert the chain ────────
   - try:
     - script:
-        timeout: 30m
+        timeout: 40m
         # Chainsaw defaults to `sh`, which rejects `set -o pipefail`; every
         # infra/keystone e2e script pins bash for the same reason.
         shell: bash
@@ -173,6 +187,7 @@ spec:
           BARBICAN_CR="${CP_NAME}-barbican"
           BARBICAN_STORE="${BARBICAN_CR}-store"
           BARBICAN_BAO="${BARBICAN_CR}-bao"
+          NEUTRON_CR="${CP_NAME}-neutron"
           CLOUDS_SECRET=k-orc-clouds-yaml
 
           # Each built-in service registers through a KeystoneService child of its
@@ -181,6 +196,7 @@ spec:
           GLANCE_KS="${GLANCE_CR}"
           PLACEMENT_KS="${PLACEMENT_CR}"
           BARBICAN_KS="${BARBICAN_CR}"
+          NEUTRON_KS="${NEUTRON_CR}"
           # A registration's K-ORC children live in the ControlPlane's namespace and
           # carry a name-hash prefix, so nothing here can address them by name: they
           # are resolved through the ownership labels the registration stamps. The
@@ -191,6 +207,7 @@ spec:
           GLANCE_SELECTOR="c5c3.io/keystoneservice-name=${GLANCE_KS},c5c3.io/keystoneservice-namespace=${CP_NS}"
           PLACEMENT_SELECTOR="c5c3.io/keystoneservice-name=${PLACEMENT_KS},c5c3.io/keystoneservice-namespace=${CP_NS}"
           BARBICAN_SELECTOR="c5c3.io/keystoneservice-name=${BARBICAN_KS},c5c3.io/keystoneservice-namespace=${CP_NS}"
+          NEUTRON_SELECTOR="c5c3.io/keystoneservice-name=${NEUTRON_KS},c5c3.io/keystoneservice-namespace=${CP_NS}"
 
           # ── Presence guard ──────────────────────────────
           # Probe for every CRD the chain spans plus the OpenBao
@@ -231,6 +248,8 @@ spec:
             placements.placement.openstack.c5c3.io \
             barbicans.barbican.openstack.c5c3.io \
             barbicansecretstores.barbican.openstack.c5c3.io \
+            neutrons.neutron.openstack.c5c3.io \
+            ovncentrals.ovn.openstack.c5c3.io \
             openbaoclusters.openbao.org \
             openbaotenants.openbao.org \
             applicationcredentials.openstack.k-orc.cloud \
@@ -302,8 +321,18 @@ spec:
           if ! operator_running openbao-operator; then
             gate_absent "no openbao-operator is running; the dedicated Barbican secret store cannot be provisioned."
           fi
-          echo "OK: c5c3 + K-ORC + keystone + glance + placement + barbican + openbao CRDs, OpenBao store, and running"
-          echo "    keystone-operator, glance-operator, placement-operator, barbican-operator, and openbao-operator present — running the full ControlPlane → Keystone chain."
+          # The ovn-operator drives the standalone OVNCentral this suite applies
+          # to Ready, and the ControlPlane mirrors that readiness into OVNReady.
+          if ! operator_running ovn-operator; then
+            gate_absent "no ovn-operator is running; the referenced OVNCentral cannot reach Ready."
+          fi
+          # The neutron-operator drives the projected Neutron child to Ready.
+          if ! operator_running neutron-operator; then
+            gate_absent "no neutron-operator is running; the projected Neutron child cannot reach Ready."
+          fi
+
+          echo "OK: c5c3 + K-ORC + keystone + glance + placement + barbican + openbao + neutron + ovn CRDs, OpenBao store, and running"
+          echo "    keystone-operator, glance-operator, placement-operator, barbican-operator, openbao-operator, ovn-operator, and neutron-operator present — running the full ControlPlane → Keystone chain."
 
           # ── Helpers ────────────────────────────────────────────────────────
           # Poll a ControlPlane status condition to True. Implemented as an
@@ -373,6 +402,16 @@ spec:
           # Apply the ControlPlane CR now that the CRD presence guard has passed.
           # Chainsaw runs scripts with the test directory as CWD.
           kubectl apply -f 02-horizon-secret-key-externalsecret.yaml
+          # The OVN control plane the ControlPlane's services.neutron references.
+          # Applied here, inside the script and behind the gate, rather than as a
+          # separate chainsaw apply step: a separate step would hard-fail on a
+          # devstack that carries no OVN CRD, which is the case the gate above is
+          # meant to SKIP.
+          kubectl apply -f 03-ovncentral-cr.yaml
+          # The brownfield bus Secret spec.infrastructure.messaging references: no
+          # broker runs here (see 04-messaging-secret.yaml); the ControlPlane
+          # only reads it and copies the URL to the Neutron child.
+          kubectl apply -f 04-messaging-secret.yaml
           kubectl apply -f 00-controlplane-cr.yaml
 
           # ── Link 1: Infrastructure (MariaDB + Memcached, owned) ────────────
@@ -567,12 +606,12 @@ spec:
           assert_eq "K-ORC identity Endpoint owned by ControlPlane" "${CP_NAME}" \
             "$(owner_of endpoints.openstack.k-orc.cloud "${EP_CR}")"
 
-          # ── Link 5b: the glance + placement + barbican registrations ────────
+          # ── Link 5b: glance + placement + barbican + neutron registrations ──
           # Each built-in service registers through a KeystoneService child the
           # ControlPlane projects, carrying both the catalog entry and the service
-          # account (user glance/placement/barbican in project
-          # service-{glance,placement,barbican}, role "service", which Keystone's
-          # SRBAC default for identity:validate_token requires).
+          # account (user glance/placement/barbican/neutron in project
+          # service-{glance,placement,barbican,neutron}, role "service", which
+          # Keystone's SRBAC default for identity:validate_token requires).
           #
           # Each child then has to converge on its own conditions. Ready=AllReady
           # aggregates CatalogReady and AccountReady, so a child that reports it
@@ -610,8 +649,9 @@ spec:
           assert_registration "${GLANCE_KS}" "${GLANCE_SELECTOR}"
           assert_registration "${PLACEMENT_KS}" "${PLACEMENT_SELECTOR}"
           assert_registration "${BARBICAN_KS}" "${BARBICAN_SELECTOR}"
+          assert_registration "${NEUTRON_KS}" "${NEUTRON_SELECTOR}"
 
-          # ServiceAccountsReady on the ControlPlane aggregates those three
+          # ServiceAccountsReady on the ControlPlane aggregates those four
           # registrations, so it turns True only once all of them are Ready.
           wait_cp_condition ServiceAccountsReady 600
           assert_eq "ServiceAccountsReady aggregates the projected registrations" "ServiceAccountsProvisioned" \
@@ -955,14 +995,103 @@ spec:
           BARBICAN_URL="http://${BARBICAN_CR}.${CP_NS}.svc:9311"
           assert_catalog_rows "${BARBICAN_KS}" "${BARBICAN_SELECTOR}" key-manager "${BARBICAN_URL}"
 
+          # ── Link 5i: OVN gate + Neutron child (the network service) ────────
+          # Two gates stand in front of this child that no peer has. OVNReady
+          # owns nothing: it mirrors the readiness of the standalone OVNCentral
+          # applied above, so it turns True once that central serves both
+          # databases and has published its client Secret. NeutronReady then
+          # needs the bus Secret delivered beside the child, the registration,
+          # the engine-issued DB credential, and the child's own Ready, which
+          # waits on db-sync, on the OVN client certificate mirrored out of the
+          # central's clientSecretName, and on the API Deployment. That is a
+          # longer chain than any peer's, so the window is wider.
+          wait_cp_condition OVNReady 300
+          assert_eq "OVNReady reason is OVNCentralReady" "OVNCentralReady" \
+            "$(kubectl get controlplane "${CP_NAME}" -n "${CP_NS}" \
+              -o "jsonpath={.status.conditions[?(@.type=='OVNReady')].reason}")"
+          wait_cp_condition NeutronReady 900
+
+          assert_eq "Neutron image tag derived from openStackRelease" "2025.2" \
+            "$(kubectl get neutrons.neutron.openstack.c5c3.io "${NEUTRON_CR}" -n "${CP_NS}" -o 'jsonpath={.spec.image.tag}')"
+          assert_eq "Neutron database clusterRef wired to infra" "openstack-db" \
+            "$(kubectl get neutrons.neutron.openstack.c5c3.io "${NEUTRON_CR}" -n "${CP_NS}" -o 'jsonpath={.spec.database.clusterRef.name}')"
+          assert_eq "Neutron logical database is neutron" "neutron" \
+            "$(kubectl get neutrons.neutron.openstack.c5c3.io "${NEUTRON_CR}" -n "${CP_NS}" -o 'jsonpath={.spec.database.database}')"
+          assert_eq "Neutron DB secretRef points at the projected DB-credential Secret" "${NEUTRON_CR}-db-credentials" \
+            "$(kubectl get neutrons.neutron.openstack.c5c3.io "${NEUTRON_CR}" -n "${CP_NS}" -o 'jsonpath={.spec.database.secretRef.name}')"
+          assert_eq "Neutron projected with Dynamic credentialsMode" "Dynamic" \
+            "$(kubectl get neutrons.neutron.openstack.c5c3.io "${NEUTRON_CR}" -n "${CP_NS}" -o 'jsonpath={.spec.database.credentialsMode}')"
+
+          # ── Assert the Neutron DB credential is generator-backed ────────────
+          # Same shape and same ordering rationale as the Glance, Placement and
+          # Barbican checks: the dynamic objects are ensured inside the
+          # Keystone-gated reconcileNeutron, and the child only reaches Dynamic
+          # once an engine-issued credential has materialised. Neutron shares the
+          # ControlPlane namespace here, so the per-tenant engine role is
+          # neutron-<CP_NS>.
+          NEUTRON_DB_SECRET="${NEUTRON_CR}-db-credentials"
+          assert_eq "Neutron DB-credential ExternalSecret uses a VaultDynamicSecret generator" "VaultDynamicSecret" \
+            "$(kubectl get externalsecret "${NEUTRON_DB_SECRET}" -n "${CP_NS}" \
+              -o "jsonpath={.spec.dataFrom[0].sourceRef.generatorRef.kind}")"
+          assert_eq "Neutron DB-credential ExternalSecret carries no static Data refs" "" \
+            "$(kubectl get externalsecret "${NEUTRON_DB_SECRET}" -n "${CP_NS}" -o 'jsonpath={.spec.data}')"
+          kubectl get vaultdynamicsecret "${NEUTRON_DB_SECRET}" -n "${CP_NS}" >/dev/null
+          assert_eq "Neutron VaultDynamicSecret reads the neutron engine-role creds path" "database/mariadb/creds/neutron-${CP_NS}" \
+            "$(kubectl get vaultdynamicsecret "${NEUTRON_DB_SECRET}" -n "${CP_NS}" -o 'jsonpath={.spec.path}')"
+          kubectl get serviceaccount neutron-db-creds -n "${CP_NS}" >/dev/null
+          NEUTRON_DB_USERNAME="$(kubectl get secret "${NEUTRON_DB_SECRET}" -n "${CP_NS}" \
+            -o "jsonpath={.data.username}" | base64 -d)"
+          if [ "${NEUTRON_DB_USERNAME}" = "neutron" ] || [ -z "${NEUTRON_DB_USERNAME}" ]; then
+            echo "ERROR: Neutron DB-credential Secret username '${NEUTRON_DB_USERNAME}' is not engine-issued"; exit 1
+          fi
+          echo "OK: Neutron DB credential is engine-issued (username '${NEUTRON_DB_USERNAME}')"
+          assert_eq "Neutron cache clusterRef wired to infra" "openstack-memcached" \
+            "$(kubectl get neutrons.neutron.openstack.c5c3.io "${NEUTRON_CR}" -n "${CP_NS}" -o 'jsonpath={.spec.cache.clusterRef.name}')"
+          assert_eq "Neutron keystoneEndpoint derived from the naming convention" \
+            "http://${KEYSTONE_CR}.${CP_NS}.svc:5000/v3" \
+            "$(kubectl get neutrons.neutron.openstack.c5c3.io "${NEUTRON_CR}" -n "${CP_NS}" -o 'jsonpath={.spec.keystoneEndpoint}')"
+          assert_eq "Neutron service user derived from its registration (username)" "neutron" \
+            "$(kubectl get neutrons.neutron.openstack.c5c3.io "${NEUTRON_CR}" -n "${CP_NS}" -o 'jsonpath={.spec.serviceUser.username}')"
+          assert_eq "Neutron service user project" "service-neutron" \
+            "$(kubectl get neutrons.neutron.openstack.c5c3.io "${NEUTRON_CR}" -n "${CP_NS}" -o 'jsonpath={.spec.serviceUser.projectName}')"
+          assert_eq "Neutron service user secretRef" "${NEUTRON_KS}-credentials" \
+            "$(kubectl get neutrons.neutron.openstack.c5c3.io "${NEUTRON_CR}" -n "${CP_NS}" -o 'jsonpath={.spec.serviceUser.secretRef.name}')"
+
+          # The bus reaches the child as a brownfield secretRef naming the Secret
+          # the ControlPlane wrote beside it, never the source Secret
+          # spec.infrastructure.messaging references: the delivered one is what
+          # the plane writes, refuses to adopt and tears down with itself.
+          assert_eq "Neutron messaging secretRef points at the delivered bus Secret" "${CP_NAME}-neutron-messaging" \
+            "$(kubectl get neutrons.neutron.openstack.c5c3.io "${NEUTRON_CR}" -n "${CP_NS}" -o 'jsonpath={.spec.messaging.secretRef.name}')"
+          kubectl get secret "${CP_NAME}-neutron-messaging" -n "${CP_NS}" >/dev/null
+
+          # The OVN control plane, with the namespace RESOLVED by the ControlPlane
+          # rather than left for the child to default: the fixture leaves
+          # centralRef.namespace empty and the plane fills in its own.
+          assert_eq "Neutron ovn centralRef names the applied OVNCentral" "controlplane-keystone-ovn" \
+            "$(kubectl get neutrons.neutron.openstack.c5c3.io "${NEUTRON_CR}" -n "${CP_NS}" -o 'jsonpath={.spec.ovn.centralRef.name}')"
+          assert_eq "Neutron ovn centralRef namespace defaulted to the ControlPlane's own" "openstack" \
+            "$(kubectl get neutrons.neutron.openstack.c5c3.io "${NEUTRON_CR}" -n "${CP_NS}" -o 'jsonpath={.spec.ovn.centralRef.namespace}')"
+          assert_eq "Neutron RPC workers sized from services.neutron.workerReplicas" "1" \
+            "$(kubectl get neutrons.neutron.openstack.c5c3.io "${NEUTRON_CR}" -n "${CP_NS}" -o 'jsonpath={.spec.workers.deployment.replicas}')"
+          assert_eq "Neutron CR owned by ControlPlane" "${CP_NAME}" \
+            "$(owner_of neutrons.neutron.openstack.c5c3.io "${NEUTRON_CR}")"
+
+          # ── Link 5j: network catalog (the registration's rows) ──────────────
+          # The network service registers an internal AND a public Endpoint at
+          # birth like its peers; with no gateway in this fixture both URLs
+          # advertise the in-cluster Neutron API Service.
+          NEUTRON_URL="http://${NEUTRON_CR}.${CP_NS}.svc:9696"
+          assert_catalog_rows "${NEUTRON_KS}" "${NEUTRON_SELECTOR}" network "${NEUTRON_URL}"
+
           # ── Link 6: aggregate Ready=True ───────────────────────────────────
           wait_cp_condition Ready 300
           assert_eq "Aggregate Ready reason" "AllReady" \
             "$(kubectl get controlplane "${CP_NAME}" -n "${CP_NS}" -o "jsonpath={.status.conditions[?(@.type=='Ready')].reason}")"
 
-          # ── Link 6a: status.services[] reports all five services ready ─────
-          # keystone [0], horizon [1], glance [2], placement [3], barbican [4] —
-          # the stable order setServicesStatus emits.
+          # ── Link 6a: status.services[] reports all six services ready ──────
+          # keystone [0], horizon [1], glance [2], placement [3], barbican [4],
+          # neutron [5] — the stable order setServicesStatus emits.
           assert_eq "status.services[0] is keystone" "keystone" \
             "$(kubectl get controlplane "${CP_NAME}" -n "${CP_NS}" -o 'jsonpath={.status.services[0].name}')"
           assert_eq "status.services[0] keystone ready" "true" \
@@ -983,6 +1112,10 @@ spec:
             "$(kubectl get controlplane "${CP_NAME}" -n "${CP_NS}" -o 'jsonpath={.status.services[4].name}')"
           assert_eq "status.services[4] barbican ready" "true" \
             "$(kubectl get controlplane "${CP_NAME}" -n "${CP_NS}" -o 'jsonpath={.status.services[4].ready}')"
+          assert_eq "status.services[5] is neutron" "neutron" \
+            "$(kubectl get controlplane "${CP_NAME}" -n "${CP_NS}" -o 'jsonpath={.status.services[5].name}')"
+          assert_eq "status.services[5] neutron ready" "true" \
+            "$(kubectl get controlplane "${CP_NAME}" -n "${CP_NS}" -o 'jsonpath={.status.services[5].ready}')"
 
           # ── Link 6b: dynamic DB credential engine (no-static / revoke / iso) ─
           # Per-tenant role is keyed on the namespace alone (dbDynamicRoleFor /
@@ -1097,7 +1230,14 @@ spec:
           echo "== openstack token issue + catalog list (cloud: admin) =="
           kubectl delete job cp-openstack-verify -n "${CP_NS}" --ignore-not-found
           kubectl apply -f 01-openstack-verify-job.yaml
-          kubectl wait --for=condition=complete job/cp-openstack-verify -n "${CP_NS}" --timeout=5m
+          # The Job runs more than a dozen openstack CLI calls in sequence (token
+          # issue, catalog list, four role-assignment lists, then the image,
+          # placement, secret and network round-trips), and with six services up
+          # on the 4-vCPU CI node each call takes 15-25s: the run that added the
+          # network round-trip was still on `network show` when a 5m wait
+          # expired. 10m is about twice the observed runtime and sits inside the
+          # 40m step budget above.
+          kubectl wait --for=condition=complete job/cp-openstack-verify -n "${CP_NS}" --timeout=10m
           echo "=== openstack client output ==="
           # Fetch the Job log ONCE and assert on the captured text. `kubectl
           # logs | grep -q` fails under pipefail exactly when it MATCHES:
@@ -1117,11 +1257,15 @@ spec:
             || { echo "ERROR: placement service not listed in the catalog"; exit 1; }
           grep -qi "key-manager" <<<"${VERIFY_LOGS}" \
             || { echo "ERROR: key-manager (barbican) service not listed in the catalog"; exit 1; }
+          grep -qi "network" <<<"${VERIFY_LOGS}" \
+            || { echo "ERROR: network service missing from the catalog"; exit 1; }
           # The Job fails itself on a payload mismatch; this grep pins the positive
           # line so a silently skipped round-trip cannot pass as a green Job.
           grep -q "secret round-trip payload matches" <<<"${VERIFY_LOGS}" \
             || { echo "ERROR: the Barbican secret round-trip did not confirm a matching payload"; exit 1; }
-          echo "OK: token issued, identity + image + placement + key-manager services catalogued, and the image, placement and secret round-trips passed — full chain verified."
+          grep -q "OK: network round-trip" <<<"${VERIFY_LOGS}" \
+            || { echo "ERROR: the network round-trip did not confirm an ACTIVE network"; exit 1; }
+          echo "OK: token issued, identity + image + placement + key-manager + network services catalogued, and the image, placement, secret and network round-trips passed — full chain verified."
     catch:
     - script:
         # Pinned, because chainsaw applies the test's exec budget to EVERY
@@ -1179,6 +1323,18 @@ spec:
           kubectl get serviceaccount barbican-db-creds -n openstack 2>&1 || true
           echo "=== barbican-operator logs (last 200 lines) ==="
           kubectl logs -n barbican-system -l app.kubernetes.io/name=barbican-operator --tail=200 --all-containers 2>&1 || true
+          echo "=== Neutron child + its bus Secret + the referenced OVNCentral ==="
+          kubectl get neutrons.neutron.openstack.c5c3.io,ovncentrals.ovn.openstack.c5c3.io -n openstack 2>&1 || true
+          kubectl describe neutrons.neutron.openstack.c5c3.io controlplane-keystone-neutron -n openstack 2>&1 || true
+          kubectl describe ovncentrals.ovn.openstack.c5c3.io controlplane-keystone-ovn -n openstack 2>&1 || true
+          kubectl get secret controlplane-keystone-neutron-messaging -n openstack 2>&1 || true
+          kubectl describe externalsecret controlplane-keystone-neutron-db-credentials -n openstack 2>&1 || true
+          kubectl describe vaultdynamicsecret controlplane-keystone-neutron-db-credentials -n openstack 2>&1 || true
+          kubectl get serviceaccount neutron-db-creds -n openstack 2>&1 || true
+          echo "=== neutron-operator logs (last 200 lines) ==="
+          kubectl logs -n neutron-system -l app.kubernetes.io/name=neutron-operator --tail=200 --all-containers 2>&1 || true
+          echo "=== ovn-operator logs (last 200 lines) ==="
+          kubectl logs -n ovn-system -l app.kubernetes.io/name=ovn-operator --tail=200 --all-containers 2>&1 || true
           echo "=== openbao-operator logs (last 100 lines) ==="
           kubectl logs -n openbao-operator-system -l app.kubernetes.io/name=openbao-operator --tail=100 --all-containers 2>&1 || true
           echo "=== OpenBao logs (last 100 lines) ==="
@@ -1195,8 +1351,8 @@ spec:
     - script:
         # Pinned for the same reason as catch above; one delete needs nothing
         # like the test's exec budget. Keeps the suite's ceiling at
-        # exec + catch + finally + cleanup = 43m, which is the number
-        # .github/workflows/ci.yaml budgets against.
+        # exec + catch + finally + cleanup = 40 + 5 + 5 + 3 = 53m, which is the
+        # number .github/workflows/ci.yaml budgets against.
         timeout: 5m
         shell: bash
         content: |

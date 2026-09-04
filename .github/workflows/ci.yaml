@@ -1935,12 +1935,12 @@ jobs:
   # applies that budget to every script operation, so try, catch and finally each
   # get one, and the cleanup runs after all three. Each of the three therefore
   # pins its catch and its finally explicitly, which puts the ceilings at
-  # 30+5+5+3 = 43m (full-chain), 40+5+20+15 = 80m (foreign-namespace) and
+  # 40+5+5+3 = 53m (full-chain), 40+5+20+15 = 80m (foreign-namespace) and
   # 50+5+20+15 = 90m (own-namespace). Unpinned, catch and finally would inherit
   # the exec budget and the own-namespace ceiling alone would be 165m.
   #
-  # timeout-minutes has to outlast the bring-up (kind create, twelve kind loads,
-  # setup-e2e-infra, K-ORC and six operator deploys) plus the suites that pass
+  # timeout-minutes has to outlast the bring-up (kind create, sixteen kind loads,
+  # setup-e2e-infra, K-ORC and eight operator deploys) plus the suites that pass
   # plus the full ceiling of the one that stalls, or the job wall arrives before
   # a suite's own timeout does: chainsaw is killed outright, its catch block
   # never runs, and a stalled leg is reported as a cancelled job with no JUnit
@@ -1975,8 +1975,14 @@ jobs:
           version: ${{ env.KIND_VERSION }}
           config: hack/kind-config.yaml
           cluster_name: ${{ env.KIND_CLUSTER }}
-      # Pull the pre-built dev operator images plus the Keystone service image
-      # and the OpenStack-client (tempest) image the verify Job uses.
+      # images/ovn/Dockerfile holds the pin; resolving it here keeps the tag
+      # out of this workflow.
+      - name: Resolve OVN version
+        run: echo "OVN_VERSION=$(hack/ci-resolve-ovn-version.sh)" >> "$GITHUB_ENV"
+      # Pull the pre-built dev operator images plus the service images the
+      # projected children run (the OVN daemon image among them, which the
+      # ovn-operator rolls out for the standalone central the suite applies) and
+      # the OpenStack-client (tempest) image the verify Job uses.
       - name: Load E2E images
         uses: ./.github/actions/load-e2e-images
         with:
@@ -1988,11 +1994,15 @@ jobs:
             ${{ env.IMAGE_PREFIX }}/glance-operator:dev
             ${{ env.IMAGE_PREFIX }}/placement-operator:dev
             ${{ env.IMAGE_PREFIX }}/barbican-operator:dev
+            ${{ env.IMAGE_PREFIX }}/ovn-operator:dev
+            ${{ env.IMAGE_PREFIX }}/neutron-operator:dev
             ${{ env.IMAGE_PREFIX }}/keystone:2025.2
             ${{ env.IMAGE_PREFIX }}/horizon:2025.2
             ${{ env.IMAGE_PREFIX }}/glance:2025.2
             ${{ env.IMAGE_PREFIX }}/placement:2025.2
             ${{ env.IMAGE_PREFIX }}/barbican:2025.2
+            ${{ env.IMAGE_PREFIX }}/neutron:2025.2
+            ${{ env.IMAGE_PREFIX }}/ovn:${{ env.OVN_VERSION }}
             ${{ env.IMAGE_PREFIX }}/tempest:2025.2
       - name: Load images into kind
         run: |
@@ -2002,11 +2012,15 @@ jobs:
           kind load docker-image ${{ env.IMAGE_PREFIX }}/glance-operator:dev --name ${{ env.KIND_CLUSTER }}
           kind load docker-image ${{ env.IMAGE_PREFIX }}/placement-operator:dev --name ${{ env.KIND_CLUSTER }}
           kind load docker-image ${{ env.IMAGE_PREFIX }}/barbican-operator:dev --name ${{ env.KIND_CLUSTER }}
+          kind load docker-image ${{ env.IMAGE_PREFIX }}/ovn-operator:dev --name ${{ env.KIND_CLUSTER }}
+          kind load docker-image ${{ env.IMAGE_PREFIX }}/neutron-operator:dev --name ${{ env.KIND_CLUSTER }}
           kind load docker-image ${{ env.IMAGE_PREFIX }}/keystone:2025.2 --name ${{ env.KIND_CLUSTER }}
           kind load docker-image ${{ env.IMAGE_PREFIX }}/horizon:2025.2 --name ${{ env.KIND_CLUSTER }}
           kind load docker-image ${{ env.IMAGE_PREFIX }}/glance:2025.2 --name ${{ env.KIND_CLUSTER }}
           kind load docker-image ${{ env.IMAGE_PREFIX }}/placement:2025.2 --name ${{ env.KIND_CLUSTER }}
           kind load docker-image ${{ env.IMAGE_PREFIX }}/barbican:2025.2 --name ${{ env.KIND_CLUSTER }}
+          kind load docker-image ${{ env.IMAGE_PREFIX }}/neutron:2025.2 --name ${{ env.KIND_CLUSTER }}
+          kind load docker-image ${{ env.IMAGE_PREFIX }}/ovn:${{ env.OVN_VERSION }} --name ${{ env.KIND_CLUSTER }}
           kind load docker-image ${{ env.IMAGE_PREFIX }}/tempest:2025.2 --name ${{ env.KIND_CLUSTER }}
       # Prepare the shared infra (TLS, OpenBao + per-CR seeding, ESO store) and
       # suspend the Flux ControlPlane stack; the operators are deployed below.
@@ -2077,6 +2091,25 @@ jobs:
           OPERATOR: barbican
           IMAGE_REPO: ${{ env.IMAGE_PREFIX }}/barbican-operator
           NAMESPACE: barbican-system
+      # ovn-operator before c5c3-operator so the OVNCentral CRD is served before
+      # the ControlPlane reads the central its services.neutron references. The
+      # operator itself drives that standalone central, which the full-chain
+      # suite applies beside the ControlPlane, to Ready.
+      - name: Deploy ovn-operator
+        run: hack/ci-deploy-operator.sh
+        env:
+          OPERATOR: ovn
+          IMAGE_REPO: ${{ env.IMAGE_PREFIX }}/ovn-operator
+          NAMESPACE: ovn-system
+      # neutron-operator before c5c3-operator so the Neutron CRD exists before
+      # c5c3-operator projects the Neutron child, and so something drives that
+      # child to Ready once it lands.
+      - name: Deploy neutron-operator
+        run: hack/ci-deploy-operator.sh
+        env:
+          OPERATOR: neutron
+          IMAGE_REPO: ${{ env.IMAGE_PREFIX }}/neutron-operator
+          NAMESPACE: neutron-system
       - name: Deploy c5c3-operator
         run: hack/ci-deploy-operator.sh
         env:

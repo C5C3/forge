@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright 2026 SAP SE or an SAP affiliate company
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# The OVN control plane the ControlPlane's services.neutron.ovn.centralRef names.
+#
+# It is deployed INFRA-STYLE beside the ControlPlane, the way the deploy stack
+# provisions one, and the ControlPlane only REFERENCES it: the c5c3-operator
+# reads this CR's status (both internalDbAddress values plus the published
+# clientSecretName) and mirrors its readiness into OVNReady. It projects no
+# OVNCentral of its own and deletes none, so the suite applies this fixture and
+# leaves it standing for the plane to read.
+#
+# Single-member Raft clusters and a single northd keep the bring-up inside the
+# suite's budget on a single-node kind cluster; the multi-member cluster is what
+# tests/e2e/ovn/central-basic-deployment/ covers. The backup CronJob is
+# suspended: this suite asserts nothing about it, and a suspended schedule keeps
+# the hourly database dump off a node that is already running the whole
+# ControlPlane chain.
+#
+# The issuer is the cluster-scoped one the kind overlay ships
+# (deploy/flux-system/infrastructure/ovn-ca-issuer.yaml). OVN authenticates every
+# connection, so both databases and the client identity the Neutron pods mount
+# are issued from the same CA.
+apiVersion: ovn.openstack.c5c3.io/v1alpha1
+kind: OVNCentral
+metadata:
+  name: controlplane-keystone-ovn
+  namespace: openstack
+spec:
+  tls:
+    issuerRef:
+      name: openstack-ovn-ca-issuer
+  northbound:
+    replicas: 1
+  southbound:
+    replicas: 1
+  northd:
+    deployment:
+      replicas: 1
+  backup:
+    suspend: true

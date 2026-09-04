@@ -3,8 +3,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # ControlPlane CR fixture for the full-controlplane-keystone E2E test. It drives
-# FIVE services (keystone, horizon, glance, placement, and barbican) through the
-# full chain.
+# SIX services (keystone, horizon, glance, placement, barbican, and neutron)
+# through the full chain.
 #
 # Managed mode: database and cache reference managed clusters by clusterRef, so
 # the c5c3-operator reconcileInfrastructure sub-reconciler projects an owned
@@ -69,6 +69,19 @@ spec:
         name: openstack-memcached
       backend: dogpile.cache.pymemcache
       replicas: 1
+    # The shared message bus, referenced brownfield. The network service is its
+    # first consumer: the Neutron CRD requires spec.messaging, and the
+    # ControlPlane derives the child's transport URL from this block, so the
+    # webhook requires it beside services.neutron. The Secret is
+    # 04-messaging-secret.yaml, applied beside this CR with a placeholder URL.
+    # A managed clusterRef would project a RabbitmqCluster whose pod requests
+    # the RabbitMQ Cluster Operator's default 1 CPU and 2Gi, which does not fit
+    # the single 4-vCPU CI node beside the other five services and the OVN
+    # control plane (the keystone db-sync Job and OVN northd never scheduled).
+    # The managed projection is what tests/e2e/c5c3/messaging/ proves.
+    messaging:
+      secretRef:
+        name: controlplane-keystone-messaging
   services:
     keystone:
       replicas: 1
@@ -114,6 +127,18 @@ spec:
       replicas: 1
       secretStore:
         dedicated: {}
+    # The network service. Its central is the standalone OVNCentral that
+    # 03-ovncentral-cr.yaml applies beside this CR; the ControlPlane only reads
+    # that CR's readiness and never owns it. The centralRef namespace is left
+    # empty and defaults to the ControlPlane's own (openstack). workerReplicas
+    # sizes both RPC worker Deployments, so 1 keeps two worker pods on this
+    # single node instead of the six the CRD default would schedule.
+    neutron:
+      replicas: 1
+      workerReplicas: 1
+      ovn:
+        centralRef:
+          name: controlplane-keystone-ovn
   globalPolicyOverrides:
     rules:
       "identity:list_users": "role:admin"
@@ -130,17 +155,18 @@ spec:
         rotation:
           mode: PasswordDriven
     # NOTE: Each declared service registers through a KeystoneService child the
-    # c5c3-operator projects for it (controlplane-keystone-glance, -placement and
-    # -barbican, one per service, in that service's namespace), carrying both the
-    # service's catalog entry and its service account. The account is the user
-    # glance / placement / barbican in a Keystone project of its own
-    # (service-glance, service-placement, service-barbican, created by the
-    # registration) bound to the "service" role, which Keystone's SRBAC default
-    # for identity:validate_token requires. The registration delivers the
-    # account's credentials as the Secret <child>-credentials beside the service,
-    # and the service child reads its service-user password from there. Exercising
-    # that projection on a live cluster is the point: each role projects as one
-    # unmanaged K-ORC Role import plus one managed RoleAssignment; the chainsaw
-    # link asserts the three children reach Ready and that the K-ORC rows they
-    # label-own are Available, and the verify Job asserts the role is listed
-    # against each user in Keystone.
+    # c5c3-operator projects for it (controlplane-keystone-glance, -placement,
+    # -barbican and -neutron, one per service, in that service's namespace),
+    # carrying both the service's catalog entry and its service account. The
+    # account is the user glance / placement / barbican / neutron in a Keystone
+    # project of its own (service-glance, service-placement, service-barbican,
+    # service-neutron, created by the registration) bound to the "service" role,
+    # which Keystone's SRBAC default for identity:validate_token requires. The
+    # registration delivers the account's credentials as the Secret
+    # <child>-credentials beside the service, and the service child reads its
+    # service-user password from there. Exercising that projection on a live
+    # cluster is the point: each role projects as one unmanaged K-ORC Role import
+    # plus one managed RoleAssignment; the chainsaw link asserts the four
+    # children reach Ready and that the K-ORC rows they label-own are Available,
+    # and the verify Job asserts the role is listed against each user in
+    # Keystone.
