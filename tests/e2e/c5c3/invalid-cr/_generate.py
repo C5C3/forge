@@ -56,6 +56,7 @@ LICENSE_HEADER = """\
 #   {glance}              the spec.services.glance entry (indent 4) or ""
 #   {placement}           the spec.services.placement entry (indent 4) or ""
 #   {barbican}            the spec.services.barbican entry (indent 4) or ""
+#   {neutron}             the spec.services.neutron entry (indent 4) or ""
 #   {service_registrations}
 #                         the spec.korc.serviceRegistrations block (indent 4) or ""
 #
@@ -71,7 +72,7 @@ spec:
   openStackRelease: "2025.2"
 {global_extra_config}{infrastructure}  services:
     keystone:
-{keystone}{horizon}{glance}{placement}{barbican}  korc:
+{keystone}{horizon}{glance}{placement}{barbican}{neutron}  korc:
     adminCredential:
       cloudCredentialsRef:
         cloudName: admin
@@ -141,6 +142,21 @@ VALID_BARBICAN = (
 )
 
 
+# A valid neutron service body (indent 4): the minimal shape, a reference to the
+# OVNCentral the projected child programs. ovn.centralRef.name is the one
+# REQUIRED field of the block, because the ML2/OVN mechanism driver has no
+# logical network model to write to without a central; everything else the child
+# needs (its database, its cache, its bus, its Keystone endpoint) is derived from
+# the ControlPlane. The neutron fixture that mutates the reference spells its
+# block out instead of appending to this one.
+VALID_NEUTRON = (
+    "    neutron:\n"
+    "      ovn:\n"
+    "        centralRef:\n"
+    "          name: ovn\n"
+)
+
+
 # A valid, MANAGED dedicated backing-services block for the Keystone service
 # (indent 6, to be appended to a Managed keystone body). Every dedicated fixture
 # below mutates exactly one aspect of it.
@@ -172,6 +188,7 @@ class Fixture:
     glance: str = ""
     placement: str = ""
     barbican: str = ""
+    neutron: str = ""
     # The spec.globalExtraConfig block (indent 2, trailing newline) or "".
     global_extra_config: str = ""
     # The spec.korc.serviceRegistrations block (indent 4, trailing newline) or "".
@@ -187,6 +204,7 @@ class Fixture:
             glance=self.glance,
             placement=self.placement,
             barbican=self.barbican,
+            neutron=self.neutron,
             service_registrations=self.service_registrations,
         )
         comment_lines = "".join(f"# {line}\n" for line in self.comment.splitlines())
@@ -1259,6 +1277,181 @@ FIXTURES: tuple[Fixture, ...] = (
             + "          database: barbican\n"
             + "          secretRef:\n"
             + "            name: barbican-db\n"
+        ),
+    ),
+    # --- per-service Neutron (still the create-rejection matrix). Every
+    #     ControlPlane name below stays at or under 32 characters, except the one
+    #     fixture that pins the bound: the projected Neutron child is
+    #     "{cp}-neutron" and the Neutron CRD caps its own metadata.name at 40.
+    #     The numbering runs 96-99 and then fills 24-26, three of the gaps left
+    #     below the two-digit ceiling every fixture filename sits under. ---
+    Fixture(
+        filename="96-external-with-neutron.yaml",
+        comment=(
+            "services.neutron set in External mode is forbidden by the webhook (cross-field,\n"
+            "mirroring its glance, placement and barbican siblings): Neutron needs its own\n"
+            "External-mode design. The neutron block is the minimal valid one (a reference to\n"
+            "the OVNCentral the child programs), so the ONLY violation is the cross-field\n"
+            "forbid, and the chainsaw step anchors on `forbidden when services.keystone.mode\n"
+            "is External`."
+        ),
+        name="cp-external-with-neutron",
+        neutron=VALID_NEUTRON,
+    ),
+    Fixture(
+        filename="97-neutron-without-messaging.yaml",
+        comment=(
+            "spec.infrastructure.messaging is required as soon as services.neutron is set,\n"
+            "and the webhook is the only layer that can say so: the Neutron CRD requires\n"
+            "spec.messaging and the ControlPlane derives the child's transport URL from the\n"
+            "shared bus, so a ControlPlane declaring the network service without a bus would\n"
+            "project a child its own admission rejects on every pass. The infrastructure block\n"
+            "is the brownfield one every Managed fixture carries, minus the messaging entry, so\n"
+            "the missing bus is the only violation and the step anchors on `is required when\n"
+            "services.neutron is set`."
+        ),
+        name="cp-neutron-no-messaging",
+        keystone="      mode: Managed\n",
+        infrastructure=MANAGED_INFRA,
+        neutron=VALID_NEUTRON,
+    ),
+    Fixture(
+        filename="98-neutron-ovn-centralref-name-empty.yaml",
+        comment=(
+            "services.neutron.ovn.centralRef.name is empty. The ML2/OVN mechanism driver\n"
+            "writes every network, subnet and port into that central's Northbound database, so\n"
+            "a reference naming no OVNCentral leaves the child no database to program. The\n"
+            "field carries MinLength=1, which rejects the CR at the CRD schema layer before\n"
+            "the webhook mirror in validateNeutron runs, so the chainsaw step anchors on the\n"
+            "API server's marker message rather than the webhook's."
+        ),
+        name="cp-neutron-empty-central-name",
+        keystone="      mode: Managed\n",
+        infrastructure=MANAGED_INFRA_WITH_BROWNFIELD_MESSAGING,
+        neutron=(
+            "    neutron:\n"
+            "      ovn:\n"
+            "        centralRef:\n"
+            '          name: ""\n'
+        ),
+    ),
+    Fixture(
+        filename="99-neutron-public-endpoint-host-mismatch.yaml",
+        comment=(
+            "services.neutron.publicEndpoint must name the same host as\n"
+            "services.neutron.gateway.hostname (webhook-only). The Gateway listener is what\n"
+            "routes that hostname to the Neutron API, so a divergent host advertises a catalog\n"
+            "endpoint that never reaches it. The value is projected into no child CR, so this\n"
+            "webhook is the only gate on the URL every client resolves to create its networks,\n"
+            "subnets and ports. The endpoint keeps the https scheme the gateway rule also\n"
+            "demands, so the ONLY violation is the host and the step anchors on `must equal\n"
+            "services.neutron.gateway.hostname`."
+        ),
+        name="cp-neutron-endpoint-mismatch",
+        keystone="      mode: Managed\n",
+        infrastructure=MANAGED_INFRA_WITH_BROWNFIELD_MESSAGING,
+        neutron=(
+            VALID_NEUTRON
+            + "      gateway:\n"
+            + "        hostname: neutron.example.com\n"
+            + "        parentRef:\n"
+            + "          name: openstack-gw\n"
+            + "      publicEndpoint: https://other.example.com\n"
+        ),
+    ),
+    Fixture(
+        filename="24-neutron-override-dynamic-on-dedicated.yaml",
+        comment=(
+            "databaseCredentialsMode Dynamic on the Neutron service is rejected by the webhook\n"
+            "when Neutron declares a DEDICATED database, mirroring the keystone, glance,\n"
+            "placement and barbican twins: the override retargets the shared database this\n"
+            "service does not use, and a dedicated database is Static-only. The defaulting\n"
+            "webhook materializes that dedicated database's own Static mode, so the only\n"
+            "violation is the service-level override and the step anchors on `not supported as\n"
+            "an override on a service with a dedicated database`."
+        ),
+        name="cp-override-dynamic-dedicated-nn",
+        keystone="      mode: Managed\n",
+        infrastructure=MANAGED_INFRA_WITH_BROWNFIELD_MESSAGING,
+        neutron=(
+            VALID_NEUTRON
+            + "      databaseCredentialsMode: Dynamic\n"
+            + "      dedicatedBackingServices:\n"
+            + "        database:\n"
+            + "          clusterRef:\n"
+            + "            name: cp-dedicated-db\n"
+            + "          database: neutron\n"
+            + "          secretRef:\n"
+            + "            name: neutron-db\n"
+        ),
+    ),
+    Fixture(
+        filename="25-placed-neutron-unpublished.yaml",
+        comment=(
+            "A placed CATALOG service must advertise a publicEndpoint or a gateway\n"
+            "(webhook-only), the rule the placed-Glance fixture pins for the image service and\n"
+            "this one for the network service: what the ControlPlane registers for an\n"
+            "unpublished Neutron is its in-cluster Service DNS name, which resolves nowhere\n"
+            "outside the cluster Neutron runs on, so every client that reads the catalog from\n"
+            "anywhere else gets an address it cannot connect to. The namespace block is\n"
+            "present, so the co-requisite rule of the same validator stays silent and the step\n"
+            "anchors on `one of publicEndpoint or gateway is required when targetClusterRef is\n"
+            "set`. Keystone stays unplaced in the ControlPlane's own namespace, which the\n"
+            "co-location rule does not compare against Neutron's; it is published all the same,\n"
+            "because a service placed away from Keystone reaches it over the public URL."
+        ),
+        name="cp-placed-neutron-unpublished",
+        keystone=(
+            "      mode: Managed\n"
+            "      publicEndpoint: https://keystone.example.com/v3\n"
+        ),
+        infrastructure=MANAGED_INFRA_WITH_BROWNFIELD_MESSAGING,
+        neutron=(
+            VALID_NEUTRON
+            + "      namespace:\n"
+            + "        name: network\n"
+            + "      targetClusterRef:\n"
+            + "        name: edge\n"
+        ),
+    ),
+    Fixture(
+        filename="26-neutron-name-too-long.yaml",
+        comment=(
+            "metadata.name is 33 characters, so the Neutron child this ControlPlane projects\n"
+            "would be named \"{cp}-neutron\" at 41 — one over the 40 the Neutron CRD admits,\n"
+            "because its ovn-db-sync CronJob appends a 12-character suffix and Kubernetes caps\n"
+            "CronJob names at 52. The webhook rejects the ControlPlane up front (a create-only\n"
+            "rule, since metadata.name is immutable): admitted, it would fail to apply the\n"
+            "child on every pass, with NeutronReady stuck False and no recovery short of\n"
+            "recreating the whole control plane. The step anchors on `the projected Neutron\n"
+            "child CR name would be 41 characters`."
+        ),
+        name="cp-neutron-name-is-thirty-three-x",
+        keystone="      mode: Managed\n",
+        infrastructure=MANAGED_INFRA_WITH_BROWNFIELD_MESSAGING,
+        neutron=VALID_NEUTRON,
+    ),
+    Fixture(
+        filename="27-neutron-ovn-central-foreign-namespace.yaml",
+        comment=(
+            "services.neutron.ovn.centralRef.namespace names a namespace this ControlPlane\n"
+            "neither owns nor claims through a services.<service>.namespace assignment\n"
+            "(webhook-only). The reference is not read-only: the neutron-operator mirrors the\n"
+            "named central's client Secret into the Neutron namespace, so admitting it would\n"
+            "hand this plane a full mTLS identity for another plane's Northbound and\n"
+            "Southbound databases. The fixture carries no metadata.namespace — Chainsaw runs\n"
+            "each Test in an ephemeral one — so any namespace spelled out here is foreign, and\n"
+            "the step anchors on `is neither this ControlPlane`."
+        ),
+        name="cp-neutron-foreign-central-ns",
+        keystone="      mode: Managed\n",
+        infrastructure=MANAGED_INFRA_WITH_BROWNFIELD_MESSAGING,
+        neutron=(
+            "    neutron:\n"
+            "      ovn:\n"
+            "        centralRef:\n"
+            "          name: ovn\n"
+            "          namespace: other-tenant\n"
         ),
     ),
     # --- transition wave E: barbican secret-store addressing freeze

@@ -1,0 +1,43 @@
+# SPDX-FileCopyrightText: Copyright 2026 SAP SE or an SAP affiliate company
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# services.neutron.ovn.centralRef.name is empty. The ML2/OVN mechanism driver
+# writes every network, subnet and port into that central's Northbound database, so
+# a reference naming no OVNCentral leaves the child no database to program. The
+# field carries MinLength=1, which rejects the CR at the CRD schema layer before
+# the webhook mirror in validateNeutron runs, so the chainsaw step anchors on the
+# API server's marker message rather than the webhook's.
+apiVersion: c5c3.io/v1alpha1
+kind: ControlPlane
+metadata:
+  name: cp-neutron-empty-central-name
+spec:
+  openStackRelease: "2025.2"
+  infrastructure:
+    database:
+      host: db.example.com
+      database: openstack
+      secretRef:
+        name: db-creds
+    cache:
+      backend: dogpile.cache.pymemcache
+      servers:
+      - mc:11211
+    messaging:
+      secretRef:
+        name: bus-url
+  services:
+    keystone:
+      mode: Managed
+    neutron:
+      ovn:
+        centralRef:
+          name: ""
+  korc:
+    adminCredential:
+      cloudCredentialsRef:
+        cloudName: admin
+      passwordSecretRef:
+        name: external-admin
+        key: password

@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright 2026 SAP SE or an SAP affiliate company
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# metadata.name is 33 characters, so the Neutron child this ControlPlane projects
+# would be named "{cp}-neutron" at 41 — one over the 40 the Neutron CRD admits,
+# because its ovn-db-sync CronJob appends a 12-character suffix and Kubernetes caps
+# CronJob names at 52. The webhook rejects the ControlPlane up front (a create-only
+# rule, since metadata.name is immutable): admitted, it would fail to apply the
+# child on every pass, with NeutronReady stuck False and no recovery short of
+# recreating the whole control plane. The step anchors on `the projected Neutron
+# child CR name would be 41 characters`.
+apiVersion: c5c3.io/v1alpha1
+kind: ControlPlane
+metadata:
+  name: cp-neutron-name-is-thirty-three-x
+spec:
+  openStackRelease: "2025.2"
+  infrastructure:
+    database:
+      host: db.example.com
+      database: openstack
+      secretRef:
+        name: db-creds
+    cache:
+      backend: dogpile.cache.pymemcache
+      servers:
+      - mc:11211
+    messaging:
+      secretRef:
+        name: bus-url
+  services:
+    keystone:
+      mode: Managed
+    neutron:
+      ovn:
+        centralRef:
+          name: ovn
+  korc:
+    adminCredential:
+      cloudCredentialsRef:
+        cloudName: admin
+      passwordSecretRef:
+        name: external-admin
+        key: password

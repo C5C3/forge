@@ -1,0 +1,42 @@
+# SPDX-FileCopyrightText: Copyright 2026 SAP SE or an SAP affiliate company
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# spec.infrastructure.messaging is required as soon as services.neutron is set,
+# and the webhook is the only layer that can say so: the Neutron CRD requires
+# spec.messaging and the ControlPlane derives the child's transport URL from the
+# shared bus, so a ControlPlane declaring the network service without a bus would
+# project a child its own admission rejects on every pass. The infrastructure block
+# is the brownfield one every Managed fixture carries, minus the messaging entry, so
+# the missing bus is the only violation and the step anchors on `is required when
+# services.neutron is set`.
+apiVersion: c5c3.io/v1alpha1
+kind: ControlPlane
+metadata:
+  name: cp-neutron-no-messaging
+spec:
+  openStackRelease: "2025.2"
+  infrastructure:
+    database:
+      host: db.example.com
+      database: openstack
+      secretRef:
+        name: db-creds
+    cache:
+      backend: dogpile.cache.pymemcache
+      servers:
+      - mc:11211
+  services:
+    keystone:
+      mode: Managed
+    neutron:
+      ovn:
+        centralRef:
+          name: ovn
+  korc:
+    adminCredential:
+      cloudCredentialsRef:
+        cloudName: admin
+      passwordSecretRef:
+        name: external-admin
+        key: password

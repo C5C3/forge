@@ -1,0 +1,46 @@
+# SPDX-FileCopyrightText: Copyright 2026 SAP SE or an SAP affiliate company
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# services.neutron.ovn.centralRef.namespace names a namespace this ControlPlane
+# neither owns nor claims through a services.<service>.namespace assignment
+# (webhook-only). The reference is not read-only: the neutron-operator mirrors the
+# named central's client Secret into the Neutron namespace, so admitting it would
+# hand this plane a full mTLS identity for another plane's Northbound and
+# Southbound databases. The fixture carries no metadata.namespace — Chainsaw runs
+# each Test in an ephemeral one — so any namespace spelled out here is foreign, and
+# the step anchors on `is neither this ControlPlane`.
+apiVersion: c5c3.io/v1alpha1
+kind: ControlPlane
+metadata:
+  name: cp-neutron-foreign-central-ns
+spec:
+  openStackRelease: "2025.2"
+  infrastructure:
+    database:
+      host: db.example.com
+      database: openstack
+      secretRef:
+        name: db-creds
+    cache:
+      backend: dogpile.cache.pymemcache
+      servers:
+      - mc:11211
+    messaging:
+      secretRef:
+        name: bus-url
+  services:
+    keystone:
+      mode: Managed
+    neutron:
+      ovn:
+        centralRef:
+          name: ovn
+          namespace: other-tenant
+  korc:
+    adminCredential:
+      cloudCredentialsRef:
+        cloudName: admin
+      passwordSecretRef:
+        name: external-admin
+        key: password

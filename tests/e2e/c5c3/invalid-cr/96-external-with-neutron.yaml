@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright 2026 SAP SE or an SAP affiliate company
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# services.neutron set in External mode is forbidden by the webhook (cross-field,
+# mirroring its glance, placement and barbican siblings): Neutron needs its own
+# External-mode design. The neutron block is the minimal valid one (a reference to
+# the OVNCentral the child programs), so the ONLY violation is the cross-field
+# forbid, and the chainsaw step anchors on `forbidden when services.keystone.mode
+# is External`.
+apiVersion: c5c3.io/v1alpha1
+kind: ControlPlane
+metadata:
+  name: cp-external-with-neutron
+spec:
+  openStackRelease: "2025.2"
+  services:
+    keystone:
+      mode: External
+      external:
+        authURL: https://keystone.example.com/v3
+    neutron:
+      ovn:
+        centralRef:
+          name: ovn
+  korc:
+    adminCredential:
+      cloudCredentialsRef:
+        cloudName: admin
+      passwordSecretRef:
+        name: external-admin
+        key: password

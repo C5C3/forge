@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: Copyright 2026 SAP SE or an SAP affiliate company
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# A placed CATALOG service must advertise a publicEndpoint or a gateway
+# (webhook-only), the rule the placed-Glance fixture pins for the image service and
+# this one for the network service: what the ControlPlane registers for an
+# unpublished Neutron is its in-cluster Service DNS name, which resolves nowhere
+# outside the cluster Neutron runs on, so every client that reads the catalog from
+# anywhere else gets an address it cannot connect to. The namespace block is
+# present, so the co-requisite rule of the same validator stays silent and the step
+# anchors on `one of publicEndpoint or gateway is required when targetClusterRef is
+# set`. Keystone stays unplaced in the ControlPlane's own namespace, which the
+# co-location rule does not compare against Neutron's; it is published all the same,
+# because a service placed away from Keystone reaches it over the public URL.
+apiVersion: c5c3.io/v1alpha1
+kind: ControlPlane
+metadata:
+  name: cp-placed-neutron-unpublished
+spec:
+  openStackRelease: "2025.2"
+  infrastructure:
+    database:
+      host: db.example.com
+      database: openstack
+      secretRef:
+        name: db-creds
+    cache:
+      backend: dogpile.cache.pymemcache
+      servers:
+      - mc:11211
+    messaging:
+      secretRef:
+        name: bus-url
+  services:
+    keystone:
+      mode: Managed
+      publicEndpoint: https://keystone.example.com/v3
+    neutron:
+      ovn:
+        centralRef:
+          name: ovn
+      namespace:
+        name: network
+      targetClusterRef:
+        name: edge
+  korc:
+    adminCredential:
+      cloudCredentialsRef:
+        cloudName: admin
+      passwordSecretRef:
+        name: external-admin
+        key: password

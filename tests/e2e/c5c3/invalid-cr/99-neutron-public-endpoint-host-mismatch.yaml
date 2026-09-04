@@ -1,0 +1,50 @@
+# SPDX-FileCopyrightText: Copyright 2026 SAP SE or an SAP affiliate company
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# services.neutron.publicEndpoint must name the same host as
+# services.neutron.gateway.hostname (webhook-only). The Gateway listener is what
+# routes that hostname to the Neutron API, so a divergent host advertises a catalog
+# endpoint that never reaches it. The value is projected into no child CR, so this
+# webhook is the only gate on the URL every client resolves to create its networks,
+# subnets and ports. The endpoint keeps the https scheme the gateway rule also
+# demands, so the ONLY violation is the host and the step anchors on `must equal
+# services.neutron.gateway.hostname`.
+apiVersion: c5c3.io/v1alpha1
+kind: ControlPlane
+metadata:
+  name: cp-neutron-endpoint-mismatch
+spec:
+  openStackRelease: "2025.2"
+  infrastructure:
+    database:
+      host: db.example.com
+      database: openstack
+      secretRef:
+        name: db-creds
+    cache:
+      backend: dogpile.cache.pymemcache
+      servers:
+      - mc:11211
+    messaging:
+      secretRef:
+        name: bus-url
+  services:
+    keystone:
+      mode: Managed
+    neutron:
+      ovn:
+        centralRef:
+          name: ovn
+      gateway:
+        hostname: neutron.example.com
+        parentRef:
+          name: openstack-gw
+      publicEndpoint: https://other.example.com
+  korc:
+    adminCredential:
+      cloudCredentialsRef:
+        cloudName: admin
+      passwordSecretRef:
+        name: external-admin
+        key: password

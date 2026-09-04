@@ -569,6 +569,90 @@ spec:
             ($error != null): true
             (contains($error, 'services.barbican.databaseCredentialsMode')): true
             (contains($error, 'Dynamic is not supported as an override on a service with a dedicated database')): true
+    # services.neutron in External mode is rejected by the webhook (cross-field,
+    # mirroring its glance, placement and barbican siblings): no Keystone workload
+    # is deployed, so Neutron needs its own External-mode design.
+    - apply:
+        file: 96-external-with-neutron.yaml
+        expect:
+        - check:
+            ($error != null): true
+            (contains($error, 'services.neutron')): true
+            (contains($error, 'forbidden when services.keystone.mode is External')): true
+    # The shared message bus is not optional for the network service (webhook-only):
+    # the Neutron CRD requires spec.messaging, and the ControlPlane derives the
+    # child's transport URL from spec.infrastructure.messaging.
+    - apply:
+        file: 97-neutron-without-messaging.yaml
+        expect:
+        - check:
+            ($error != null): true
+            (contains($error, 'infrastructure.messaging')): true
+            (contains($error, 'is required when services.neutron is set')): true
+    # An empty ovn.centralRef.name is rejected by the MinLength marker, which answers
+    # before the webhook mirror in validateNeutron does: the ML2/OVN mechanism driver
+    # has no Northbound database to program without a central.
+    - apply:
+        file: 98-neutron-ovn-centralref-name-empty.yaml
+        expect:
+        - check:
+            ($error != null): true
+            (contains($error, 'services.neutron.ovn.centralRef.name')): true
+            (contains($error, 'should be at least 1 chars long')): true
+    # services.neutron.publicEndpoint must name the same host as the gateway
+    # (webhook-only): the listener routes that hostname to the Neutron API, so a
+    # divergent host advertises a catalog endpoint that never reaches it.
+    - apply:
+        file: 99-neutron-public-endpoint-host-mismatch.yaml
+        expect:
+        - check:
+            ($error != null): true
+            (contains($error, 'services.neutron.publicEndpoint')): true
+            (contains($error, 'must equal services.neutron.gateway.hostname')): true
+    # databaseCredentialsMode Dynamic on the Neutron service with a DEDICATED
+    # database is rejected by the webhook, mirroring the keystone, glance, placement,
+    # and barbican cases above.
+    - apply:
+        file: 24-neutron-override-dynamic-on-dedicated.yaml
+        expect:
+        - check:
+            ($error != null): true
+            (contains($error, 'services.neutron.databaseCredentialsMode')): true
+            (contains($error, 'Dynamic is not supported as an override on a service with a dedicated database')): true
+    # The placed-catalog-service rule seen on the network service (webhook-only):
+    # what the ControlPlane would otherwise register for Neutron is an in-cluster
+    # Service DNS name that resolves nowhere from another cluster.
+    - apply:
+        file: 25-placed-neutron-unpublished.yaml
+        expect:
+        - check:
+            ($error != null): true
+            (contains($error, 'services.neutron.publicEndpoint')): true
+            (contains($error, 'one of publicEndpoint or gateway is required when targetClusterRef is set')): true
+    # A 33-character ControlPlane name would project a 41-character Neutron child,
+    # one over the 40 the Neutron CRD admits. The webhook rejects it up front
+    # (create-only): metadata.name is immutable, so an admitted CR never recovers.
+    - apply:
+        file: 26-neutron-name-too-long.yaml
+        expect:
+        - check:
+            ($error != null): true
+            (contains($error, 'the projected Neutron child CR name would be 41 characters')): true
+    # An OVNCentral in a namespace the ControlPlane neither owns nor claims is
+    # refused (webhook-only): the neutron-operator mirrors that central's client
+    # Secret into the Neutron namespace, so the reference alone would hand this
+    # plane an mTLS identity for another plane's OVN databases. The anchor stops
+    # short of the apostrophe in "ControlPlane's": a JMESPath string literal is
+    # single-quoted (a double-quoted token is an identifier lookup, which reads
+    # false against $error), and the validation-parity audit takes each anchor
+    # up to the next single quote, so the apostrophe cannot be escaped either.
+    - apply:
+        file: 27-neutron-ovn-central-foreign-namespace.yaml
+        expect:
+        - check:
+            ($error != null): true
+            (contains($error, 'services.neutron.ovn.centralRef.namespace')): true
+            (contains($error, 'is neither this ControlPlane')): true
     # A target cluster on an External-mode keystone is rejected by the CEL rule,
     # like every other managed-only field: no Keystone workload is deployed, so
     # there is nothing to place.

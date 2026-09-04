@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright 2026 SAP SE or an SAP affiliate company
+#
+# SPDX-License-Identifier: Apache-2.0
+
+# databaseCredentialsMode Dynamic on the Neutron service is rejected by the webhook
+# when Neutron declares a DEDICATED database, mirroring the keystone, glance,
+# placement and barbican twins: the override retargets the shared database this
+# service does not use, and a dedicated database is Static-only. The defaulting
+# webhook materializes that dedicated database's own Static mode, so the only
+# violation is the service-level override and the step anchors on `not supported as
+# an override on a service with a dedicated database`.
+apiVersion: c5c3.io/v1alpha1
+kind: ControlPlane
+metadata:
+  name: cp-override-dynamic-dedicated-nn
+spec:
+  openStackRelease: "2025.2"
+  infrastructure:
+    database:
+      host: db.example.com
+      database: openstack
+      secretRef:
+        name: db-creds
+    cache:
+      backend: dogpile.cache.pymemcache
+      servers:
+      - mc:11211
+    messaging:
+      secretRef:
+        name: bus-url
+  services:
+    keystone:
+      mode: Managed
+    neutron:
+      ovn:
+        centralRef:
+          name: ovn
+      databaseCredentialsMode: Dynamic
+      dedicatedBackingServices:
+        database:
+          clusterRef:
+            name: cp-dedicated-db
+          database: neutron
+          secretRef:
+            name: neutron-db
+  korc:
+    adminCredential:
+      cloudCredentialsRef:
+        cloudName: admin
+      passwordSecretRef:
+        name: external-admin
+        key: password
