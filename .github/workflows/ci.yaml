@@ -28,7 +28,7 @@ env:
   # API-server allowance. Pinning it here keeps CI on the enforcing build, in
   # lockstep with the KIND_VERSION in hack/install-test-deps.sh that local
   # development installs (tests/unit/renovate asserts the two match).
-  KIND_VERSION: v0.32.0
+  KIND_VERSION: v0.33.0
   # Pin tool versions for CI reproducibility (single source of truth).
   CONTROLLER_GEN_VERSION: v0.21.0
   GOFUMPT_VERSION: v0.11.0
