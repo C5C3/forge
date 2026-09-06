@@ -24,6 +24,8 @@ github.com/dc-tec/openbao-operator v0.0.0-20260825173912-639b0018e8e5 h1:wY84tMr
 github.com/dc-tec/openbao-operator v0.0.0-20260825173912-639b0018e8e5/go.mod h1:0pB9XgL8PUzWEChBAZR4vdu/nN++6/+O8nWirassz7g=
 github.com/dc-tec/openbao-operator v0.0.0-20260825192026-2a69a9f11841 h1:aBQ/wBbMS3eKCHFsMrVVxJ1XChQtWlwI/8WrSrzVmLA=
 github.com/dc-tec/openbao-operator v0.0.0-20260825192026-2a69a9f11841/go.mod h1:0pB9XgL8PUzWEChBAZR4vdu/nN++6/+O8nWirassz7g=
+github.com/dc-tec/openbao-operator v0.0.0-20260906163417-472e9ecd7620 h1:aDBEjZxyNSZoqS7TSXUUWvlk/GTD77iljmd0O1Qn/G0=
+github.com/dc-tec/openbao-operator v0.0.0-20260906163417-472e9ecd7620/go.mod h1:yoVAcyxIFeMYtEJdrXFFyN+FdcKlUGfEf/379nfyK5Q=
 github.com/distribution/reference v0.6.0 h1:0IXCQ5g4/QMHHkarYzh5l+u8T3t73zM5QvfrDyIgxBk=
 github.com/distribution/reference v0.6.0/go.mod h1:BbU0aIcezP1/5jX/8MP0YiH4SdvB5Y4f/wlDRiLyi3E=
 github.com/emicklei/go-restful/v3 v3.13.0 h1:C4Bl2xDndpU6nJ4bc1jXd+uTmYPVUwkD6bFY/oTyCes=
@@ -257,6 +259,8 @@ go.yaml.in/yaml/v2 v2.4.4 h1:tuyd0P+2Ont/d6e2rl3be67goVK4R6deVxCUX5vyPaQ=
 go.yaml.in/yaml/v2 v2.4.4/go.mod h1:gMZqIpDtDqOfM0uNfy0SkpRhvUryYH0Z6wdMYcacYXQ=
 go.yaml.in/yaml/v3 v3.0.4 h1:tfq32ie2Jv2UxXFdLJdh3jXuOzWiL1fo0bu/FbuKpbc=
 go.yaml.in/yaml/v3 v3.0.4/go.mod h1:DhzuOOF2ATzADvBadXxruRBLzYTpT36CKvDb3+aBEFg=
+go.yaml.in/yaml/v3 v3.0.5 h1:N6y/pJk8buWs9NY5ERU2HSMfm+IuD/OtfdAnq6kESPw=
+go.yaml.in/yaml/v3 v3.0.5/go.mod h1:HVTZu1O7/Vkt2N+BFy8Zza+lnLsABggaTM2ZpNIGuKg=
 golang.org/x/mod v0.37.0 h1:vF1DjpVEshcIqoEaauuHebaLk1O1forxjxBaVn884JQ=
 golang.org/x/mod v0.37.0/go.mod h1:m8S8VeM9r4dzDwjrKO0a1sZP3YjeMamRRlD+fmR2Q/0=
 golang.org/x/net v0.57.0 h1:K5+3DljvIuDG9/Jv9rvyMywYNFCQ9RSUY6OOTTkT+tE=
