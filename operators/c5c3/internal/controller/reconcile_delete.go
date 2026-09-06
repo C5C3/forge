@@ -35,6 +35,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
 	"github.com/c5c3/cobaltcore/internal/common/conditions"
+	"github.com/c5c3/cobaltcore/internal/common/messaging"
 	commonmulticluster "github.com/c5c3/cobaltcore/internal/common/multicluster"
 	commonv1 "github.com/c5c3/cobaltcore/internal/common/types"
 	barbicanv1alpha1 "github.com/c5c3/cobaltcore/operators/barbican/api/v1alpha1"
@@ -269,6 +270,26 @@ func (r *ControlPlaneReconciler) reconcileDelete(ctx context.Context, cp *c5c3v1
 					"registration's PushSecret(s) before releasing the ControlPlane",
 			})
 			return ctrl.Result{RequeueAfter: korcRequeueAfter}, nil
+		}
+
+		// The managed message bus goes by hand, with foreground propagation, and
+		// the release waits for it: a GC-driven background delete opens a window
+		// in which the RabbitMQ Cluster Operator re-creates the broker unowned
+		// (see deleteManagedMessagingBeforeRelease).
+		busGone, err := r.deleteManagedMessagingBeforeRelease(ctx, cp)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !busGone {
+			conditions.SetCondition(&cp.Status.Conditions, metav1.Condition{
+				Type:               conditionTypeInfrastructureReady,
+				Status:             metav1.ConditionFalse,
+				ObservedGeneration: cp.Generation,
+				Reason:             "FinalizingMessaging",
+				Message: fmt.Sprintf("waiting for the managed RabbitmqCluster %q to be deleted before releasing the ControlPlane",
+					cp.Spec.Infrastructure.Messaging.ClusterRef.Name),
+			})
+			return ctrl.Result{RequeueAfter: namespaceRequeueAfter}, nil
 		}
 
 		// Release the finalizers so GC tears down Keystone/MariaDB and the rest. The
@@ -736,6 +757,86 @@ func (r *ControlPlaneReconciler) teardownReader(c client.Client) client.Reader {
 	}
 	return r.apiReader()
 }
+
+// deleteManagedMessagingBeforeRelease tears the managed message bus down by hand
+// and reports whether it is gone, so the finalizer is released only once the
+// RabbitmqCluster has left etcd. Owner-reference GC would delete it too, but with
+// BACKGROUND propagation: the CR vanishes the instant the RabbitMQ Cluster
+// Operator removes its finalizer, and that operator's deletion path (v2.13.0 and
+// later, rabbitmq/cluster-operator#1864) removes the finalizer through
+// controllerutil.CreateOrUpdate. A second reconcile of the deleting CR, queued by
+// the first one's own pod-label and StatefulSet writes, reads NotFound from its
+// cache and CREATES a fresh, unowned broker under the same name. Nothing collects
+// that one: it outlives the ControlPlane, and a namespace deleted around its pod
+// is revisited days later, after the pod's default preStop grace.
+//
+// Deleting with FOREGROUND propagation closes that window by construction. The
+// API server keeps the CR, marked deletingDependents, until every
+// blockOwnerDeletion child (the StatefulSet, Services, Secrets, ConfigMaps and
+// RBAC the cluster-operator owns) is gone, so the second reconcile still finds
+// the object without its finalizer and does nothing.
+//
+// The wait ends once the cluster-operator's finalizer is off the Terminating CR
+// (or the CR is NotFound): the re-create lives inside that finalizer's handling,
+// so nothing after it can bring the broker back, and the CR then lingers under
+// foregroundDeletion only until GC has reaped its children. Waiting for NotFound
+// instead would wait on a garbage collector envtest does not run.
+//
+// Only a bus this ControlPlane controls is touched: an externally-provisioned
+// RabbitmqCluster adopted under the managed name (ensureRabbitMQ never claims
+// one) is left standing, and a brownfield secretRef names nothing to delete. A
+// cluster that does not serve the kind reads as nothing to wait for. Past
+// messagingTeardownDeadline — a cluster-operator that is absent or wedged — the
+// wait is abandoned with a Warning naming the broker, and the release falls back
+// to the GC cascade this path replaces: a wedged broker must not make the
+// ControlPlane undeletable. The escape paths (K-ORC stall, remote-children
+// finish) release without this wait, as they give up on everything else.
+func (r *ControlPlaneReconciler) deleteManagedMessagingBeforeRelease(ctx context.Context, cp *c5c3v1alpha1.ControlPlane) (bool, error) {
+	if cp.Spec.Infrastructure == nil || cp.Spec.Infrastructure.Messaging == nil ||
+		cp.Spec.Infrastructure.Messaging.ClusterRef == nil {
+		return true, nil
+	}
+	m := cp.Spec.Infrastructure.Messaging
+	key := types.NamespacedName{Name: m.ClusterRef.Name, Namespace: cp.Namespace}
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(messaging.RabbitmqClusterGVK)
+	switch err := r.Get(ctx, key, u); {
+	case apierrors.IsNotFound(err) || meta.IsNoMatchError(err):
+		return true, nil
+	case err != nil:
+		return false, fmt.Errorf("reading RabbitmqCluster %q before release: %w", key.Name, err)
+	}
+	if !metav1.IsControlledBy(u, cp) {
+		return true, nil
+	}
+	if u.GetDeletionTimestamp() == nil {
+		if err := r.Delete(ctx, u, client.PropagationPolicy(metav1.DeletePropagationForeground)); client.IgnoreNotFound(err) != nil {
+			return false, fmt.Errorf("deleting RabbitmqCluster %q before release: %w", key.Name, err)
+		}
+		return false, nil
+	}
+	if !controllerutil.ContainsFinalizer(u, rabbitmqClusterDeletionFinalizer) {
+		return true, nil
+	}
+	if time.Since(cp.DeletionTimestamp.Time) > messagingTeardownDeadline {
+		r.Recorder.Event(cp, "Warning", "MessagingTeardownStalled", fmt.Sprintf(
+			"RabbitmqCluster %q still carries the RabbitMQ Cluster Operator's finalizer %s after the deletion "+
+				"started; releasing the ControlPlane and leaving the broker to the owner-reference cascade",
+			key.Name, messagingTeardownDeadline))
+		log.FromContext(ctx).Info("managed message bus teardown stalled; releasing the ControlPlane anyway",
+			"rabbitmqCluster", key.Name, "deadline", messagingTeardownDeadline)
+		return true, nil
+	}
+	return false, nil
+}
+
+// rabbitmqClusterDeletionFinalizer is the finalizer the RabbitMQ Cluster Operator
+// holds on every RabbitmqCluster (internal/controller/reconcile_finalizer.go in
+// rabbitmq/cluster-operator). Its presence on a Terminating CR is what
+// deleteManagedMessagingBeforeRelease waits out: the operator's deletion path
+// runs while it is set, and the re-create that path can cause is impossible once
+// it is gone.
+const rabbitmqClusterDeletionFinalizer = "deletion.finalizers.rabbitmqclusters.rabbitmq.com"
 
 // crossNamespaceServiceChildren returns the service children the ControlPlane
 // placed in namespace: the Keystone child when the Keystone service is assigned

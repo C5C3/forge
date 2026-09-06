@@ -134,6 +134,15 @@ const (
 	// its own budget instead of racing the phase before it for a shared deadline.
 	orcTeardownDeadline = registrationTeardownStallTimeout + orcTeardownStallTimeout
 
+	// messagingTeardownDeadline bounds, measured from the deletion timestamp, the
+	// wait for the managed message bus to leave etcd before the ControlPlane
+	// finalizer is released (deleteManagedMessagingBeforeRelease). The RabbitMQ
+	// Cluster Operator's own deletion path labels the broker pods to skip their
+	// preStop drain, so a healthy teardown takes seconds; the bound is for a
+	// cluster-operator that is absent or wedged, where holding on would trade an
+	// orphaned broker for an undeletable ControlPlane.
+	messagingTeardownDeadline = 3 * time.Minute
+
 	// crdRecheckInterval is the cadence at which the crdWatchGate re-probes
 	// discovery for the optional sibling-operator CRDs that were missing when
 	// the operator started. When one of them appears the gate returns an error
