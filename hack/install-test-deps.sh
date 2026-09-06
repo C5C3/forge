@@ -17,9 +17,9 @@ INSTALL_DIR="${INSTALL_DIR:-${HOME}/.local/bin}"
 # Pinned versions
 # ---------------------------------------------------------------------------
 CHAINSAW_VERSION="v0.2.15"
-FLUX_VERSION="2.9.4"
+FLUX_VERSION="2.9.5"
 KIND_VERSION="v0.32.0"
-KUBECTL_VERSION="v1.36.4"
+KUBECTL_VERSION="v1.37.0"
 
 # ---------------------------------------------------------------------------
 # Pinned SHA256 hashes.
