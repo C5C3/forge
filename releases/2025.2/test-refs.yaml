@@ -20,4 +20,4 @@ keystone-tempest-plugin: "0.21.0"
 # 3.1.0 and later require testtools>=2.8.4 and this release's
 # upper-constraints.txt pins testtools===2.7.2, so 3.0.0 is the newest version
 # the image resolves here. 2026.1 constrains testtools to 2.8.5 and pins 3.2.0.
-neutron-tempest-plugin: "3.0.0"
+neutron-tempest-plugin: "3.2.0"
