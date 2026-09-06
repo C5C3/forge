@@ -309,12 +309,18 @@ spec:
           # RabbitmqCluster are never even issued a delete, and the cleanup
           # timeout (tests/e2e/chainsaw-config.yaml, cleanup: 3m) expires.
           #
-          # The operator's own teardown path is the RabbitmqCluster delete: it
-          # labels the pod skipPreStopChecks, releases its finalizer, and the pod
-          # exits promptly. The controller owner reference asserted above is what
-          # triggers that delete once the ControlPlane is gone. So the suite tears
-          # the ControlPlane down itself, as dedicated-namespaces does, and hands
-          # chainsaw a namespace with no pod left in it.
+          # The cluster-operator's own teardown path is the RabbitmqCluster
+          # delete: it labels the pod skipPreStopChecks, releases its finalizer,
+          # and the pod exits promptly. The c5c3 finalizer issues that delete
+          # itself, with foreground propagation, and holds the ControlPlane until
+          # the cluster-operator's finalizer is off the CR: left to the
+          # owner-reference cascade (background propagation) the CR vanishes the
+          # instant the finalizer goes, and the cluster-operator's second reconcile
+          # of it re-creates an unowned broker under the same name
+          # (rabbitmq/cluster-operator#1864), which is what this wait_gone caught
+          # twice on the self-hosted runners. So the suite tears the ControlPlane
+          # down itself, as dedicated-namespaces does, and hands chainsaw a
+          # namespace with no pod left in it.
           kubectl delete controlplane "${CP_NAME}" -n "${CP_NS}" --wait=true --timeout=300s
           wait_gone rabbitmqcluster "${BUS}" 180
           # The cluster-operator labels a broker's pods with the RabbitmqCluster

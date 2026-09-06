@@ -46,6 +46,7 @@ import (
 	mcruntime "sigs.k8s.io/multicluster-runtime/pkg/multicluster"
 
 	"github.com/c5c3/cobaltcore/internal/common/conditions"
+	"github.com/c5c3/cobaltcore/internal/common/messaging"
 	commonmulticluster "github.com/c5c3/cobaltcore/internal/common/multicluster"
 	commonreconcile "github.com/c5c3/cobaltcore/internal/common/reconcile"
 	commonv1 "github.com/c5c3/cobaltcore/internal/common/types"
@@ -3639,4 +3640,189 @@ func TestSweepNamespacesBeforeRelease_CollectsRegistrationTenantStores(t *testin
 	g.Expect(done).To(BeTrue())
 
 	expectSwept(t, c, store, cert, sa)
+}
+
+// managedBusFor returns the RabbitmqCluster child a ControlPlane with managed
+// messaging owns: named after the clusterRef, controller-owned by cp, and
+// carrying the RabbitMQ Cluster Operator's finalizer, so a Delete leaves it
+// Terminating the way the real API server does until something removes it.
+func managedBusFor(cp *c5c3v1alpha1.ControlPlane) *unstructured.Unstructured {
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(messaging.RabbitmqClusterGVK)
+	u.SetName(cp.Spec.Infrastructure.Messaging.ClusterRef.Name)
+	u.SetNamespace(cp.Namespace)
+	u.SetOwnerReferences(ownedByCP(cp))
+	u.SetFinalizers([]string{rabbitmqClusterDeletionFinalizer})
+	return u
+}
+
+// deletingManagedMessagingControlPlane is deletingControlPlane with a managed
+// message bus declared, so the release path has a RabbitmqCluster to tear down.
+func deletingManagedMessagingControlPlane(deletionAge time.Duration) *c5c3v1alpha1.ControlPlane {
+	cp := deletingControlPlane(deletionAge)
+	cp.Spec.Infrastructure = &c5c3v1alpha1.InfrastructureSpec{
+		Messaging: &commonv1.MessagingSpec{
+			ClusterRef: &corev1.LocalObjectReference{Name: "cp-rabbitmq"},
+			Replicas:   1,
+		},
+	}
+	return cp
+}
+
+// TestReconcileDelete_DeletesTheManagedBusForegroundBeforeRelease pins the guard
+// against rabbitmq/cluster-operator#1864: the owned RabbitmqCluster is deleted by
+// the teardown itself, with FOREGROUND propagation, and the ControlPlane finalizer
+// is held — reported as InfrastructureReady=False/FinalizingMessaging — until the
+// broker has left etcd. A GC-driven background delete would let the
+// cluster-operator's second reconcile re-create the broker unowned.
+func TestReconcileDelete_DeletesTheManagedBusForegroundBeforeRelease(t *testing.T) {
+	g := NewGomegaWithT(t)
+
+	s := korcTestScheme(t)
+	cp := deletingManagedMessagingControlPlane(0)
+	bus := managedBusFor(cp)
+	var gotPolicy *metav1.DeletionPropagation
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cp, bus).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Delete: func(ctx context.Context, cl client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+				if obj.GetName() == bus.GetName() && obj.GetObjectKind().GroupVersionKind() == messaging.RabbitmqClusterGVK {
+					do := &client.DeleteOptions{}
+					do.ApplyOptions(opts)
+					gotPolicy = do.PropagationPolicy
+				}
+				return cl.Delete(ctx, obj, opts...)
+			},
+		}).Build()
+	rec := record.NewFakeRecorder(10)
+	r := &ControlPlaneReconciler{Client: c, Scheme: s, Recorder: rec}
+
+	key := types.NamespacedName{Name: cp.Name, Namespace: cp.Namespace}
+	g.Expect(c.Get(context.Background(), key, cp)).To(Succeed())
+
+	res, err := r.reconcileDelete(context.Background(), cp)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(res.RequeueAfter).To(Equal(namespaceRequeueAfter),
+		"the release must wait for the broker to leave etcd")
+	g.Expect(gotPolicy).NotTo(BeNil(), "the teardown must delete the owned RabbitmqCluster itself")
+	g.Expect(*gotPolicy).To(Equal(metav1.DeletePropagationForeground),
+		"only a foreground delete keeps the CR visible while the cluster-operator's second reconcile runs")
+
+	gotBus := &unstructured.Unstructured{}
+	gotBus.SetGroupVersionKind(messaging.RabbitmqClusterGVK)
+	g.Expect(c.Get(context.Background(), client.ObjectKeyFromObject(bus), gotBus)).To(Succeed())
+	g.Expect(gotBus.GetDeletionTimestamp().IsZero()).To(BeFalse(),
+		"the broker must be Terminating behind the cluster-operator's finalizer")
+	g.Expect(controllerutil.ContainsFinalizer(cp, controlPlaneORCFinalizer)).To(BeTrue(),
+		"the ControlPlane finalizer must be held while the broker is torn down")
+	cond := conditions.GetCondition(cp.Status.Conditions, conditionTypeInfrastructureReady)
+	g.Expect(cond).NotTo(BeNil())
+	g.Expect(cond.Status).To(Equal(metav1.ConditionFalse))
+	g.Expect(cond.Reason).To(Equal("FinalizingMessaging"))
+	g.Expect(drainEvents(rec)).NotTo(ContainElement(ContainSubstring("ORCTeardownComplete")))
+
+	// A second pass while the broker is still Terminating issues no second delete
+	// and keeps waiting.
+	gotPolicy = nil
+	res, err = r.reconcileDelete(context.Background(), cp)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(res.RequeueAfter).To(Equal(namespaceRequeueAfter))
+	g.Expect(gotPolicy).To(BeNil(), "a Terminating broker is waited for, not deleted again")
+
+	// The cluster-operator removes its finalizer and the broker leaves etcd; the
+	// next pass releases the ControlPlane.
+	gotBus.SetFinalizers(nil)
+	g.Expect(c.Update(context.Background(), gotBus)).To(Succeed())
+	g.Expect(c.Get(context.Background(), key, cp)).To(Succeed())
+	res, err = r.reconcileDelete(context.Background(), cp)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(res).To(Equal(ctrl.Result{}))
+	err = c.Get(context.Background(), key, &c5c3v1alpha1.ControlPlane{})
+	g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	g.Expect(drainEvents(rec)).To(ContainElement(ContainSubstring("ORCTeardownComplete")))
+}
+
+// TestReconcileDelete_ReleasesOnceTheClusterOperatorFinalizerIsOff pins the wait's
+// end: a Terminating broker that no longer carries the cluster-operator's
+// finalizer — lingering only under the API server's foregroundDeletion until GC
+// reaps its children, which envtest never does — no longer holds the release.
+func TestReconcileDelete_ReleasesOnceTheClusterOperatorFinalizerIsOff(t *testing.T) {
+	g := NewGomegaWithT(t)
+
+	s := korcTestScheme(t)
+	cp := deletingManagedMessagingControlPlane(0)
+	bus := managedBusFor(cp)
+	bus.SetFinalizers([]string{"foregroundDeletion"})
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cp, bus).Build()
+	rec := record.NewFakeRecorder(10)
+	r := &ControlPlaneReconciler{Client: c, Scheme: s, Recorder: rec}
+	g.Expect(c.Delete(context.Background(), bus)).To(Succeed())
+
+	key := types.NamespacedName{Name: cp.Name, Namespace: cp.Namespace}
+	g.Expect(c.Get(context.Background(), key, cp)).To(Succeed())
+
+	res, err := r.reconcileDelete(context.Background(), cp)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(res).To(Equal(ctrl.Result{}), "a broker past the cluster-operator's finalizer must not hold the release")
+	err = c.Get(context.Background(), key, &c5c3v1alpha1.ControlPlane{})
+	g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	g.Expect(drainEvents(rec)).NotTo(ContainElement(ContainSubstring("MessagingTeardownStalled")))
+}
+
+// TestReconcileDelete_LeavesAnUnownedBusToItsOwner asserts that a RabbitmqCluster
+// under the managed name that this ControlPlane does not control — an adopted,
+// externally-provisioned broker — is neither deleted nor waited for.
+func TestReconcileDelete_LeavesAnUnownedBusToItsOwner(t *testing.T) {
+	g := NewGomegaWithT(t)
+
+	s := korcTestScheme(t)
+	cp := deletingManagedMessagingControlPlane(0)
+	bus := managedBusFor(cp)
+	bus.SetOwnerReferences(nil)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cp, bus).Build()
+	rec := record.NewFakeRecorder(10)
+	r := &ControlPlaneReconciler{Client: c, Scheme: s, Recorder: rec}
+
+	key := types.NamespacedName{Name: cp.Name, Namespace: cp.Namespace}
+	g.Expect(c.Get(context.Background(), key, cp)).To(Succeed())
+
+	res, err := r.reconcileDelete(context.Background(), cp)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(res).To(Equal(ctrl.Result{}), "an unowned broker must not hold the release")
+
+	gotBus := &unstructured.Unstructured{}
+	gotBus.SetGroupVersionKind(messaging.RabbitmqClusterGVK)
+	g.Expect(c.Get(context.Background(), client.ObjectKeyFromObject(bus), gotBus)).To(Succeed())
+	g.Expect(gotBus.GetDeletionTimestamp().IsZero()).To(BeTrue(),
+		"a broker this ControlPlane never claimed must be left standing")
+	err = c.Get(context.Background(), key, &c5c3v1alpha1.ControlPlane{})
+	g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+}
+
+// TestReconcileDelete_AbandonsTheBusWaitPastTheDeadline asserts the bound: a
+// broker still Terminating messagingTeardownDeadline after the deletion started
+// no longer holds the ControlPlane, and a Warning names it.
+func TestReconcileDelete_AbandonsTheBusWaitPastTheDeadline(t *testing.T) {
+	g := NewGomegaWithT(t)
+
+	s := korcTestScheme(t)
+	cp := deletingManagedMessagingControlPlane(messagingTeardownDeadline + time.Minute)
+	bus := managedBusFor(cp)
+	c := fake.NewClientBuilder().WithScheme(s).WithObjects(cp, bus).Build()
+	rec := record.NewFakeRecorder(10)
+	r := &ControlPlaneReconciler{Client: c, Scheme: s, Recorder: rec}
+	// Terminating behind the cluster-operator's finalizer, as a wedged operator
+	// leaves it.
+	g.Expect(c.Delete(context.Background(), bus)).To(Succeed())
+
+	key := types.NamespacedName{Name: cp.Name, Namespace: cp.Namespace}
+	g.Expect(c.Get(context.Background(), key, cp)).To(Succeed())
+
+	res, err := r.reconcileDelete(context.Background(), cp)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(res).To(Equal(ctrl.Result{}), "past the deadline the release must proceed")
+	err = c.Get(context.Background(), key, &c5c3v1alpha1.ControlPlane{})
+	g.Expect(apierrors.IsNotFound(err)).To(BeTrue())
+	events := drainEvents(rec)
+	g.Expect(events).To(ContainElement(ContainSubstring("MessagingTeardownStalled")))
+	g.Expect(events).To(ContainElement(ContainSubstring("ORCTeardownComplete")))
 }

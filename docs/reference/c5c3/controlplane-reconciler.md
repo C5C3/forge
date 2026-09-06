@@ -930,6 +930,11 @@ running five pods reads as a no-op in review and arrives at the reconciler as a
 scale-down nobody typed. With the annotation set, the recreate is the only path
 the operator offers for a declared count the running cluster exceeds.
 
+On ControlPlane deletion the bus is not left to the owner-reference cascade:
+the finalizer deletes it with foreground propagation and waits for it to go, for
+the cluster-operator race described under
+[Owner-ref / GC model](#owner-ref--gc-model).
+
 A child that is mid-teardown is never reported ready. The RabbitMQ Cluster
 Operator holds a finalizer on its CRs, so a deleted `RabbitmqCluster` lingers in
 `Terminating` with its spec and its `status.conditions` intact — `AllReplicasReady`
@@ -3061,11 +3066,33 @@ projected. On deletion it:
    `authDelegatorBinding` — leaves the binding standing with a **Warning**
    `AuthDelegatorBindingNotReclaimed` naming it, rather than holding the
    ControlPlane in `Terminating` for a grant the target withdrew.
-6. **Releases the finalizers once the ORC CRs, PushSecrets, and cross-namespace
-   children are gone**, letting GC cascade-delete the same-namespace Keystone,
-   the infrastructure, and the remaining children. The remote-children finalizer
-   goes in the same update, because by then every placed namespace has been swept
-   or its cluster abandoned.
+6. **Deletes the managed message bus by hand, then releases the finalizers once
+   the ORC CRs, PushSecrets, cross-namespace children and the bus are gone**,
+   letting GC cascade-delete the same-namespace Keystone, the infrastructure,
+   and the remaining children. The `RabbitmqCluster` is the one same-namespace
+   child the cascade is not trusted with: GC deletes with background
+   propagation, so the CR vanishes the instant the RabbitMQ Cluster Operator
+   removes its finalizer, and that operator's deletion path (v2.13.0 and later,
+   rabbitmq/cluster-operator#1864) removes the finalizer through
+   `controllerutil.CreateOrUpdate`. A second reconcile of the deleting CR, queued
+   by the first one's own pod-label and StatefulSet writes, reads NotFound from
+   its cache and creates a fresh, unowned broker under the same name, which
+   nothing collects. `deleteManagedMessagingBeforeRelease` therefore deletes the
+   owned bus itself with **foreground** propagation, which keeps the CR visible
+   until every child the cluster-operator owns is gone, and holds the finalizer
+   until the cluster-operator's own finalizer is off the Terminating CR (or the
+   CR is gone), reported as `InfrastructureReady=False/FinalizingMessaging`. The
+   CR then lingers under `foregroundDeletion` only until GC has reaped its
+   children; waiting for NotFound instead would wait on a garbage collector
+   envtest does not run. A bus this ControlPlane does not control (an adopted,
+   externally-provisioned one) is left standing, and a brownfield `secretRef`
+   names nothing to delete. Past
+   `messagingTeardownDeadline` (3 minutes from the deletion timestamp) a
+   **Warning** `MessagingTeardownStalled` names the broker and the release
+   proceeds on the cascade, so a wedged cluster-operator cannot make the
+   ControlPlane undeletable. The escape paths below release without this wait.
+   The remote-children finalizer goes in the same update, because by then every
+   placed namespace has been swept or its cluster abandoned.
 7. **Releases an unmanaged-only remainder immediately.** K-ORC re-fetches the
    imported resource through an *authenticated* actuator before releasing any
    finalizer, and the unmanaged imports authenticate with the admin application
