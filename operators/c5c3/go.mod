@@ -11,7 +11,7 @@ require (
 	github.com/c5c3/cobaltcore/operators/neutron v0.0.0-00010101000000-000000000000
 	github.com/c5c3/cobaltcore/operators/ovn v0.0.0-00010101000000-000000000000
 	github.com/c5c3/cobaltcore/operators/placement v0.0.0-00010101000000-000000000000
-	github.com/dc-tec/openbao-operator v0.0.0-20260825192026-2a69a9f11841
+	github.com/dc-tec/openbao-operator v0.0.0-20260906163417-472e9ecd7620
 	github.com/external-secrets/external-secrets/apis v0.0.0-20260819101639-6271822a4da8
 	github.com/k-orc/openstack-resource-controller/v2 v2.5.1-0.20260803003919-c22784ca3ff5
 	github.com/mariadb-operator/mariadb-operator v0.38.1
@@ -75,7 +75,7 @@ require (
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.28.0 // indirect
 	go.yaml.in/yaml/v2 v2.4.4 // indirect
-	go.yaml.in/yaml/v3 v3.0.4 // indirect
+	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/oauth2 v0.36.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
